@@ -377,6 +377,24 @@ def api_review_approve():
         return jsonify({"ok": False, "message": str(e)}), 400
 
 
+@app.route("/api/review/regenerate", methods=["POST"])
+def api_review_regenerate():
+    data = request.get_json(silent=True) or {}
+    comment_id = str(data.get("comment_id", "")).strip()
+    if not comment_id:
+        return jsonify({"ok": False, "message": "缺少 comment_id"}), 400
+    try:
+        draft = get_bot().regenerate_review_draft(comment_id)
+        return jsonify({"ok": True, "draft": draft})
+    except ReviewGenerationBusyError as e:
+        return jsonify({"ok": False, "message": str(e)}), 409
+    except (KeyError, ValueError) as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+    except Exception as e:
+        get_bot().logger.exception("重新生成审核回复失败")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
 @app.route("/api/review/send", methods=["POST"])
 def api_review_send():
     data = request.get_json(silent=True) or {}

@@ -154,6 +154,36 @@ class ReviewWorkflowTests(unittest.TestCase):
             saved = json.load(handle)
         self.assertEqual(saved[0]["reply"], original_reply)
 
+    def test_regenerate_uses_current_prompt_result_and_clears_approval(self):
+        draft = self._draft("1", approved=True, status="approved")
+        draft["parent_comment"] = "之前的回复"
+        draft["parent_author"] = "上级评论"
+        draft["root_id"] = "99"
+        draft["depth"] = 1
+        self.bot._review_drafts["1"] = draft
+        self.bot.generate_reply_decisions_resilient = Mock(return_value=[{
+            "id": "1",
+            "should_reply": True,
+            "reply": "豆包重新生成的原文",
+            "reason": "有新的互动价值",
+            "model": "doubao-new",
+        }])
+
+        result = self.bot.regenerate_review_draft("1")
+
+        self.assertEqual(result["reply"], "豆包重新生成的原文")
+        self.assertEqual(result["status"], "pending")
+        self.assertFalse(result["approved"])
+        item = self.bot.generate_reply_decisions_resilient.call_args.args[0][0]
+        self.assertTrue(item["is_follow_up"])
+        self.assertEqual(item["context"][0].content, "之前的回复")
+
+    def test_sent_draft_cannot_be_regenerated(self):
+        self.bot._review_drafts["1"] = self._draft("1", approved=False, status="sent")
+
+        with self.assertRaisesRegex(ValueError, "已发送"):
+            self.bot.regenerate_review_draft("1")
+
     def test_empty_requested_list_sends_nothing(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
 

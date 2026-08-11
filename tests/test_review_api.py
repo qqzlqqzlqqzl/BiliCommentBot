@@ -14,6 +14,12 @@ class ReviewApiTests(unittest.TestCase):
             "approved": True,
             "status": "approved",
         }
+        self.fake_bot.regenerate_review_draft.return_value = {
+            "comment_id": "1",
+            "approved": False,
+            "status": "pending",
+            "reply": "新回复",
+        }
         self.bot_patch = patch.object(server, "get_bot", return_value=self.fake_bot)
         self.bot_patch.start()
 
@@ -42,6 +48,18 @@ class ReviewApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.fake_bot.set_review_approval.assert_not_called()
+
+    def test_regenerate_requires_comment_id(self):
+        response = self.client.post("/api/review/regenerate", json={})
+
+        self.assertEqual(response.status_code, 400)
+        self.fake_bot.regenerate_review_draft.assert_not_called()
+
+    def test_regenerate_passes_single_comment_id(self):
+        response = self.client.post("/api/review/regenerate", json={"comment_id": "1"})
+
+        self.assertEqual(response.status_code, 200)
+        self.fake_bot.regenerate_review_draft.assert_called_once_with("1")
 
 
 if __name__ == "__main__":
