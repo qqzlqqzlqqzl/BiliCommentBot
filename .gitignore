@@ -15,6 +15,7 @@ history.json
 video_history.json
 bilibili_cookie.json
 video_cache.json
+/data-account-*/
 
 # 构建和打包
 /build

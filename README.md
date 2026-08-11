@@ -50,6 +50,22 @@ python main.py
 
 也可以启动“草稿监控”，让程序定时补充审核草稿。它不会绕过人工审核发送。
 
+## 双账号
+
+- 账号 1：双击 `启动机器人.bat`，使用端口 `5000` 和项目根目录中现有的登录数据。
+- 账号 2：双击 `启动账号2-5001.bat`，使用端口 `5001` 和 `data-account-2` 独立数据目录。
+
+两个实例的 Cookie、UID、审核草稿、历史、缓存和日志互不共用。不要把一个账号的数据目录交给另一个实例。
+
+也可以通过环境变量自定义：
+
+```powershell
+$env:BILI_PORT = "5001"
+$env:BILI_ACCOUNT_NAME = "账号2"
+$env:BILI_DATA_DIR = "$PWD\data-account-2"
+python main.py
+```
+
 ## 关键配置
 
 ```toml

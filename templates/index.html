@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>B站评论审核助手</title>
+<title>{{ instance_name }} · {{ instance_port }} - B站评论审核助手</title>
 <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <style>
   :root {
@@ -202,6 +202,7 @@
   <aside class="sidebar">
     <div class="sidebar-logo">
       <div class="logo-title">🤖 BiliBot</div>
+      <div class="logo-sub">{{ instance_name }} · 端口 {{ instance_port }}</div>
       <div class="logo-sub">B站评论人工审核回复</div>
     </div>
     <ul class="nav-list">

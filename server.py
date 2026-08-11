@@ -47,6 +47,22 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = SECRET_KEY
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
+
+def get_server_port() -> int:
+    raw_port = os.environ.get("BILI_PORT", "5000").strip()
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise RuntimeError(f"BILI_PORT 不是有效端口: {raw_port}") from exc
+    if not 1 <= port <= 65535:
+        raise RuntimeError(f"BILI_PORT 超出范围: {port}")
+    return port
+
+
+def get_instance_name() -> str:
+    return os.environ.get("BILI_ACCOUNT_NAME", "").strip() or "账号 1"
+
+
 # ─────────────────────────────────────────────
 #  日志 Handler（推送到前端）
 # ─────────────────────────────────────────────
@@ -233,7 +249,11 @@ def _poll_qr_login(qr_key: str, session: requests.Session):
 # ─────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template(
+        "index.html",
+        instance_name=get_instance_name(),
+        instance_port=get_server_port(),
+    )
 
 
 @app.route("/api/config", methods=["GET"])
@@ -483,14 +503,16 @@ def on_connect():
 #  入口
 # ─────────────────────────────────────────────
 def main():
-    host = "0.0.0.0"
-    port = 5000
+    host = os.environ.get("BILI_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port = get_server_port()
+    instance_name = get_instance_name()
     url = f"http://{host}:{port}"
-    browser_url = f"http://localhost:{port}"
+    browser_url = f"http://127.0.0.1:{port}"
     print(f"""
 ╔══════════════════════════════════════════╗
 ║       B站评论人工审核回复工具 Web UI        ║
 ╠══════════════════════════════════════════╣
+║  当前实例: {instance_name:<31}║
 ║  访问地址: {url:<31}║
 ║  按 Ctrl+C 停止服务                      ║
 ╚══════════════════════════════════════════╝
