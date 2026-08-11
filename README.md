@@ -1,650 +1,102 @@
-# B站评论自动回复机器人
+# B站评论人工审核回复工具
 
-![GitHub语言](https://img.shields.io/github/languages/top/Janson20/BiliCommentBot)
-![GitHub星数](https://img.shields.io/github/stars/Janson20/BiliCommentBot)
-![Fork数](https://img.shields.io/github/forks/Janson20/BiliCommentBot)
-![GitHub协议](https://img.shields.io/github/license/Janson20/BiliCommentBot)
-![最新发行版](https://img.shields.io/github/v/release/Janson20/BiliCommentBot)
-![议题](https://img.shields.io/github/issues/Janson20/BiliCommentBot)
+这是基于 [Janson20/BiliCommentBot](https://github.com/Janson20/BiliCommentBot) 改造的本地审核版。原项目负责 B站登录、评论抓取、楼中楼定位、限频和 Web UI；本分支把“生成后立即发送”改成了“豆包生成草稿 → 人工勾选 → 明确确认 → 批量发送”。
 
-使用 DeepSeek API 自动回复 B 站账号下视频新增评论的 Python 机器人，**现已集成完整的 Web UI 管理界面**。
+当前是测试阶段，默认只读取每个视频最近 `2` 页评论。验证稳定后可在配置页改成 `8`～`10` 页。
 
-## 功能特性
+## 安全边界
 
-- 🐳 **Docker 部署超轻量**：内存占用平均仅约 50M，最高不超过 100M
-- 🌐 **Web UI 管理界面**：启动后自动打开浏览器，所有功能通过图形界面操作
-- 🤖 自动监控 B 站视频的新增评论
-- 🎯 **仅回复指定视频**：支持配置只回复某个特定视频的评论
-- 🧠 使用 DeepSeek API 生成智能回复
-- 📝 **链式回复支持（楼中楼）**：监控并回复主评论下的子评论，实现多层对话互动
-- 👍 支持自动点赞评论（可选）
-- 🔥 **回复后点赞用户视频**：可自动点赞评论用户的最新视频
-- 👥 **仅给粉丝视频点赞**：支持只给关注了你的用户的视频点赞
-- 🔄 Cookie 自动刷新，避免登录过期
-- 📝 实时日志查看，支持按级别过滤
-- 📚 回复历史记录查看
-- 🛡️ 智能频率控制和重试机制
-- 💾 视频列表缓存，减少 API 请求
-- 📱 扫码登录获取 Cookie
-- ⚙️ 配置热更新，修改后立即生效无需重启
-- 📊 **详细的操作日志**：所有关键操作都有完整的日志记录
-- 🔒 **登录密码保护**：可设置访问密码，支持自定义或随机生成
+- 豆包只给语境清楚、有互动价值、低误判风险的评论生成回复。
+- 上下文不足、争议大、容易引战或只能写万能套话的评论会标为跳过。
+- 页面同时展示视频标题、观众原评论、楼中楼上级评论、豆包回复原文和筛选理由。
+- Codex 不会二次改写豆包回复。
+- 后台监控只生成审核草稿，绝不自动发送。
+- 只有勾选为“已批准”的草稿才可发送。
+- 发送前页面会再次确认：`将向 B站发送已勾选的 N 条豆包原文`。
+- API 也要求明确提交非空的评论 ID 列表，不支持空列表或遗漏列表时批量发送。
 
-### API 版本
+## 模型
 
-为降低频率限制，以下接口已切换至 B 站 APP 端（模拟 BiliDroid 客户端）：
+固定使用火山方舟 Responses API：
 
-| 功能 | 旧接口 (Web) | 新接口 (APP) |
-|------|-------------|-------------|
-| 视频列表 | `api.bilibili.com/x/space/arc/search` | `app.bilibili.com/x/v2/space/archive/cursor` |
-| 点赞视频 | `api.bilibili.com/x/web-interface/archive/like` | `app.bilibili.com/x/v2/view/like` |
-| BVID→AID | `/x/web-interface/view` (API) | 本地算法转换 (零网络开销) |
-
-APP 端接口需携带 appkey+sign 签名及 BiliDroid UA，程序已自动处理。
-
-## 快速开始
-
-### 方式一：本地运行
-
-#### 1. 安装依赖
-
-```bash
-pip install -r requirements.txt
+```text
+model: doubao-seed-2-1-turbo-260628
+endpoint: https://ark.cn-beijing.volces.com/api/v3/responses
+reasoning.effort: low
 ```
 
-#### 2. 启动程序
+API Key 优先从环境变量读取：
 
-双击 `启动机器人.bat` 或执行：
+```powershell
+$env:ARK_API_KEY = "你的方舟 API Key"
+```
 
-```bash
+也兼容 `VOLCENGINE_ARK_API_KEY`。不要把真实 Key 写入仓库。
+
+## 本地运行
+
+```powershell
+python -m pip install -r requirements.txt
 python main.py
 ```
 
-程序会自动打开浏览器访问 `http://127.0.0.1:5000`，你可以通过 Web UI 完成所有配置和操作。
+然后打开 `http://127.0.0.1:5000`：
 
-### 方式二：Docker 部署
+1. 在“登录”页扫码获取 B站 Cookie。
+2. 在“配置 → 豆包 / 火山方舟”确认模型和 API 地址。
+3. 打开“回复审核”，点击“生成最近评论草稿”。
+4. 检查原评论、上级评论和豆包原文，只勾选确认无误的回复。
+5. 点击“发送已勾选”，核对数量后确认。
 
-#### 1. 使用 Docker Hub 镜像（推荐）
+也可以启动“草稿监控”，让程序定时补充审核草稿。它不会绕过人工审核发送。
 
-项目已发布至 [Docker Hub](https://hub.docker.com/r/janson20/bilicommentbot)，可以直接拉取使用：
-
-```bash
-docker pull janson20/bilicommentbot:latest
-```
-
-运行容器（所有数据存储在 `./data` 目录，只需挂载一个卷）：
-
-```bash
-mkdir -p ./data
-docker run -d \
-  --name bilicomment-bot \
-  -p 5000:5000 \
-  -v $(pwd)/data:/app/data \
-  -e TZ=Asia/Shanghai \
-  -e BILI_DATA_DIR=/app/data \
-  janson20/bilicommentbot:latest
-```
-
-首次启动会自动在 `./data` 目录下生成配置文件，之后编辑 `./data/config.toml` 填入配置即可。
-
-访问 `http://localhost:5000` 使用 Web UI。
-
-#### 2. 使用 GitHub Container Registry 镜像
-
-项目也已发布至 [GitHub Container Registry](https://ghcr.io/janson20/bilicommentbot)：
-
-```bash
-docker pull ghcr.io/janson20/bilicommentbot:main
-```
-
-运行容器：
-
-```bash
-mkdir -p ./data
-docker run -d \
-  --name bilicomment-bot \
-  -p 5000:5000 \
-  -v $(pwd)/data:/app/data \
-  -e TZ=Asia/Shanghai \
-  -e BILI_DATA_DIR=/app/data \
-  ghcr.io/janson20/bilicommentbot:main
-```
-
-访问 `http://localhost:5000` 使用 Web UI。
-
-#### 3. 使用 Docker Compose（推荐）
-
-编辑 `docker-compose.yml`，修改镜像为 Docker Hub 镜像：
-
-```yaml
-version: '3.8'
-
-services:
-  bilicomment:
-    image: janson20/bilicommentbot:latest
-    container_name: bilicomment-bot
-    ports:
-      - "5000:5000"
-    volumes:
-      - ./data:/app/data
-    environment:
-      - TZ=Asia/Shanghai
-      - BILI_DATA_DIR=/app/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
-```
-
-启动服务：
-
-```bash
-docker-compose up -d
-```
-
-访问 `http://localhost:5000` 使用 Web UI。
-
-常用命令：
-
-```bash
-# 启动服务
-docker-compose up -d
-
-# 停止服务
-docker-compose down
-
-# 查看日志
-docker-compose logs -f
-
-# 重启服务
-docker-compose restart
-
-# 拉取最新镜像并重启
-docker-compose pull
-docker-compose up -d
-```
-
-#### 4. 本地构建镜像
-
-如需自行构建镜像：
-
-```bash
-docker build -t bilicomment-bot .
-```
-
-运行容器：
-
-```bash
-mkdir -p ./data
-docker run -d \
-  --name bilicomment-bot \
-  -p 5000:5000 \
-  -v $(pwd)/data:/app/data \
-  -e TZ=Asia/Shanghai \
-  -e BILI_DATA_DIR=/app/data \
-  bilicomment-bot
-```
-
-> **提示**：推荐使用 Docker Hub 镜像 `janson20/bilicommentbot:latest`，无需自行构建。
-
-#### 5. Docker 数据目录结构
-
-所有配置和数据文件统一存储在 `./data` 目录下，只需挂载一个卷：
-
-```
-./data/
-├── config.toml              # 配置文件
-├── history.json             # 回复历史记录
-├── bilibili_cookie.json     # Cookie 持久化文件
-├── video_cache.json         # 视频列表缓存
-└── logs/
-    └── bot.log              # 程序运行日志
-```
-
-### 3. 配置并启动
-
-1. **获取凭证**：在 Web UI 的「登录」页面，点击「扫码登录」，用 B 站 APP 扫描二维码获取 Cookie
-2. **配置 DeepSeek API**：在「配置」→「DeepSeek」填入你的 API 密钥
-3. **启动机器人**：在「控制台」页面点击「启动机器人」
-4. **查看日志**：在「实时日志」页面监控运行状态
-
-## Web UI 功能页面
-
-| 页面 | 功能说明 |
-|------|----------|
-| **📊 控制台** | 机器人启动/停止控制、登录状态验证、实时统计（回复数/视频数/状态）、清空缓存 |
-| **⚙️ 配置** | 6个分类 Tab：B站、DeepSeek、回复策略、频率控制、缓存、日志 —— 支持热更新 |
-| **🔑 登录** | 扫码登录获取 Cookie，登录成功后自动写入配置 |
-| **📝 历史记录** | 分页查看所有回复历史，支持清空 |
-| **📋 实时日志** | WebSocket 实时推送日志，可按级别过滤（INFO/WARNING/ERROR/DEBUG），支持自动滚动 |
-
-## 配置说明
-
-配置文件为 `config.toml`，你可以通过 Web UI 的「配置」页面修改，也可以直接编辑文件。以下是主要配置项说明：
-
-### B站配置
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `uid` | 你的 B 站用户ID（从主页URL获取） | - |
-| `cookie` | B 站登录 Cookie（通过扫码登录自动获取） | - |
-| `refresh_token` | Cookie 刷新令牌（自动刷新时需要） | - |
-| `check_interval` | 检查评论的间隔时间（秒） | 60 |
-| `auto_refresh_cookie` | 是否自动刷新 Cookie | true |
-| `cookie_refresh_interval` | Cookie 刷新间隔（分钟） | 30 |
-| `max_comment_pages` | 获取评论的最大页数 | 10 |
-| `max_video_pages` | 获取视频列表的最大页数 | 10 |
-
-### DeepSeek API 配置
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `api_key` | DeepSeek API 密钥 | - |
-| `base_url` | API 基础 URL | https://api.deepseek.com |
-| `model` | 使用的模型 | deepseek-v4-flash |
-| `max_tokens` | 最大回复长度 | 200 |
-| `temperature` | 温度参数（0-1） | 0.7 |
-| `system_prompt` | 系统提示词，定义 AI 回复风格 | 友善的 B 站 UP 主 |
-
-### 回复配置
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `enabled` | 是否启用自动回复 | true |
-| `prefix` | 回复前缀 | - |
-| `only_new` | 是否只回复未处理的评论 | true |
-| `max_process` | 每次最多处理的评论数 | 10 |
-| `reply_delay` | 回复延迟（秒） | 3 |
-| `like_enabled` | 是否在回复前先点赞评论 | false |
-| `context_comments_count` | 上下文评论数（生成回复时参考前 N 条评论） | 0 |
-| `only_bvid` | 仅回复指定视频的 BVID（留空则回复所有视频） | - |
-| `like_user_video_enabled` | 是否在回复后点赞评论用户的最新视频 | false |
-| `like_user_video_only_followers` | 是否仅点赞关注了你的用户的视频 | false |
-| `chained_reply_enabled` | 是否启用链式回复（楼中楼） | true |
-| `max_reply_depth` | 最大回复深度（层数），设置楼中楼回复的最大嵌套层数 | 3 |
-
-### 请求频率控制
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `min_request_interval` | 最小请求间隔（秒） | 3.0 |
-| `max_retries` | 最大重试次数 | 3 |
-| `retry_delay` | 重试基础延迟（秒） | 5 |
-
-**智能频率控制机制**：
-- 指数退避：根据连续失败次数按 2^n 倍增长请求间隔，最大可达基础间隔的 10 倍
-- 频率限制检测：同时检测 HTTP 429 和 B 站 JSON 响应体中的频率限制错误码（-509/-412/-799 等）
-- 随机抖动：添加随机延迟避免多客户端同步重试
-- 请求头随机化：模拟真实用户行为，轮流使用多种 User-Agent
-- 视频列表 API 已切换至 B 站 APP 端接口，大幅降低频率限制触发概率
-
-### 缓存配置
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `enabled` | 是否启用缓存 | true |
-| `expire_time` | 缓存过期时间（秒） | 300 |
-
-### 视频缓存配置
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `expire_time` | 视频列表缓存过期时间（秒） | 43200（12小时） |
-| `cache_file` | 视频缓存文件路径 | video_cache.json |
-
-### 日志配置
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `level` | 日志级别（DEBUG/INFO/WARNING/ERROR） | INFO |
-| `file` | 日志文件路径 | logs/bot.log |
-| `console` | 是否输出到控制台 | true |
-
-### 安全配置
-
-| 配置项 | 说明 | 默认值 |
-|--------|------|--------|
-| `enabled` | 是否启用登录密码保护 | false |
-| `password` | 登录密码（SHA-256哈希值，通过Web UI设置） | "" |
-
-## 完整配置示例
-
-参考 `config.example.toml` 文件：
+## 关键配置
 
 ```toml
 [bilibili]
-uid = "你的B站用户ID"
-cookie = "SESSDATA=xxx; bili_jct=xxx; ..."
-refresh_token = "刷新令牌（可选）"
-check_interval = 300  # 5分钟检查一次
-auto_refresh_cookie = true
-cookie_refresh_interval = 30
-max_comment_pages = 10
+max_comment_pages = 2
 max_video_pages = 10
 
-[deepseek]
-api_key = "sk-xxx"
-base_url = "https://api.deepseek.com"
-model = "deepseek-v4-flash"
-max_tokens = 200
-temperature = 0.7
-system_prompt = "你是一个友善的B站游戏区Minecraft UP主，请对评论做出自然、友好的回复。回复要简洁明了，控制在100字以内。"
+[ark]
+api_key = ""
+base_url = "https://ark.cn-beijing.volces.com/api/v3/responses"
+model = "doubao-seed-2-1-turbo-260628"
+max_tokens = 2400
+system_prompt = "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实。"
 
 [reply]
 enabled = true
-prefix = ""
-only_new = true
 max_process = 10
-reply_delay = 3
-like_enabled = false
-context_comments_count = 0
-only_bvid = ""  # 留空则回复所有视频，填写 BVID（如 BV1xx411c7mD）则仅回复该视频
-like_user_video_enabled = false  # 回复后自动点赞评论用户的最新视频
-like_user_video_only_followers = false  # 仅点赞关注了你的用户的视频（需要配置 uid）
-chained_reply_enabled = true  # 启用链式回复（楼中楼）
-max_reply_depth = 3  # 最大回复深度（层数）
-
-[rate_limit]
-min_request_interval = 3.0
-max_retries = 3
-retry_delay = 5
-
-[cache]
-enabled = true
-expire_time = 300
-
-[video_cache]
-expire_time = 43200  # 12小时
-cache_file = "video_cache.json"
-
-[logging]
-level = "INFO"
-file = "logs/bot.log"
-console = true
+review_batch_size = 8
+reply_delay = 2
+chained_reply_enabled = true
 ```
 
-## 获取凭证
-
-### 获取 B 站 Cookie（推荐方式：扫码登录）
-
-1. 启动程序后访问 Web UI 的「登录」页面
-2. 点击「扫码登录」按钮
-3. 使用 B 站 APP 扫描二维码并确认登录
-4. 登录成功后 Cookie 自动填入配置
-
-**手动获取方式**（备用）：
-1. 登录 B 站网页版
-2. 按 F12 打开开发者工具
-3. 切换到 Network 标签
-4. 刷新页面
-5. 找到任意请求，查看 Request Headers 中的 Cookie
-6. 复制完整的 Cookie 字符串
-
-**重要**：Cookie 中必须包含 `bili_jct` 字段，这是 CSRF 校验必需的。
-
-### 获取 B 站用户 ID
-
-1. 访问你的 B 站主页
-2. 查看 URL 中的数字部分（如：space.bilibili.com/123456789）
-3. 这个数字就是你的用户 ID
-
-### 获取 DeepSeek API 密钥
-
-1. 访问 [DeepSeek 官网](https://platform.deepseek.com/)
-2. 注册并登录
-3. 在 API 管理页面创建新的 API 密钥
-4. 将密钥填入配置
-
-## 功能详解
-
-### Cookie 自动刷新
-
-机器人支持 Cookie 自动刷新功能，可避免因 Cookie 过期而需要重新获取的问题：
-
-- 在配置中设置 `auto_refresh_cookie = true`
-- 提供有效的 `refresh_token` 参数
-- 设置 `cookie_refresh_interval` 控制刷新间隔（默认 30 分钟）
-- Cookie 和 refresh_token 会自动保存到 `bilibili_cookie.json` 文件
-
-### Cookie 持久化
-
-- Cookie 状态会保存到 `bilibili_cookie.json`
-- 包含 cookie、refresh_token 和时间戳
-- 程序退出前自动保存
-- 启动时优先从文件加载
-
-### 链式回复支持（楼中楼）
-
-机器人支持监控并回复主评论下的子评论（即"楼中楼"），实现真正的多层对话互动：
-
-**功能特性**：
-- 自动获取主评论下的所有子评论
-- 支持配置最大回复深度（防止无限递归）
-- 回复子评论时，会自动将父评论作为上下文
-- 默认启用，可在配置中关闭
-
-**配置说明**：
-- `chained_reply_enabled`: 是否启用链式回复（默认 `true`）
-- `max_reply_depth`: 最大回复深度，例如设置为 `3` 表示最多回复到第 3 层评论（默认 `3`）
-
-**技术实现**：
-- 使用 B 站 API `https://api.bilibili.com/x/v2/reply/reply` 获取子评论
-- 递归获取子评论，支持配置最大深度
-- 回复时正确使用 `root` 和 `parent` 参数，确保回复显示在正确的位置
-
-**使用建议**：
-- 建议保持默认启用状态，以增强社区互动感
-- 如果视频评论量很大，可适当降低 `max_reply_depth` 以减少 API 请求
-- 配合 `only_new = true` 使用，避免重复回复
-
-### 视频列表缓存
-
-为了减少 API 请求频率，机器人会将视频列表缓存到 `video_cache.json` 文件中，默认缓存时间为 12 小时。
-
-**缓存机制**：
-- 首次运行时自动获取视频列表并缓存
-- 每 12 小时自动更新视频列表
-- 如果获取失败，会使用过期缓存
-- 缓存保存到文件，重启后仍然有效
-
-**清除缓存**：
-- 在 Web UI 的「控制台」页面点击「清空缓存」
-- 或删除 `video_cache.json` 文件后重启程序
-
-### 历史记录
-
-机器人会自动将回复过的评论保存到 `history.json` 文件中，包含以下信息：
-- 评论 ID 和内容
-- 评论用户信息
-- 回复内容和时间
-- 原始评论时间
-
-你可以在 Web UI 的「历史记录」页面查看所有回复历史。
-
-### 实时日志
-
-程序运行时会生成详细的日志，包括：
-- 评论获取和处理信息
-- API 调用和响应
-- 错误和警告信息
-- Cookie 刷新状态
-
-在 Web UI 的「实时日志」页面可以：
-- 实时查看日志输出
-- 按级别过滤日志
-- 支持自动滚动到最新日志
-
-## 故障排除
-
-### Cookie 相关错误
-
-**错误提示：未找到 CSRF token，无法回复评论**
-- 原因：Cookie 中缺少 `bili_jct` 字段
-- 解决：重新通过扫码登录获取 Cookie
-
-**错误提示：Cookie 已过期，需要重新登录**
-- 原因：Cookie 失效且无法自动刷新
-- 解决：重新扫码登录获取新的 Cookie
-
-### API 请求错误
-
-**错误提示：请求过于频繁 (-509/-412/-799 或 HTTP 429)**
-- 原因：请求频率超过 B 站限制；视频列表接口为 APP 端 API，对频率限制已较宽松
-- 解决：增大 `min_request_interval` 值（建议 ≥ 5s），减少 `max_video_pages`，或利用视频缓存减少请求
-
-**错误提示：JSON 解析失败**
-- 原因：B 站 API 返回格式变更或响应被压缩
-- 解决：检查日志中的响应内容，或清除缓存重试
-
-### DeepSeek API 错误
-
-**错误提示：DeepSeek API 调用失败**
-- 原因：API 密钥无效、配额不足或网络问题
-- 解决：检查 api_key 配置，确保账户有足够配额
-
-**回复内容为空或不合理**
-- 原因：system_prompt 设置不当
-- 解决：调整 system_prompt，使其更符合预期回复风格
-
-### 其他问题
-
-**无法获取视频列表**
-- 检查 uid 是否正确
-- 确保网络连接正常
-- 查看日志中的详细错误信息
-
-**评论未回复**
-- 检查 `reply.enabled` 是否为 true
-- 查看日志中是否有错误信息
-- 确认评论未被历史记录过滤
-
-**Web UI 无法打开**
-- 检查端口 5000 是否被占用
-- 确认已安装 Flask 和 Flask-SocketIO
-- 查看控制台错误信息
-
-## 技术实现
-
-### 核心架构
-
-- **后端**：Flask + Flask-SocketIO，提供 RESTful API 和 WebSocket 实时通信
-- **前端**：纯 HTML/CSS/JS，内嵌在 Python 字符串中
-- **机器人核心**：后台线程运行，响应停止信号
-
-### API 技术细节
-
-- **视频列表**：使用 B 站 APP 端 API (`app.bilibili.com`)，携带 appkey+sign 签名和 BiliDroid UA 模拟 Android 客户端
-- **BVID↔AID 互转**：纯本地数学算法（异或+查表），无需 API 请求，零网络开销
-- **评论/回复**：使用 B 站 Web 端 API (`api.bilibili.com`)，基于 Cookie 认证
-- **频率控制**：指数退避 + B站错误码检测（-509/-412/-799/10403）+ 部分结果缓存
-
-### 主要模块
-
-**BilibiliCookieManager**
-- 管理 B 站 Cookie 的生命周期
-- 自动刷新过期的 Cookie
-- 持久化 Cookie 状态到文件
-
-**BiliCommentBot**
-- 机器人主逻辑控制器
-- 管理视频列表和评论获取
-- 协调 API 请求和回复生成
-- 实现智能频率控制
-
-**WebServer**
-- Flask 应用服务器
-- 提供 Web UI 界面
-- WebSocket 实时日志推送
-- 配置 API 接口
-
-### 请求处理流程
-
-1. **初始化阶段**
-   - 加载配置文件
-   - 初始化 Cookie 管理器
-   - 加载历史记录
-   - 加载视频缓存
-
-2. **监控循环**
-   - 检查 Cookie 状态
-   - 获取视频列表（使用缓存）
-   - 获取视频评论
-   - 过滤已处理评论
-   - 生成 AI 回复
-   - 发送回复（可选点赞）
-   - 保存历史记录
-
-3. **错误处理**
-   - 自动重试失败的请求
-   - 智能退避避免频率限制
-   - 降级到使用缓存
-   - 记录详细日志
-
-## 文件说明
-
-| 文件 | 说明 |
-|------|------|
-| `main.py` | 主程序，包含 Web UI 和机器人核心逻辑 |
-| `启动机器人.bat` | Windows 启动脚本 |
-| `config.toml` | 配置文件（本地运行，首次运行自动生成） |
-| `config.example.toml` | 配置文件示例（本地） |
-| `config.docker.example.toml` | Docker 配置文件示例 |
-| `data/` | Docker 模式数据目录（包含配置、历史、缓存、日志） |
-| `requirements.txt` | Python 依赖 |
-| `history.json` | 回复历史记录（本地运行） |
-| `bilibili_cookie.json` | Cookie 持久化文件（本地运行） |
-| `video_cache.json` | 视频列表缓存（本地运行） |
-| `logs/bot.log` | 程序运行日志（本地运行） |
-
-## 运行要求
-
-- Python 3.11+ （本地运行）
-- Docker & Docker Compose 20.10+ （Docker 部署）
-- 网络连接正常
-- 已安装依赖（见 requirements.txt）
-
-## Docker 环境配置
-
-在 Docker 环境中运行时，程序会自动检测并禁用浏览器自动打开功能。你需要手动访问 `http://<宿主机IP>:5000` 来使用 Web UI。
-
-### 远程访问配置
-
-如果需要在局域网内远程访问 Web UI，修改 `docker-compose.yml` 中的端口映射：
-
-```yaml
-ports:
-  - "0.0.0.0:5000:5000"  # 允许外部访问
+`reply.enabled` 的含义是“启用自动生成审核草稿”，不是自动发送。
+
+## 数据文件
+
+| 文件 | 用途 |
+|---|---|
+| `config.toml` | 本地配置 |
+| `review_drafts.json` | 审核草稿、批准状态和发送状态 |
+| `history.json` | 已成功发送的回复历史 |
+| `bilibili_cookie.json` | B站 Cookie |
+| `video_cache.json` | 视频列表缓存 |
+
+## 验证
+
+```powershell
+python -m py_compile bot.py server.py
+python -m unittest discover -s tests -v
 ```
 
-然后通过 `http://<服务器IP>:5000` 访问。
+测试会 mock B站发送接口，不会真实回复评论。
 
-### 健康检查
+## 当前限制
 
-Docker 容器内置了健康检查，每 30 秒检查一次服务状态。可以通过以下命令查看健康状态：
+评论抓取沿用原项目的路径：先取账号视频列表，再逐个视频抓最近评论页。它不等同于创作中心“全账号最近回复流”的排序。测试两页后需要核对实际顺序；如果与创作中心差异明显，下一步应改用账号聚合回复流接口。
 
-```bash
-docker inspect bilicomment-bot --format='{{.State.Health.Status}}'
-```
+## 许可证
 
-## 注意事项
-
-1. 请确保 Cookie 和 API 密钥的正确性
-2. **Cookie 必须包含 bili_jct 字段**，否则会出现 CSRF 校验失败
-3. 建议合理设置检查间隔，避免频繁请求
-4. 回复延迟设置可以防止被 B 站限制
-5. 首次运行建议先测试，确认配置正确后再长期运行
-6. 启用点赞功能会增加 API 请求频率，请谨慎使用
-7. Web UI 默认运行在 `http://127.0.0.1:5000`，如需远程访问请修改代码中的 host 配置或使用 Docker 部署时绑定到 0.0.0.0
-8. Docker 部署时，所有数据存储在 `./data` 目录，确保宿主机有足够的磁盘空间
-9. 首次 Docker 部署时，容器会自动在 `./data` 目录下生成配置文件，编辑 `./data/config.toml` 即可
-
-## 免责声明
-
-本工具仅供学习和研究使用，请遵守 B 站的相关规定和 API 使用条款。使用本工具所产生的任何后果由用户自行承担。
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=Janson20/BiliCommentBot&type=date&legend=top-left)](https://www.star-history.com/#Janson20/BiliCommentBot&type=date&legend=top-left)
+上游项目使用 MIT License，本分支保留原 LICENSE。

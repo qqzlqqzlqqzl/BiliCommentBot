@@ -16,7 +16,7 @@ auto_refresh_cookie = true
 # Cookie刷新检查间隔（分钟）
 cookie_refresh_interval = 30
 # 获取评论的最大页数
-max_comment_pages = 10
+max_comment_pages = 2
 # 获取视频的最大页数
 max_video_pages = 10
 
@@ -43,24 +43,17 @@ expire_time = 43200
 # 缓存文件路径（Docker模式下相对于 data 目录）
 cache_file = "video_cache.json"
 
-# DeepSeek API配置
-[deepseek]
-# DeepSeek API密钥
-api_key = "sk-xxx"
-# API基础URL
-base_url = "https://api.deepseek.com"
-# 使用的模型
-model = "deepseek-v4-flash"
-# 最大回复长度
-max_tokens = 200
-# 温度参数（0-1，控制回复的随机性）
-temperature = 0.7
-# 系统提示词（定义AI的角色和行为）
-system_prompt = "你是一个友善的B站游戏区Minecraft UP主，请对评论做出自然、友好的回复。回复要简洁明了，控制在100字以内。"
+# 火山方舟豆包配置。容器中建议通过 ARK_API_KEY 环境变量提供。
+[ark]
+api_key = ""
+base_url = "https://ark.cn-beijing.volces.com/api/v3/responses"
+model = "doubao-seed-2-1-turbo-260628"
+max_tokens = 2400
+system_prompt = "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实。"
 
 # 回复配置
 [reply]
-# 是否启用自动回复
+# 是否启用后台自动生成审核草稿。无论此项是否开启，都不会自动发送。
 enabled = true
 # 回复前缀
 prefix = "🤖 "
@@ -68,6 +61,8 @@ prefix = "🤖 "
 only_new = true
 # 每次最多处理的评论数
 max_process = 10
+# 每批交给豆包判断的评论数
+review_batch_size = 8
 # 回复延迟（秒，避免频繁操作）
 reply_delay = 2
 # 生成回复时使用前N条评论作为上下文（0表示不使用上下文）

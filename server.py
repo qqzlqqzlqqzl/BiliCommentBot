@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-B站评论自动回复机器人 — Web 服务入口
+B站评论人工审核回复工具 — Web 服务入口
 """
 import os
 import time
@@ -320,6 +320,52 @@ def api_history_clear():
         return jsonify({"ok": False, "message": str(e)})
 
 
+@app.route("/api/review/drafts", methods=["GET"])
+def api_review_drafts():
+    bot = get_bot()
+    drafts = bot.get_review_drafts()
+    return jsonify({"ok": True, "total": len(drafts), "drafts": drafts})
+
+
+@app.route("/api/review/generate", methods=["POST"])
+def api_review_generate():
+    data = request.get_json(silent=True) or {}
+    limit = data.get("limit", 20)
+    try:
+        result = get_bot().generate_review_drafts(limit=limit)
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.route("/api/review/approve", methods=["POST"])
+def api_review_approve():
+    data = request.get_json(silent=True) or {}
+    comment_id = str(data.get("comment_id", "")).strip()
+    if not comment_id:
+        return jsonify({"ok": False, "message": "缺少 comment_id"}), 400
+    if not isinstance(data.get("approved"), bool):
+        return jsonify({"ok": False, "message": "approved 必须是布尔值"}), 400
+    try:
+        draft = get_bot().set_review_approval(comment_id, data["approved"])
+        return jsonify({"ok": True, "draft": draft})
+    except (KeyError, ValueError) as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+
+
+@app.route("/api/review/send", methods=["POST"])
+def api_review_send():
+    data = request.get_json(silent=True) or {}
+    comment_ids = data.get("comment_ids")
+    if not isinstance(comment_ids, list) or not comment_ids:
+        return jsonify({"ok": False, "message": "必须明确提交至少一个已批准的 comment_id"}), 400
+    try:
+        result = get_bot().send_approved_drafts(comment_ids=comment_ids)
+        return jsonify({"ok": True, **result})
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
 @app.route("/api/logs", methods=["GET"])
 def api_logs():
     return jsonify({"ok": True, "logs": ws_log_handler.log_buffer[-200:]})
@@ -443,7 +489,7 @@ def main():
     browser_url = f"http://localhost:{port}"
     print(f"""
 ╔══════════════════════════════════════════╗
-║       B站评论自动回复机器人 Web UI        ║
+║       B站评论人工审核回复工具 Web UI        ║
 ╠══════════════════════════════════════════╣
 ║  访问地址: {url:<31}║
 ║  按 Ctrl+C 停止服务                      ║
@@ -455,7 +501,11 @@ def main():
     # 检测配置是否完整，自动启动机器人
     cfg = load_config()
     cookie = cfg.get("bilibili", {}).get("cookie", "")
-    api_key = cfg.get("deepseek", {}).get("api_key", "")
+    api_key = (
+        os.environ.get("ARK_API_KEY")
+        or os.environ.get("VOLCENGINE_ARK_API_KEY")
+        or cfg.get("ark", {}).get("api_key", "")
+    )
     auth_enabled = cfg.get("auth", {}).get("enabled", False)
 
     if auth_enabled:

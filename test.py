@@ -36,7 +36,7 @@ def test_config_loading():
         logger.info("✓ 配置文件加载成功")
         logger.info(f"  - UID: {bot.config['bilibili'].get('uid', '未配置')}")
         logger.info(f"  - 检查间隔: {bot.config['bilibili'].get('check_interval', 0)}秒")
-        logger.info(f"  - DeepSeek模型: {bot.config['deepseek'].get('model', 'N/A')}")
+        logger.info(f"  - 豆包模型: {bot.config['ark'].get('model', 'N/A')}")
         logger.info(f"  - 回复启用: {bot.config['reply'].get('enabled', False)}")
         logger.info(f"  - 上下文评论数: {bot.config['reply'].get('context_comments_count', 0)}")
         return bot
@@ -302,7 +302,7 @@ def main():
     # 9. 模拟回复测试
     if comments and bot.config['reply'].get('enabled', False):
         logger.info("\n是否进行模拟回复测试？（不实际发送到B站）")
-        logger.info("注意: 这将调用DeepSeek API，可能产生API费用")
+        logger.info("注意: 这将调用火山方舟豆包 API，可能产生API费用")
         choice = input("输入 'y' 继续测试，其他键跳过: ").strip().lower()
         if choice == 'y':
             dry_run_reply_test(bot, comments)

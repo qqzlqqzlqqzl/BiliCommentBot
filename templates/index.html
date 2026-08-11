@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>B站评论机器人</title>
+<title>B站评论审核助手</title>
 <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <style>
   :root {
@@ -167,6 +167,15 @@
   /* Auth Gate */
   .auth-gate { position: fixed; inset: 0; z-index: 9999; background: var(--bg); display: flex; align-items: center; justify-content: center; }
   .auth-box { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 40px; width: 380px; box-shadow: 0 8px 32px rgba(0,0,0,.15); }
+  .review-toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }
+  .review-summary { color:var(--text2); font-size:13px; margin-left:auto; }
+  .review-table td { vertical-align:top; line-height:1.55; }
+  .review-comment { min-width:220px; max-width:360px; word-break:break-word; }
+  .review-reply { min-width:220px; max-width:360px; word-break:break-word; color:var(--green); }
+  .review-parent { margin-top:8px; padding:8px 10px; border-left:3px solid var(--accent2); background:var(--surface2); color:var(--text2); font-size:12px; }
+  .review-reason { margin-top:8px; color:var(--text2); font-size:12px; }
+  .review-empty { padding:32px; color:var(--text2); text-align:center; }
+  .review-check { width:18px; height:18px; accent-color:var(--accent); cursor:pointer; }
 </style>
 </head>
 <body>
@@ -193,10 +202,11 @@
   <aside class="sidebar">
     <div class="sidebar-logo">
       <div class="logo-title">🤖 BiliBot</div>
-      <div class="logo-sub">B站评论自动回复</div>
+      <div class="logo-sub">B站评论人工审核回复</div>
     </div>
     <ul class="nav-list">
       <li><a href="#" class="active" data-page="dashboard"><span class="icon">📊</span><span>控制台</span><span class="status-dot" id="nav-status-dot"></span></a></li>
+      <li><a href="#" data-page="review"><span class="icon">✅</span><span>回复审核</span></a></li>
       <li><a href="#" data-page="config"><span class="icon">⚙️</span><span>配置</span></a></li>
       <li><a href="#" data-page="login"><span class="icon">🔑</span><span>登录</span></a></li>
       <li><a href="#" data-page="history"><span class="icon">📝</span><span>历史记录</span></a></li>
@@ -231,9 +241,9 @@
       </div>
 
       <div class="card">
-        <div class="card-title">机器人控制</div>
+        <div class="card-title">草稿监控</div>
         <div class="control-bar">
-          <button class="btn btn-success" id="btn-start" onclick="botStart()">▶ 启动机器人</button>
+          <button class="btn btn-success" id="btn-start" onclick="botStart()">▶ 启动草稿监控</button>
           <button class="btn btn-danger" id="btn-stop" onclick="botStop()" disabled>⏹ 停止</button>
           <button class="btn btn-secondary" onclick="verifyLogin()">🔍 验证登录状态</button>
           <button class="btn btn-secondary" onclick="clearCache()">🗑 清除视频缓存</button>
@@ -250,12 +260,45 @@
       </div>
     </div>
 
+    <!-- Review -->
+    <div class="page" id="page-review">
+      <div class="page-title"><span class="icon">✅</span>回复审核</div>
+      <div class="card">
+        <div class="alert alert-info" style="margin-bottom:16px">
+          豆包只生成候选回复，不会自动发送。只有你勾选批准并再次确认的内容，才会原样发到 B站。
+        </div>
+        <div class="review-toolbar">
+          <label class="form-label" for="review-limit" style="margin:0">本次读取</label>
+          <input class="form-input" id="review-limit" type="number" min="1" max="100" value="20" style="width:90px">
+          <button class="btn btn-primary" id="btn-review-generate" onclick="generateReviewDrafts()">生成最近评论草稿</button>
+          <button class="btn btn-secondary" onclick="loadReviewDrafts()">刷新列表</button>
+          <button class="btn btn-success" id="btn-review-send" onclick="sendApprovedDrafts()">发送已勾选</button>
+          <span class="review-summary" id="review-summary">共 0 条，可审核 0 条，已勾选 0 条</span>
+        </div>
+        <div class="table-wrap">
+          <table class="review-table">
+            <thead>
+              <tr>
+                <th>批准</th>
+                <th>视频 / 观众评论</th>
+                <th>豆包原文</th>
+                <th>状态</th>
+              </tr>
+            </thead>
+            <tbody id="review-tbody">
+              <tr><td colspan="4" class="review-empty">还没有审核草稿</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
     <!-- Config -->
     <div class="page" id="page-config">
       <div class="page-title"><span class="icon">⚙️</span>配置</div>
       <div class="tab-bar">
         <button class="tab-btn active" data-tab="tab-bilibili">B站配置</button>
-        <button class="tab-btn" data-tab="tab-deepseek">DeepSeek</button>
+        <button class="tab-btn" data-tab="tab-ark">豆包 / 火山方舟</button>
         <button class="tab-btn" data-tab="tab-reply">回复策略</button>
         <button class="tab-btn" data-tab="tab-rate">频率控制</button>
         <button class="tab-btn" data-tab="tab-cache">缓存</button>
@@ -292,7 +335,7 @@
           <div class="form-row">
             <div class="form-group">
               <label class="form-label">最大评论页数</label>
-              <input class="form-input" type="number" id="cfg-bilibili-max_comment_pages" value="10">
+              <input class="form-input" type="number" id="cfg-bilibili-max_comment_pages" value="2">
             </div>
             <div class="form-group">
               <label class="form-label">最大视频页数</label>
@@ -308,34 +351,31 @@
         </div>
       </div>
 
-      <!-- DeepSeek -->
-      <div class="tab-panel" id="tab-deepseek">
+      <!-- Ark -->
+      <div class="tab-panel" id="tab-ark">
         <div class="card">
           <div class="form-group">
-            <label class="form-label">DeepSeek API Key</label>
-            <input class="form-input" id="cfg-deepseek-api_key" placeholder="sk-xxx" type="password">
+            <label class="form-label">火山方舟 API Key</label>
+            <input class="form-input" id="cfg-ark-api_key" placeholder="建议使用 ARK_API_KEY 环境变量" type="password">
+            <div class="form-hint">API Key 不要提交到仓库。环境变量 ARK_API_KEY 优先于这里的配置。</div>
           </div>
           <div class="form-group">
-            <label class="form-label">API Base URL</label>
-            <input class="form-input" id="cfg-deepseek-base_url" value="https://api.deepseek.com">
+            <label class="form-label">Responses API 地址</label>
+            <input class="form-input" id="cfg-ark-base_url" value="https://ark.cn-beijing.volces.com/api/v3/responses">
           </div>
           <div class="form-row">
             <div class="form-group">
               <label class="form-label">模型</label>
-              <input class="form-input" id="cfg-deepseek-model" value="deepseek-v4-flash">
+              <input class="form-input" id="cfg-ark-model" value="doubao-seed-2-1-turbo-260628">
             </div>
             <div class="form-group">
-              <label class="form-label">最大 Token 数</label>
-              <input class="form-input" type="number" id="cfg-deepseek-max_tokens" value="200">
+              <label class="form-label">单批最大输出 Token</label>
+              <input class="form-input" type="number" id="cfg-ark-max_tokens" value="2400">
             </div>
           </div>
           <div class="form-group">
-            <label class="form-label">温度（0-1，越高越随机）</label>
-            <input class="form-input" type="number" step="0.1" min="0" max="1" id="cfg-deepseek-temperature" value="0.7">
-          </div>
-          <div class="form-group">
-            <label class="form-label">系统提示词（定义 AI 角色和回复风格）</label>
-            <textarea class="form-textarea" id="cfg-deepseek-system_prompt" rows="5"></textarea>
+            <label class="form-label">筛选与回复提示词</label>
+            <textarea class="form-textarea" id="cfg-ark-system_prompt" rows="5"></textarea>
           </div>
         </div>
       </div>
@@ -346,7 +386,7 @@
           <div class="form-group">
             <label class="form-check">
               <input type="checkbox" id="cfg-reply-enabled" checked>
-              启用自动回复
+              启用自动生成审核草稿
             </label>
           </div>
           <div class="form-group">
@@ -670,6 +710,9 @@ socket.on('log_history', d => { allLogs = d.logs; renderLogs(); });
 socket.on('new_history', item => {
   if (currentPage === 'history') loadHistory(historyPage);
 });
+socket.on('review_updated', () => {
+  if (currentPage === 'review') loadReviewDrafts();
+});
 socket.on('qr_status', d => {
   const el = document.getElementById('qr-status');
   if (el) {
@@ -714,6 +757,7 @@ function navigateTo(page) {
   document.querySelector(`[data-page="${page}"]`).classList.add('active');
   currentPage = page;
   if (page === 'history') loadHistory(1);
+  if (page === 'review') loadReviewDrafts();
   if (page === 'config') loadConfig();
 }
 
@@ -890,13 +934,12 @@ function loadConfig() {
     set('cfg-bilibili-max_video_pages', b.max_video_pages);
     set('cfg-bilibili-auto_refresh_cookie', b.auto_refresh_cookie);
 
-    const ds = cfg.deepseek || {};
-    set('cfg-deepseek-api_key', ds.api_key);
-    set('cfg-deepseek-base_url', ds.base_url);
-    set('cfg-deepseek-model', ds.model);
-    set('cfg-deepseek-max_tokens', ds.max_tokens);
-    set('cfg-deepseek-temperature', ds.temperature);
-    set('cfg-deepseek-system_prompt', ds.system_prompt);
+    const ark = cfg.ark || {};
+    set('cfg-ark-api_key', ark.api_key);
+    set('cfg-ark-base_url', ark.base_url);
+    set('cfg-ark-model', ark.model);
+    set('cfg-ark-max_tokens', ark.max_tokens);
+    set('cfg-ark-system_prompt', ark.system_prompt);
 
     const r = cfg.reply || {};
     set('cfg-reply-enabled', r.enabled);
@@ -974,13 +1017,12 @@ function saveConfig() {
       max_video_pages: get('cfg-bilibili-max_video_pages'),
       auto_refresh_cookie: get('cfg-bilibili-auto_refresh_cookie'),
     },
-    deepseek: {
-      api_key: get('cfg-deepseek-api_key'),
-      base_url: get('cfg-deepseek-base_url'),
-      model: get('cfg-deepseek-model'),
-      max_tokens: get('cfg-deepseek-max_tokens'),
-      temperature: get('cfg-deepseek-temperature'),
-      system_prompt: get('cfg-deepseek-system_prompt'),
+    ark: {
+      api_key: get('cfg-ark-api_key'),
+      base_url: get('cfg-ark-base_url'),
+      model: get('cfg-ark-model'),
+      max_tokens: get('cfg-ark-max_tokens'),
+      system_prompt: get('cfg-ark-system_prompt'),
     },
     reply: {
       enabled: get('cfg-reply-enabled'),
@@ -1044,6 +1086,143 @@ function saveConfig() {
   }).then(r=>r.json()).then(d=>{
     showToast(d.message, d.ok ? 'success' : 'error');
   });
+}
+
+// ── 回复审核 ──
+function reviewStatusLabel(item) {
+  const labels = {
+    pending: '待审核',
+    approved: '已勾选',
+    skipped: '豆包建议跳过',
+    sent: '已发送',
+    failed: '发送失败',
+  };
+  return labels[item.status] || item.status || '-';
+}
+
+function reviewStatusBadge(item) {
+  const cls = item.status === 'sent' ? 'badge-green'
+    : item.status === 'failed' ? 'badge-red'
+    : item.status === 'approved' ? 'badge-blue'
+    : '';
+  return `<span class="badge ${cls}">${escHtml(reviewStatusLabel(item))}</span>`;
+}
+
+function loadReviewDrafts() {
+  fetch('/api/review/drafts').then(r => r.json()).then(d => {
+    if (!d.ok) {
+      showToast(d.message || '读取审核草稿失败', 'error');
+      return;
+    }
+    const items = d.drafts || [];
+    const replyable = items.filter(item => item.should_reply && item.status !== 'sent').length;
+    const approved = items.filter(item => item.approved && item.status === 'approved').length;
+    document.getElementById('review-summary').textContent =
+      `共 ${items.length} 条，可审核 ${replyable} 条，已勾选 ${approved} 条`;
+    document.getElementById('btn-review-send').disabled = approved === 0;
+
+    const tbody = document.getElementById('review-tbody');
+    if (!items.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="review-empty">还没有审核草稿</td></tr>';
+      return;
+    }
+    tbody.innerHTML = items.map(item => {
+      const canApprove = item.should_reply && !['sent', 'skipped'].includes(item.status);
+      const parent = item.parent_comment
+        ? `<div class="review-parent">上级评论 · ${escHtml(item.parent_author || '')}<br>${escHtml(item.parent_comment)}</div>`
+        : '';
+      const reason = item.reason
+        ? `<div class="review-reason">豆包判断：${escHtml(item.reason)}</div>`
+        : '';
+      return `
+        <tr>
+          <td style="text-align:center">
+            <input class="review-check" type="checkbox"
+              ${item.approved && item.status === 'approved' ? 'checked' : ''}
+              ${canApprove ? '' : 'disabled'}
+              onchange="setDraftApproval('${escHtml(String(item.comment_id))}', this.checked, this)">
+          </td>
+          <td class="review-comment">
+            <div style="color:var(--text2);font-size:12px;margin-bottom:6px">${escHtml(item.video_title || '')}</div>
+            <div><span class="badge badge-blue">${escHtml(item.author || '')}</span></div>
+            <div style="margin-top:7px">${escHtml(item.comment || '')}</div>
+            ${parent}
+          </td>
+          <td class="review-reply">
+            ${item.reply ? escHtml(item.reply) : '<span style="color:var(--text2)">不建议回复</span>'}
+            ${reason}
+          </td>
+          <td>${reviewStatusBadge(item)}</td>
+        </tr>`;
+    }).join('');
+  }).catch(e => showToast(`读取审核草稿失败：${e}`, 'error'));
+}
+
+function generateReviewDrafts() {
+  const button = document.getElementById('btn-review-generate');
+  const limit = Math.max(1, Math.min(100, Number(document.getElementById('review-limit').value) || 20));
+  button.disabled = true;
+  button.textContent = '豆包生成中...';
+  fetch('/api/review/generate', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({limit}),
+  }).then(r => r.json()).then(d => {
+    if (d.ok) {
+      showToast(`生成 ${d.generated} 条：可回复 ${d.replyable} 条，跳过 ${d.skipped} 条`, 'success');
+      loadReviewDrafts();
+    } else {
+      showToast(d.message || '生成失败', 'error');
+    }
+  }).catch(e => showToast(`生成失败：${e}`, 'error')).finally(() => {
+    button.disabled = false;
+    button.textContent = '生成最近评论草稿';
+  });
+}
+
+function setDraftApproval(commentId, approved, checkbox) {
+  checkbox.disabled = true;
+  fetch('/api/review/approve', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({comment_id: commentId, approved}),
+  }).then(r => r.json()).then(d => {
+    if (!d.ok) showToast(d.message || '保存批准状态失败', 'error');
+    loadReviewDrafts();
+  }).catch(e => {
+    showToast(`保存批准状态失败：${e}`, 'error');
+    loadReviewDrafts();
+  });
+}
+
+function sendApprovedDrafts() {
+  fetch('/api/review/drafts').then(r => r.json()).then(d => {
+    if (!d.ok) throw new Error(d.message || '读取草稿失败');
+    const approved = (d.drafts || []).filter(item => item.approved && item.status === 'approved');
+    if (!approved.length) {
+      showToast('没有已勾选、待发送的回复', 'info');
+      return;
+    }
+    const message = `将向 B站发送已勾选的 ${approved.length} 条豆包原文。发送后无法在本工具中撤回，确认继续？`;
+    if (!confirm(message)) return;
+    const button = document.getElementById('btn-review-send');
+    button.disabled = true;
+    fetch('/api/review/send', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({comment_ids: approved.map(item => String(item.comment_id))}),
+    }).then(r => r.json()).then(result => {
+      if (result.ok) {
+        showToast(`已发送 ${result.sent} 条，失败 ${result.failed} 条`, result.failed ? 'error' : 'success');
+      } else {
+        showToast(result.message || '发送失败', 'error');
+      }
+      loadReviewDrafts();
+    }).catch(e => {
+      showToast(`发送失败：${e}`, 'error');
+      loadReviewDrafts();
+    });
+  }).catch(e => showToast(`发送前检查失败：${e}`, 'error'));
 }
 
 // ── 扫码登录 ──
