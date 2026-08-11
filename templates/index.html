@@ -274,6 +274,15 @@
           <button class="btn btn-primary" id="btn-review-generate" onclick="generateReviewDrafts()">生成最近评论草稿</button>
           <button class="btn btn-secondary" onclick="loadReviewDrafts()">刷新列表</button>
           <button class="btn btn-success" id="btn-review-send" onclick="sendApprovedDrafts()">发送已勾选</button>
+          <label class="form-label" for="review-status-filter" style="margin:0 0 0 8px">显示</label>
+          <select class="form-input" id="review-status-filter" onchange="loadReviewDrafts()" style="width:150px">
+            <option value="pending" selected>待审核</option>
+            <option value="skipped">豆包建议跳过</option>
+            <option value="approved">已勾选</option>
+            <option value="sent">已发送</option>
+            <option value="failed">发送失败</option>
+            <option value="all">全部</option>
+          </select>
           <span class="review-summary" id="review-summary">共 0 条，可审核 0 条，已勾选 0 条</span>
         </div>
         <div class="table-wrap">
@@ -335,11 +344,12 @@
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label class="form-label">最大评论页数</label>
+              <label class="form-label">最近回复页数</label>
               <input class="form-input" type="number" id="cfg-bilibili-max_comment_pages" value="2">
+              <div class="form-hint">审核页从账号聚合回复流读取，每页 10 条；测试阶段建议 2 页。</div>
             </div>
             <div class="form-group">
-              <label class="form-label">最大视频页数</label>
+              <label class="form-label">旧视频扫描页数（审核流程不使用）</label>
               <input class="form-input" type="number" id="cfg-bilibili-max_video_pages" value="10">
             </div>
           </div>
@@ -1109,7 +1119,7 @@ function reviewStatusBadge(item) {
   return `<span class="badge ${cls}">${escHtml(reviewStatusLabel(item))}</span>`;
 }
 
-function loadReviewDrafts() {
+function loadReviewDrafts(retryOnNetworkError = true) {
   fetch('/api/review/drafts').then(r => r.json()).then(d => {
     if (!d.ok) {
       showToast(d.message || '读取审核草稿失败', 'error');
@@ -1122,12 +1132,17 @@ function loadReviewDrafts() {
       `共 ${items.length} 条，可审核 ${replyable} 条，已勾选 ${approved} 条`;
     document.getElementById('btn-review-send').disabled = approved === 0;
 
+    const selectedStatus = document.getElementById('review-status-filter').value;
+    const visibleItems = selectedStatus === 'all'
+      ? items
+      : items.filter(item => item.status === selectedStatus);
     const tbody = document.getElementById('review-tbody');
-    if (!items.length) {
-      tbody.innerHTML = '<tr><td colspan="4" class="review-empty">还没有审核草稿</td></tr>';
+    if (!visibleItems.length) {
+      const message = items.length ? '当前筛选下没有草稿' : '还没有审核草稿';
+      tbody.innerHTML = `<tr><td colspan="4" class="review-empty">${message}</td></tr>`;
       return;
     }
-    tbody.innerHTML = items.map(item => {
+    tbody.innerHTML = visibleItems.map(item => {
       const canApprove = item.should_reply && !['sent', 'skipped'].includes(item.status);
       const parent = item.parent_comment
         ? `<div class="review-parent">上级评论 · ${escHtml(item.parent_author || '')}<br>${escHtml(item.parent_comment)}</div>`
@@ -1156,7 +1171,13 @@ function loadReviewDrafts() {
           <td>${reviewStatusBadge(item)}</td>
         </tr>`;
     }).join('');
-  }).catch(e => showToast(`读取审核草稿失败：${e}`, 'error'));
+  }).catch(e => {
+    if (retryOnNetworkError) {
+      setTimeout(() => loadReviewDrafts(false), 800);
+      return;
+    }
+    showToast('读取审核草稿失败：本地服务暂时没有响应，请刷新页面', 'error');
+  });
 }
 
 function generateReviewDrafts() {
