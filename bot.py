@@ -883,19 +883,12 @@ class BiliCommentBot:
             "context": [parent] if parent else [],
             "parent_comment": parent,
             "is_follow_up": bool(original.get("root_id") or original.get("depth")),
+            "regenerate": True,
+            "previous_reply": str(original.get("reply") or ""),
         }
 
         try:
-            decisions = self.generate_reply_decisions_resilient([item])
-            decision = decisions[0] if decisions else {
-                "should_reply": False,
-                "reply": "",
-                "reason": "豆包未返回该条，暂不回复",
-                "model": self.config.get("ark", {}).get(
-                    "model",
-                    DEFAULT_CONFIG["ark"]["model"],
-                ),
-            }
+            decision = self.generate_distinct_reply_decision(item)
             should_reply = bool(decision.get("should_reply") and decision.get("reply"))
             with self._review_lock:
                 current = self._review_drafts.get(comment_id)
@@ -1248,6 +1241,13 @@ class BiliCommentBot:
                 "author": comment.user,
                 "comment": comment.content,
                 "is_follow_up": bool(item.get("is_follow_up") or comment.root_id),
+                "regenerate": bool(item.get("regenerate")),
+                "previous_reply": str(item.get("previous_reply") or ""),
+                "avoid_replies": [
+                    str(reply)
+                    for reply in (item.get("avoid_replies") or [])
+                    if str(reply).strip()
+                ],
                 "parent_context": [
                     {"author": parent.user, "comment": parent.content}
                     for parent in context
@@ -1266,6 +1266,7 @@ class BiliCommentBot:
 5. 不要为了追平对话而回复每一条追评。拿不准是否值得继续时 should_reply=false。
 6. reply 必须是可直接发出的豆包原文，通常不超过60个汉字；不要加“回复：”、引号、分析或备选项。
 7. 不要编造视频和评论里没有的事实。
+8. regenerate=true 表示用户不满意旧回复。必须重新组织表达，不能与 previous_reply 或 avoid_replies 中的内容相同，也不能只替换标点、语气词或少量近义词。
 
 只输出严格 JSON 数组：
 [{{"id":"评论id","should_reply":true,"reply":"直接回复正文","reason":"简短判断"}}]
@@ -1316,6 +1317,46 @@ class BiliCommentBot:
                 "model": model,
             })
         return results
+
+    @staticmethod
+    def _normalized_reply_text(text: str) -> str:
+        return re.sub(r"[\W_]+", "", str(text or ""), flags=re.UNICODE).lower()
+
+    def generate_distinct_reply_decision(self, item: dict) -> dict:
+        """重新生成时最多调用豆包两次，确保不是原样返回。"""
+        previous_reply = str(item.get("previous_reply") or "")
+        avoid_replies = [previous_reply] if previous_reply else []
+
+        for _ in range(2):
+            request_item = dict(item)
+            request_item["regenerate"] = True
+            request_item["previous_reply"] = previous_reply
+            request_item["avoid_replies"] = list(avoid_replies)
+            decisions = self.generate_reply_decisions_resilient([request_item])
+            decision = decisions[0] if decisions else None
+            if not decision or not decision.get("should_reply"):
+                return decision or {
+                    "id": str(item["comment"].comment_id),
+                    "should_reply": False,
+                    "reply": "",
+                    "reason": "豆包未返回该条，暂不回复",
+                    "model": self.config.get("ark", {}).get(
+                        "model",
+                        DEFAULT_CONFIG["ark"]["model"],
+                    ),
+                }
+
+            new_reply = str(decision.get("reply") or "")
+            normalized_new = self._normalized_reply_text(new_reply)
+            if normalized_new and all(
+                normalized_new != self._normalized_reply_text(old_reply)
+                for old_reply in avoid_replies
+            ):
+                return decision
+            if new_reply:
+                avoid_replies.append(new_reply)
+
+        raise RuntimeError("豆包连续两次返回相同回复，旧回复已保留，请稍后再试")
 
     def generate_reply_decisions_resilient(self, items: List[dict]) -> List[dict]:
         """豆包偶发返回坏 JSON 时串行拆小批次，避免一条坏结果拖垮整批。"""

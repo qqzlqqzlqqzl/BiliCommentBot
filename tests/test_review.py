@@ -109,6 +109,36 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertIn("纯“谢谢/收到/哈哈”", prompt)
         self.assertFalse(result[0]["should_reply"])
 
+    def test_regenerate_prompt_contains_previous_reply_and_requires_difference(self):
+        comment = bot_module.Comment(
+            comment_id="1",
+            content="测试评论",
+            user="观众",
+            uid="42",
+            time=123,
+        )
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {
+            "output": [{
+                "content": [{
+                    "type": "output_text",
+                    "text": '[{"id":"1","should_reply":true,"reply":"全新的说法","reason":"已重写"}]',
+                }],
+            }],
+        }
+        with patch.object(bot_module.requests, "post", return_value=response) as post:
+            self.bot.generate_reply_decisions([{
+                "comment": comment,
+                "regenerate": True,
+                "previous_reply": "原来的说法",
+                "avoid_replies": ["原来的说法"],
+            }])
+
+        prompt = post.call_args.kwargs["json"]["input"][0]["content"][0]["text"]
+        self.assertIn('"previous_reply": "原来的说法"', prompt)
+        self.assertIn("不能只替换标点", prompt)
+
     def test_bad_doubao_json_is_split_serially_without_losing_whole_batch(self):
         def item(comment_id):
             return {
@@ -175,22 +205,58 @@ class ReviewWorkflowTests(unittest.TestCase):
         draft["root_id"] = "99"
         draft["depth"] = 1
         self.bot._review_drafts["1"] = draft
-        self.bot.generate_reply_decisions_resilient = Mock(return_value=[{
+        self.bot.generate_distinct_reply_decision = Mock(return_value={
             "id": "1",
             "should_reply": True,
             "reply": "豆包重新生成的原文",
             "reason": "有新的互动价值",
             "model": "doubao-new",
-        }])
+        })
 
         result = self.bot.regenerate_review_draft("1")
 
         self.assertEqual(result["reply"], "豆包重新生成的原文")
         self.assertEqual(result["status"], "pending")
         self.assertFalse(result["approved"])
-        item = self.bot.generate_reply_decisions_resilient.call_args.args[0][0]
+        item = self.bot.generate_distinct_reply_decision.call_args.args[0]
         self.assertTrue(item["is_follow_up"])
         self.assertEqual(item["context"][0].content, "之前的回复")
+        self.assertEqual(item["previous_reply"], "豆包原文")
+
+    def test_regenerate_retries_when_doubao_returns_same_reply(self):
+        item = {
+            "comment": bot_module.Comment(
+                comment_id="1",
+                content="测试评论",
+                user="观众",
+                uid="42",
+                time=123,
+            ),
+            "previous_reply": "原来的回复！",
+        }
+        self.bot.generate_reply_decisions_resilient = Mock(side_effect=[
+            [{
+                "id": "1",
+                "should_reply": True,
+                "reply": "原来的回复。",
+                "reason": "第一次",
+                "model": "doubao",
+            }],
+            [{
+                "id": "1",
+                "should_reply": True,
+                "reply": "换一个完全不同的角度",
+                "reason": "第二次",
+                "model": "doubao",
+            }],
+        ])
+
+        result = self.bot.generate_distinct_reply_decision(item)
+
+        self.assertEqual(result["reply"], "换一个完全不同的角度")
+        self.assertEqual(self.bot.generate_reply_decisions_resilient.call_count, 2)
+        second_item = self.bot.generate_reply_decisions_resilient.call_args_list[1].args[0][0]
+        self.assertIn("原来的回复。", second_item["avoid_replies"])
 
     def test_sent_draft_cannot_be_regenerated(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=False, status="sent")
