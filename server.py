@@ -250,10 +250,12 @@ def _poll_qr_login(qr_key: str, session: requests.Session):
 # ─────────────────────────────────────────────
 @app.route("/")
 def index():
+    cfg = load_config()
     return render_template(
         "index.html",
         instance_name=get_instance_name(),
         instance_port=get_server_port(),
+        instance_uid=str(cfg.get("bilibili", {}).get("uid", "") or "未配置"),
     )
 
 
@@ -557,12 +559,15 @@ def main():
     else:
         print("⚠️  未启用登录密码保护，建议在配置 > 安全中设置密码")
 
-    if cookie and api_key:
+    auto_start_monitor = os.environ.get("BILI_AUTO_START_MONITOR", "1").strip() == "1"
+    if cookie and api_key and auto_start_monitor:
         print("检测到有效配置，自动启动机器人...")
         if bot.start():
             print("✓ 机器人已自动启动")
         else:
             print("✗ 机器人启动失败")
+    elif cookie and api_key:
+        print("Web 服务已启动；草稿监控保持停止，请在页面中手动启动")
     else:
         print("提示: 请在 Web UI 中完成配置后启动")
 

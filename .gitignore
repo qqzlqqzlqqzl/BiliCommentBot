@@ -17,6 +17,8 @@ bilibili_cookie.json
 video_cache.json
 /data-account-*/
 /.review-generation.lock
+/.review-generation.lock.owner.json
+/.review-generation.lock.owner.json.*.tmp
 
 # 构建和打包
 /build

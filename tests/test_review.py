@@ -141,6 +141,19 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(calls, [["1", "2"], ["1"], ["2"]])
         self.assertEqual([entry["reply"] for entry in result], ["回复1", "回复2"])
 
+    def test_busy_message_identifies_account_port_and_operation(self):
+        message = bot_module._review_generation_busy_message({
+            "active": True,
+            "account": "账号2",
+            "port": "5001",
+            "operation": "重新生成单条回复",
+        })
+
+        self.assertEqual(
+            message,
+            "账号2（端口 5001）正在重新生成单条回复，请完成后再试",
+        )
+
     def test_approval_is_persisted_without_changing_reply(self):
         self.bot._review_drafts["1"] = self._draft("1")
         original_reply = self.bot._review_drafts["1"]["reply"]

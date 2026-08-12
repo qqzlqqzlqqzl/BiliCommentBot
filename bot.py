@@ -35,21 +35,64 @@ REVIEW_GENERATION_LOCK_FILE = os.environ.get(
     "BILI_REVIEW_LOCK_FILE",
     os.path.abspath(".review-generation.lock"),
 )
+REVIEW_GENERATION_OWNER_FILE = f"{REVIEW_GENERATION_LOCK_FILE}.owner.json"
 _PROCESS_REVIEW_GENERATION_LOCK = threading.Lock()
+_PROCESS_REVIEW_GENERATION_OWNER = {}
 
 
 class ReviewGenerationBusyError(RuntimeError):
     pass
 
 
+def _review_generation_owner(operation: str) -> dict:
+    return {
+        "active": True,
+        "account": os.environ.get("BILI_ACCOUNT_NAME", "").strip() or "未命名账号",
+        "port": os.environ.get("BILI_PORT", "").strip() or "未知端口",
+        "operation": operation,
+        "pid": os.getpid(),
+        "started_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def _write_review_generation_owner(owner: dict):
+    temp_file = f"{REVIEW_GENERATION_OWNER_FILE}.{os.getpid()}.tmp"
+    with open(temp_file, "w", encoding="utf-8") as handle:
+        json.dump(owner, handle, ensure_ascii=False)
+    os.replace(temp_file, REVIEW_GENERATION_OWNER_FILE)
+
+
+def _read_review_generation_owner() -> dict:
+    try:
+        with open(REVIEW_GENERATION_OWNER_FILE, "r", encoding="utf-8") as handle:
+            owner = json.load(handle)
+        return owner if isinstance(owner, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _review_generation_busy_message(owner: dict = None) -> str:
+    owner = owner or {}
+    if owner.get("active"):
+        account = owner.get("account") or "另一个账号"
+        port = owner.get("port") or "未知端口"
+        operation = owner.get("operation") or "处理审核草稿"
+        return f"{account}（端口 {port}）正在{operation}，请完成后再试"
+    return "另一个账号正在处理审核草稿，请完成后再试"
+
+
 @contextmanager
-def review_generation_guard():
+def review_generation_guard(operation: str = "生成审核草稿"):
     """保证同一台机器上的多个账号实例不会并发抓取评论或调用豆包。"""
+    global _PROCESS_REVIEW_GENERATION_OWNER
     if not _PROCESS_REVIEW_GENERATION_LOCK.acquire(blocking=False):
-        raise ReviewGenerationBusyError("已有账号正在生成审核草稿，请等它完成后再试")
+        raise ReviewGenerationBusyError(
+            _review_generation_busy_message(_PROCESS_REVIEW_GENERATION_OWNER)
+        )
 
     lock_handle = None
     locked = False
+    owner = _review_generation_owner(operation)
     try:
         lock_handle = open(REVIEW_GENERATION_LOCK_FILE, "a+b")
         lock_handle.seek(0, os.SEEK_END)
@@ -68,13 +111,21 @@ def review_generation_guard():
             locked = True
         except (OSError, BlockingIOError) as exc:
             raise ReviewGenerationBusyError(
-                "另一个账号正在生成审核草稿，请等它完成后再试"
+                _review_generation_busy_message(_read_review_generation_owner())
             ) from exc
 
+        _PROCESS_REVIEW_GENERATION_OWNER = owner
+        _write_review_generation_owner(owner)
         yield
     finally:
         if lock_handle is not None:
             if locked:
+                _write_review_generation_owner({
+                    **owner,
+                    "active": False,
+                    "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                _PROCESS_REVIEW_GENERATION_OWNER = {}
                 lock_handle.seek(0)
                 if os.name == "nt":
                     import msvcrt
@@ -788,7 +839,7 @@ class BiliCommentBot:
     def regenerate_review_draft(self, comment_id: str) -> dict:
         """使用当前最新配置重新生成单条候选回复，不访问 B站接口。"""
         comment_id = str(comment_id)
-        with review_generation_guard():
+        with review_generation_guard("重新生成单条回复"):
             with self._review_lock:
                 current = self._review_drafts.get(comment_id)
                 if not current:
@@ -1619,7 +1670,7 @@ class BiliCommentBot:
         return result
 
     def generate_review_drafts(self, limit: int = None) -> dict:
-        with review_generation_guard():
+        with review_generation_guard("生成审核草稿"):
             return self._generate_review_drafts(limit)
 
     def _generate_review_drafts(self, limit: int = None) -> dict:
