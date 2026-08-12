@@ -14,6 +14,7 @@ import re
 import random
 import copy
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -82,8 +83,8 @@ def _review_generation_busy_message(owner: dict = None) -> str:
 
 
 @contextmanager
-def review_generation_guard(operation: str = "生成审核草稿"):
-    """保证同一台机器上的多个账号实例不会并发抓取评论或调用豆包。"""
+def review_generation_guard(operation: str = "读取 B站最近回复"):
+    """只串行保护 B站读取阶段；豆包生成不占用这把跨账号锁。"""
     global _PROCESS_REVIEW_GENERATION_OWNER
     if not _PROCESS_REVIEW_GENERATION_LOCK.acquire(blocking=False):
         raise ReviewGenerationBusyError(
@@ -839,86 +840,87 @@ class BiliCommentBot:
     def regenerate_review_draft(self, comment_id: str) -> dict:
         """使用当前最新配置重新生成单条候选回复，不访问 B站接口。"""
         comment_id = str(comment_id)
-        with review_generation_guard("重新生成单条回复"):
+        with self._review_lock:
+            current = self._review_drafts.get(comment_id)
+            if not current:
+                raise KeyError("草稿不存在")
+            if current.get("status") == "sent":
+                raise ValueError("已发送的回复不能重新生成")
+            if current.get("status") == "regenerating":
+                raise ValueError("该回复已经在重新生成")
+            original = dict(current)
+            current["approved"] = False
+            current["status"] = "regenerating"
+            self._save_review_drafts()
+
+        comment = Comment(
+            comment_id=comment_id,
+            content=str(original.get("comment") or ""),
+            user=str(original.get("author") or ""),
+            uid=str(original.get("author_uid") or ""),
+            time=int(original.get("comment_time") or 0),
+            parent_id=original.get("parent_id"),
+            root_id=original.get("root_id"),
+            depth=int(original.get("depth") or 0),
+        )
+        parent = None
+        if original.get("parent_comment"):
+            parent = Comment(
+                comment_id=str(original.get("parent_id") or original.get("root_id") or "context"),
+                content=str(original["parent_comment"]),
+                user=str(original.get("parent_author") or "上级评论"),
+                uid="",
+                time=0,
+            )
+
+        item = {
+            "bvid": original.get("bvid", ""),
+            "oid": original.get("oid", ""),
+            "comment_type": original.get("comment_type", 1),
+            "video_title": original.get("video_title", ""),
+            "video_desc": "",
+            "comment": comment,
+            "context": [parent] if parent else [],
+            "parent_comment": parent,
+            "is_follow_up": bool(original.get("root_id") or original.get("depth")),
+        }
+
+        try:
+            decisions = self.generate_reply_decisions_resilient([item])
+            decision = decisions[0] if decisions else {
+                "should_reply": False,
+                "reply": "",
+                "reason": "豆包未返回该条，暂不回复",
+                "model": self.config.get("ark", {}).get(
+                    "model",
+                    DEFAULT_CONFIG["ark"]["model"],
+                ),
+            }
+            should_reply = bool(decision.get("should_reply") and decision.get("reply"))
             with self._review_lock:
                 current = self._review_drafts.get(comment_id)
                 if not current:
                     raise KeyError("草稿不存在")
                 if current.get("status") == "sent":
-                    raise ValueError("已发送的回复不能重新生成")
-                original = dict(current)
-                current["approved"] = False
-                current["status"] = "regenerating"
+                    raise ValueError("回复已在重新生成期间发送，不能覆盖")
+                current.update({
+                    "should_reply": should_reply,
+                    "reply": decision.get("reply", "") if should_reply else "",
+                    "reason": decision.get("reason", ""),
+                    "model": decision.get("model", ""),
+                    "approved": False,
+                    "status": "pending" if should_reply else "skipped",
+                    "regenerated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
                 self._save_review_drafts()
-
-            comment = Comment(
-                comment_id=comment_id,
-                content=str(original.get("comment") or ""),
-                user=str(original.get("author") or ""),
-                uid=str(original.get("author_uid") or ""),
-                time=int(original.get("comment_time") or 0),
-                parent_id=original.get("parent_id"),
-                root_id=original.get("root_id"),
-                depth=int(original.get("depth") or 0),
-            )
-            parent = None
-            if original.get("parent_comment"):
-                parent = Comment(
-                    comment_id=str(original.get("parent_id") or original.get("root_id") or "context"),
-                    content=str(original["parent_comment"]),
-                    user=str(original.get("parent_author") or "上级评论"),
-                    uid="",
-                    time=0,
-                )
-
-            item = {
-                "bvid": original.get("bvid", ""),
-                "oid": original.get("oid", ""),
-                "comment_type": original.get("comment_type", 1),
-                "video_title": original.get("video_title", ""),
-                "video_desc": "",
-                "comment": comment,
-                "context": [parent] if parent else [],
-                "parent_comment": parent,
-                "is_follow_up": bool(original.get("root_id") or original.get("depth")),
-            }
-
-            try:
-                decisions = self.generate_reply_decisions_resilient([item])
-                decision = decisions[0] if decisions else {
-                    "should_reply": False,
-                    "reply": "",
-                    "reason": "豆包未返回该条，暂不回复",
-                    "model": self.config.get("ark", {}).get(
-                        "model",
-                        DEFAULT_CONFIG["ark"]["model"],
-                    ),
-                }
-                should_reply = bool(decision.get("should_reply") and decision.get("reply"))
-                with self._review_lock:
-                    current = self._review_drafts.get(comment_id)
-                    if not current:
-                        raise KeyError("草稿不存在")
-                    if current.get("status") == "sent":
-                        raise ValueError("回复已在重新生成期间发送，不能覆盖")
-                    current.update({
-                        "should_reply": should_reply,
-                        "reply": decision.get("reply", "") if should_reply else "",
-                        "reason": decision.get("reason", ""),
-                        "model": decision.get("model", ""),
-                        "approved": False,
-                        "status": "pending" if should_reply else "skipped",
-                        "regenerated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    })
+                result = dict(current)
+        except Exception:
+            with self._review_lock:
+                current = self._review_drafts.get(comment_id)
+                if current and current.get("status") == "regenerating":
+                    self._review_drafts[comment_id] = original
                     self._save_review_drafts()
-                    result = dict(current)
-            except Exception:
-                with self._review_lock:
-                    current = self._review_drafts.get(comment_id)
-                    if current and current.get("status") == "regenerating":
-                        self._review_drafts[comment_id] = original
-                        self._save_review_drafts()
-                raise
+            raise
 
         self._emit("review_updated", {"regenerated": comment_id})
         return result
@@ -1670,25 +1672,34 @@ class BiliCommentBot:
         return result
 
     def generate_review_drafts(self, limit: int = None) -> dict:
-        with review_generation_guard("生成审核草稿"):
-            return self._generate_review_drafts(limit)
-
-    def _generate_review_drafts(self, limit: int = None) -> dict:
         if self.auto_refresh_cookie:
             self.refresh_cookie_if_needed()
         limit = int(limit or self.config["reply"].get("max_process", 10))
         limit = max(1, min(limit, 100))
-        items = self._collect_review_items(limit)
+        # 只锁 B站读取。读取完成后立即释放，两个账号的豆包生成可同时进行。
+        with review_generation_guard("读取 B站最近回复"):
+            items = self._collect_review_items(limit)
+        return self._generate_review_drafts(items)
+
+    def _generate_review_drafts(self, items: List[dict]) -> dict:
         if not items:
             return {"generated": 0, "replyable": 0, "skipped": 0}
 
-        # 评论可能很长。小批次更容易让模型稳定输出完整 JSON，仍保持串行调用。
+        # 评论可能很长。按小批次保证 JSON 稳定，不同批次可并发调用豆包。
         batch_size = max(1, min(int(self.config["reply"].get("review_batch_size", 4)), 4))
+        batches = [
+            items[start:start + batch_size]
+            for start in range(0, len(items), batch_size)
+        ]
         decisions = {}
-        for start in range(0, len(items), batch_size):
-            batch = items[start:start + batch_size]
-            for decision in self.generate_reply_decisions_resilient(batch):
-                decisions[decision["id"]] = decision
+        with ThreadPoolExecutor(max_workers=len(batches)) as executor:
+            futures = [
+                executor.submit(self.generate_reply_decisions_resilient, batch)
+                for batch in batches
+            ]
+            for future in as_completed(futures):
+                for decision in future.result():
+                    decisions[decision["id"]] = decision
 
         generated = 0
         replyable = 0

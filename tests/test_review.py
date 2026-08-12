@@ -4,6 +4,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -141,17 +142,17 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(calls, [["1", "2"], ["1"], ["2"]])
         self.assertEqual([entry["reply"] for entry in result], ["回复1", "回复2"])
 
-    def test_busy_message_identifies_account_port_and_operation(self):
+    def test_busy_message_identifies_bilibili_read_owner(self):
         message = bot_module._review_generation_busy_message({
             "active": True,
             "account": "账号2",
             "port": "5001",
-            "operation": "重新生成单条回复",
+            "operation": "读取 B站最近回复",
         })
 
         self.assertEqual(
             message,
-            "账号2（端口 5001）正在重新生成单条回复，请完成后再试",
+            "账号2（端口 5001）正在读取 B站最近回复，请完成后再试",
         )
 
     def test_approval_is_persisted_without_changing_reply(self):
@@ -196,6 +197,44 @@ class ReviewWorkflowTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "已发送"):
             self.bot.regenerate_review_draft("1")
+
+    def test_doubao_batches_run_concurrently_after_bilibili_read(self):
+        def item(comment_id):
+            return {
+                "bvid": "BV1test",
+                "oid": "100",
+                "comment_type": 1,
+                "video_title": "测试视频",
+                "comment": bot_module.Comment(
+                    comment_id=str(comment_id),
+                    content=f"评论{comment_id}",
+                    user="观众",
+                    uid="42",
+                    time=123,
+                ),
+                "parent_comment": None,
+            }
+
+        self.bot.config["reply"]["review_batch_size"] = 1
+        barrier = threading.Barrier(2)
+
+        def fake_generate(batch):
+            barrier.wait(timeout=1)
+            time.sleep(0.02)
+            comment_id = str(batch[0]["comment"].comment_id)
+            return [{
+                "id": comment_id,
+                "should_reply": True,
+                "reply": f"回复{comment_id}",
+                "reason": "可回复",
+                "model": "doubao",
+            }]
+
+        self.bot.generate_reply_decisions_resilient = fake_generate
+        result = self.bot._generate_review_drafts([item(1), item(2)])
+
+        self.assertEqual(result["generated"], 2)
+        self.assertEqual(result["replyable"], 2)
 
     def test_empty_requested_list_sends_nothing(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")

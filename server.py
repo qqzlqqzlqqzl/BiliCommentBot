@@ -388,8 +388,6 @@ def api_review_regenerate():
     try:
         draft = get_bot().regenerate_review_draft(comment_id)
         return jsonify({"ok": True, "draft": draft})
-    except ReviewGenerationBusyError as e:
-        return jsonify({"ok": False, "message": str(e)}), 409
     except (KeyError, ValueError) as e:
         return jsonify({"ok": False, "message": str(e)}), 400
     except Exception as e:
