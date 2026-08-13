@@ -1591,134 +1591,71 @@ class BiliCommentBot:
         self.last_cookie_refresh_time = current_time
 
     # ── 人工审核处理循环 ──
-    def get_account_reply_feed(self, limit: int) -> List[dict]:
-        """读取账号聚合回复流，不再枚举账号下的全部视频。"""
-        url = "https://api.bilibili.com/x/msgfeed/reply"
-        page_size = 10
-        max_pages = max(1, int(self.config["bilibili"].get("max_comment_pages", 2)))
-        only_bvid = self.config["reply"].get("only_bvid", "").strip()
-        items = []
-        seen_ids = set()
-        cursor_id = None
-        cursor_time = None
-
-        for page in range(1, max_pages + 1):
-            params = {"ps": page_size, "platform": "web"}
-            if cursor_id is not None and cursor_time is not None:
-                params["id"] = cursor_id
-                params["reply_time"] = cursor_time
-            response = self.make_request_with_retry(
-                "GET",
-                url,
-                params=params,
-                use_cache=False,
-            )
-            if not response:
-                raise RuntimeError(f"读取账号回复流失败（第 {page} 页无响应）")
-            payload = response.json()
-            if payload.get("code") != 0:
-                raise RuntimeError(
-                    f"读取账号回复流失败: {payload.get('code')} {payload.get('message', '')}"
-                )
-
-            page_items = (payload.get("data") or {}).get("items") or []
-            self.logger.info(f"账号回复流第{page}页获取到 {len(page_items)} 条")
-            for outer in page_items:
-                raw = outer.get("item") or {}
-                user = outer.get("user") or {}
-                comment_id = str(raw.get("source_id") or "")
-                if not comment_id or comment_id in seen_ids:
-                    continue
-                seen_ids.add(comment_id)
-
-                uri = str(raw.get("uri") or raw.get("native_uri") or "")
-                bvid_match = re.search(r"/video/(BV[0-9A-Za-z]+)", uri)
-                bvid = bvid_match.group(1) if bvid_match else ""
-                if only_bvid and bvid != only_bvid:
-                    continue
-
-                root_id = str(raw.get("root_id") or "")
-                if root_id == "0":
-                    root_id = ""
-                parent_context = (
-                    str(raw.get("target_reply_content") or "").strip()
-                    or str(raw.get("root_reply_content") or "").strip()
-                )
-                parent = None
-                if parent_context:
-                    parent = Comment(
-                        comment_id=str(raw.get("target_id") or root_id or "context"),
-                        content=parent_context,
-                        user="上级评论",
-                        uid="",
-                        time=0,
-                    )
-
-                comment = Comment(
-                    comment_id=comment_id,
-                    content=str(raw.get("source_content") or "").strip(),
-                    user=str(user.get("nickname") or ""),
-                    uid=str(user.get("mid") or ""),
-                    time=int(outer.get("reply_time") or 0),
-                    parent_id=comment_id if root_id else None,
-                    root_id=root_id or None,
-                    depth=1 if root_id else 0,
-                )
-                items.append({
-                    "bvid": bvid,
-                    "oid": str(raw.get("subject_id") or ""),
-                    "comment_type": int(raw.get("business_id") or 1),
-                    "video_title": str(raw.get("title") or ""),
-                    "video_desc": "",
-                    "comment": comment,
-                    "context": [parent] if parent else [],
-                    "parent_comment": parent,
-                    "is_follow_up": bool(root_id),
-                })
-                if len(items) >= limit:
-                    return items
-
-            if len(page_items) < page_size:
-                break
-            cursor = (payload.get("data") or {}).get("cursor") or {}
-            if cursor.get("is_end"):
-                break
-            next_id = cursor.get("id")
-            next_time = cursor.get("time")
-            if next_id is None or next_time is None:
-                break
-            cursor_id = next_id
-            cursor_time = next_time
-
-        return items
-
     def _collect_review_items(self, limit: int) -> List[dict]:
+        only_bvid = self.config["reply"].get("only_bvid", "").strip()
+        if only_bvid:
+            videos = [{"bvid": only_bvid, "title": f"指定视频({only_bvid})", "desc": ""}]
+        else:
+            videos = self.get_video_list()
+        if not videos:
+            raise RuntimeError("未获取到视频列表")
+
+        context_count = self.config["reply"].get("context_comments_count", 0)
         my_uid = self.config["bilibili"].get("uid", "")
+        items = []
+
         with self._review_lock:
             existing_ids = set(self._review_drafts)
 
-        result = []
-        for item in self.get_account_reply_feed(limit=max(limit * 2, limit)):
-            comment = item["comment"]
-            if comment.comment_id in self.processed_comments or comment.comment_id in existing_ids:
-                continue
-            if my_uid and comment.uid == my_uid:
-                continue
-            passed, _ = self._check_filters(comment)
-            if not passed:
-                continue
-            result.append(item)
-            if len(result) >= limit:
+        for video in videos:
+            if len(items) >= limit:
                 break
-        return result
+            bvid = video["bvid"]
+            comments = self.get_video_comments(bvid)
+            for idx, comment in enumerate(comments):
+                if len(items) >= limit:
+                    break
+                if comment.comment_id in self.processed_comments or comment.comment_id in existing_ids:
+                    continue
+                if my_uid and comment.uid == my_uid:
+                    continue
+                passed, _ = self._check_filters(comment)
+                if not passed:
+                    continue
+
+                context = []
+                parent_comment = None
+                if comment.depth > 0 and comment.parent_id:
+                    parent_comment = next(
+                        (candidate for candidate in comments if candidate.comment_id == comment.parent_id),
+                        None,
+                    )
+                    if parent_comment:
+                        context.append(parent_comment)
+                if context_count > 0 and idx > 0:
+                    start_idx = max(0, idx - context_count)
+                    for previous in comments[start_idx:idx]:
+                        if previous.comment_id != comment.parent_id:
+                            context.append(previous)
+
+                items.append({
+                    "bvid": bvid,
+                    "video_title": video.get("title", ""),
+                    "video_desc": video.get("desc", ""),
+                    "comment": comment,
+                    "context": context,
+                    "parent_comment": parent_comment,
+                    "is_follow_up": comment.depth > 0,
+                })
+        return items
 
     def generate_review_drafts(self, limit: int = None) -> dict:
         if self.auto_refresh_cookie:
             self.refresh_cookie_if_needed()
         limit = int(limit or self.config["reply"].get("max_process", 10))
         limit = max(1, min(limit, 100))
-        # 只锁 B站读取。读取完成后立即释放，两个账号的豆包生成可同时进行。
-        with review_generation_guard("读取 B站最近回复"):
+        # 原基座抓取链保持不变；跨账号只串行保护 B站读取阶段。
+        with review_generation_guard("读取 B站视频评论"):
             items = self._collect_review_items(limit)
         return self._generate_review_drafts(items)
 

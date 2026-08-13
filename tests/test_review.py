@@ -177,12 +177,12 @@ class ReviewWorkflowTests(unittest.TestCase):
             "active": True,
             "account": "账号2",
             "port": "5001",
-            "operation": "读取 B站最近回复",
+            "operation": "读取 B站视频评论",
         })
 
         self.assertEqual(
             message,
-            "账号2（端口 5001）正在读取 B站最近回复，请完成后再试",
+            "账号2（端口 5001）正在读取 B站视频评论，请完成后再试",
         )
 
     def test_approval_is_persisted_without_changing_reply(self):
@@ -330,104 +330,41 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(self.bot._review_drafts["1"]["status"], "sent")
         self.assertEqual(self.bot._review_drafts["3"]["status"], "approved")
 
-    def test_account_reply_feed_uses_recent_notification_pages(self):
-        self.bot.config["bilibili"]["max_comment_pages"] = 2
+    def test_collect_review_items_uses_original_video_comment_chain(self):
         self.bot.config["reply"]["only_bvid"] = ""
-        self.bot.make_request_with_retry = Mock()
-        first_page = {
-            "code": 0,
-            "data": {
-                "cursor": {"is_end": False, "id": 900, "time": 120},
-                "items": [{
-                        "reply_time": 123,
-                        "user": {"nickname": "观众甲", "mid": 99},
-                        "item": {
-                            "source_id": 1001,
-                            "subject_id": 2001,
-                            "root_id": 0,
-                            "business_id": 1,
-                            "source_content": "测试评论",
-                            "title": "测试标题",
-                            "uri": "https://www.bilibili.com/video/BV1abc123",
-                        },
-                }],
-            },
-        }
-        self.bot.make_request_with_retry.side_effect = [
-            Mock(json=Mock(return_value=first_page)),
-        ]
-
-        items = self.bot.get_account_reply_feed(limit=1)
-
-        self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["comment"].comment_id, "1001")
-        self.assertEqual(items[0]["comment"].content, "测试评论")
-        self.assertEqual(items[0]["oid"], "2001")
-        self.assertEqual(items[0]["bvid"], "BV1abc123")
-        self.bot.make_request_with_retry.assert_called_once_with(
-            "GET",
-            "https://api.bilibili.com/x/msgfeed/reply",
-            params={"ps": 10, "platform": "web"},
-            use_cache=False,
+        self.bot.config["reply"]["context_comments_count"] = 0
+        self.bot.config["bilibili"]["uid"] = "999"
+        self.bot.get_video_list = Mock(return_value=[{
+            "bvid": "BV1test",
+            "title": "测试视频",
+            "desc": "视频简介",
+        }])
+        root = bot_module.Comment(
+            comment_id="100",
+            content="主评论",
+            user="观众甲",
+            uid="1",
+            time=100,
         )
-
-    def test_account_reply_feed_uses_cursor_for_second_page(self):
-        self.bot.config["bilibili"]["max_comment_pages"] = 2
-        self.bot.config["reply"]["only_bvid"] = ""
-        first = {
-            "code": 0,
-            "data": {
-                "cursor": {"is_end": False, "id": 900, "time": 120},
-                "items": [
-                    {
-                        "reply_time": 123,
-                        "user": {"nickname": "甲", "mid": 1},
-                        "item": {
-                            "source_id": 1001 + index,
-                            "subject_id": 2001,
-                            "root_id": 0,
-                            "business_id": 1,
-                            "source_content": "第一页",
-                            "title": "标题一",
-                            "uri": "https://www.bilibili.com/video/BV1pageone",
-                        },
-                    }
-                    for index in range(10)
-                ],
-            },
-        }
-        second = {
-            "code": 0,
-            "data": {
-                "cursor": {"is_end": True, "id": 800, "time": 100},
-                "items": [{
-                    "reply_time": 100,
-                    "user": {"nickname": "乙", "mid": 2},
-                    "item": {
-                        "source_id": 2001,
-                        "subject_id": 3001,
-                        "root_id": 0,
-                        "business_id": 1,
-                        "source_content": "第二页",
-                        "title": "标题二",
-                        "uri": "https://www.bilibili.com/video/BV1pagetwo",
-                    },
-                }],
-            },
-        }
-        self.bot.make_request_with_retry = Mock(side_effect=[
-            Mock(json=Mock(return_value=first)),
-            Mock(json=Mock(return_value=second)),
-        ])
-
-        items = self.bot.get_account_reply_feed(limit=20)
-
-        self.assertEqual(len(items), 11)
-        self.assertEqual(items[-1]["comment"].content, "第二页")
-        self.assertEqual(
-            self.bot.make_request_with_retry.call_args_list[1].kwargs["params"],
-            {"ps": 10, "platform": "web", "id": 900, "reply_time": 120},
+        child = bot_module.Comment(
+            comment_id="101",
+            content="楼中楼",
+            user="观众乙",
+            uid="2",
+            time=101,
+            parent_id="100",
+            root_id="100",
+            depth=1,
         )
+        self.bot.get_video_comments = Mock(return_value=[root, child])
+
+        items = self.bot._collect_review_items(limit=20)
+
+        self.bot.get_video_list.assert_called_once_with()
+        self.bot.get_video_comments.assert_called_once_with("BV1test")
+        self.assertEqual([item["comment"].comment_id for item in items], ["100", "101"])
+        self.assertEqual(items[1]["parent_comment"].comment_id, "100")
+        self.assertTrue(items[1]["is_follow_up"])
 
 
 if __name__ == "__main__":
