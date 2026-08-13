@@ -33,7 +33,6 @@ from bot import (
     HISTORY_FILE,
     COOKIE_FILE,
     VIDEO_CACHE_FILE,
-    ReviewGenerationBusyError,
 )
 
 # ─────────────────────────────────────────────
@@ -357,8 +356,6 @@ def api_review_generate():
     try:
         result = get_bot().generate_review_drafts(limit=limit)
         return jsonify({"ok": True, **result})
-    except ReviewGenerationBusyError as e:
-        return jsonify({"ok": False, "message": str(e)}), 409
     except Exception as e:
         get_bot().logger.exception("生成审核草稿失败")
         return jsonify({"ok": False, "message": str(e)}), 500
