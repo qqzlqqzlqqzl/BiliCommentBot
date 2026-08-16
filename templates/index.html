@@ -385,7 +385,21 @@
             </div>
             <div class="form-group">
               <label class="form-label">单批最大输出 Token</label>
-              <input class="form-input" type="number" id="cfg-ark-max_tokens" value="2400">
+              <input class="form-input" type="number" id="cfg-ark-max_tokens" value="128000">
+              <div class="form-hint">这是输出上限，不是每次固定消耗量。</div>
+            </div>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label class="form-label">思考力度</label>
+              <select class="form-select" id="cfg-ark-reasoning_effort">
+                <option value="low">low（更快）</option>
+                <option value="medium" selected>medium（均衡）</option>
+                <option value="high">high（更充分）</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <div class="form-hint" style="margin-top:28px">评论筛选和草拟默认使用 medium；修改后保存配置即可生效。</div>
             </div>
           </div>
           <div class="form-group">
@@ -960,6 +974,7 @@ function loadConfig() {
     set('cfg-ark-base_url', ark.base_url);
     set('cfg-ark-model', ark.model);
     set('cfg-ark-max_tokens', ark.max_tokens);
+    set('cfg-ark-reasoning_effort', ark.reasoning_effort);
     set('cfg-ark-system_prompt', ark.system_prompt);
 
     const r = cfg.reply || {};
@@ -1046,6 +1061,7 @@ function saveConfig() {
       base_url: get('cfg-ark-base_url'),
       model: get('cfg-ark-model'),
       max_tokens: get('cfg-ark-max_tokens'),
+      reasoning_effort: get('cfg-ark-reasoning_effort'),
       system_prompt: get('cfg-ark-system_prompt'),
     },
     reply: {

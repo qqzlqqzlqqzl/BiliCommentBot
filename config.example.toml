@@ -47,7 +47,8 @@ cache_file = "video_cache.json"
 api_key = ""
 base_url = "https://ark.cn-beijing.volces.com/api/v3/responses"
 model = "doubao-seed-2-1-turbo-260628"
-max_tokens = 2400
+max_tokens = 128000
+reasoning_effort = "medium"
 system_prompt = "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实。"
 
 # 回复配置

@@ -22,7 +22,8 @@
 ```text
 model: doubao-seed-2-1-turbo-260628
 endpoint: https://ark.cn-beijing.volces.com/api/v3/responses
-reasoning.effort: low
+reasoning.effort: medium（设置页可选 low / medium / high）
+max_output_tokens: 128000
 ```
 
 API Key 优先从环境变量读取：

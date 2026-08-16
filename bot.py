@@ -63,7 +63,8 @@ DEFAULT_CONFIG = {
         "api_key": "",
         "base_url": "https://ark.cn-beijing.volces.com/api/v3/responses",
         "model": "doubao-seed-2-1-turbo-260628",
-        "max_tokens": 2400,
+        "max_tokens": 128000,
+        "reasoning_effort": "medium",
         "system_prompt": "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实。",
     },
     "reply": {
@@ -290,6 +291,10 @@ class BilibiliCookieManager:
             return True
         except Exception:
             return False
+
+
+class ArkEmptyOutputError(RuntimeError):
+    """方舟请求成功，但响应中没有可用的 output_text。"""
 
 
 # ─────────────────────────────────────────────
@@ -1299,8 +1304,10 @@ class BiliCommentBot:
                 "role": "user",
                 "content": [{"type": "input_text", "text": prompt}],
             }],
-            "reasoning": {"effort": "low"},
-            "max_output_tokens": int(api_config.get("max_tokens", 2400)),
+            "reasoning": {
+                "effort": str(api_config.get("reasoning_effort", "medium")).strip().lower(),
+            },
+            "max_output_tokens": int(api_config.get("max_tokens", 128000)),
         }
         proxy_url = os.environ.get("ARK_PROXY_URL", "").strip()
         proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
@@ -1312,9 +1319,14 @@ class BiliCommentBot:
             proxies=proxies,
         )
         response.raise_for_status()
-        output_text = self._ark_output_text(response.json())
+        response_payload = response.json()
+        output_text = self._ark_output_text(response_payload)
         if not output_text:
-            raise RuntimeError("豆包没有返回文本")
+            status = str(response_payload.get("status") or "unknown")
+            incomplete = response_payload.get("incomplete_details")
+            raise ArkEmptyOutputError(
+                f"豆包没有返回文本（status={status}, incomplete_details={incomplete!r}）"
+            )
         parsed = self._parse_json_text(output_text)
         if not isinstance(parsed, list):
             raise RuntimeError("豆包返回格式不是 JSON 数组")
@@ -1377,12 +1389,14 @@ class BiliCommentBot:
         raise RuntimeError("豆包连续两次返回相同回复，旧回复已保留，请稍后再试")
 
     def generate_reply_decisions_resilient(self, items: List[dict]) -> List[dict]:
-        """豆包偶发返回坏 JSON 时串行拆小批次，避免一条坏结果拖垮整批。"""
+        """豆包偶发返回坏 JSON/空文本时串行拆小批次，避免拖垮整批。"""
         try:
             return self.generate_reply_decisions(items)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, ArkEmptyOutputError) as exc:
+            problem = "JSON 不完整" if isinstance(exc, json.JSONDecodeError) else "空文本"
             self.logger.warning(
-                "豆包返回 JSON 不完整，当前批次 %s 条，准备串行拆分: %s",
+                "豆包返回%s，当前批次 %s 条，准备串行拆分: %s",
+                problem,
                 len(items),
                 exc,
             )
@@ -1392,7 +1406,11 @@ class BiliCommentBot:
                     "id": comment_id,
                     "should_reply": False,
                     "reply": "",
-                    "reason": "豆包返回格式异常，暂不回复",
+                    "reason": (
+                        "豆包未返回文本，暂不回复"
+                        if isinstance(exc, ArkEmptyOutputError)
+                        else "豆包返回格式异常，暂不回复"
+                    ),
                     "model": self.config.get("ark", {}).get(
                         "model",
                         DEFAULT_CONFIG["ark"]["model"],

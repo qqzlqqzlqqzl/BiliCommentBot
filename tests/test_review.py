@@ -138,6 +138,9 @@ class ReviewWorkflowTests(unittest.TestCase):
         prompt = post.call_args.kwargs["json"]["input"][0]["content"][0]["text"]
         self.assertIn('"previous_reply": "原来的说法"', prompt)
         self.assertIn("不能只替换标点", prompt)
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["max_output_tokens"], 128000)
+        self.assertEqual(payload["reasoning"], {"effort": "medium"})
 
     def test_bad_doubao_json_is_split_serially_without_losing_whole_batch(self):
         def item(comment_id):
@@ -171,6 +174,41 @@ class ReviewWorkflowTests(unittest.TestCase):
 
         self.assertEqual(calls, [["1", "2"], ["1"], ["2"]])
         self.assertEqual([entry["reply"] for entry in result], ["回复1", "回复2"])
+
+    def test_empty_doubao_output_is_split_and_single_failure_is_skipped(self):
+        def item(comment_id):
+            return {
+                "comment": bot_module.Comment(
+                    comment_id=str(comment_id),
+                    content=f"评论{comment_id}",
+                    user="观众",
+                    uid="42",
+                    time=123,
+                ),
+            }
+
+        calls = []
+
+        def fake_generate(items):
+            comment_ids = [entry["comment"].comment_id for entry in items]
+            calls.append(comment_ids)
+            if len(items) > 1 or comment_ids == ["1"]:
+                raise bot_module.ArkEmptyOutputError("豆包没有返回文本")
+            return [{
+                "id": "2",
+                "should_reply": True,
+                "reply": "回复2",
+                "reason": "可回复",
+                "model": "doubao",
+            }]
+
+        self.bot.generate_reply_decisions = fake_generate
+        result = self.bot.generate_reply_decisions_resilient([item(1), item(2)])
+
+        self.assertEqual(calls, [["1", "2"], ["1"], ["2"]])
+        self.assertFalse(result[0]["should_reply"])
+        self.assertEqual(result[0]["reason"], "豆包未返回文本，暂不回复")
+        self.assertEqual(result[1]["reply"], "回复2")
 
     def test_approval_is_persisted_without_changing_reply(self):
         self.bot._review_drafts["1"] = self._draft("1")
