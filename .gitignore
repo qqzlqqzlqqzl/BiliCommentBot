@@ -21,6 +21,7 @@ video_cache.json
 # 构建和打包
 /build
 /dist
+/release
 *.spec
 !BiliCommentReviewer.spec
 

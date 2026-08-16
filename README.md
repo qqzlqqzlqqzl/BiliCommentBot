@@ -119,6 +119,8 @@ pwsh -NoProfile -File .\build_release.ps1 -SkipInstall
 ```
 
 构建脚本使用独立 `.venv-build`，旧 build/dist 目标会送入回收站，不会直接删除。
+完成后同时生成 `release\BiliCommentReviewer-0.1.0-windows-x64.zip` 和对应
+`.sha256` 文件，分发时发送 ZIP 即可。
 
 ## 验证
 

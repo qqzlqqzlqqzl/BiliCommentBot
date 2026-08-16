@@ -39,6 +39,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
+    version="version_info.txt",
     disable_windowed_traceback=False,
 )
 
