@@ -174,8 +174,10 @@
   .review-reply { min-width:220px; max-width:360px; word-break:break-word; color:var(--green); }
   .review-parent { margin-top:8px; padding:8px 10px; border-left:3px solid var(--accent2); background:var(--surface2); color:var(--text2); font-size:12px; }
   .review-reason { margin-top:8px; color:var(--text2); font-size:12px; }
+  .review-time { color:var(--text2); font-size:12px; margin-left:8px; white-space:nowrap; }
   .review-empty { padding:32px; color:var(--text2); text-align:center; }
-  .review-check { width:18px; height:18px; accent-color:var(--accent); cursor:pointer; }
+  .review-check-cell { width:64px; min-width:64px; text-align:center; vertical-align:middle !important; }
+  .review-check { width:36px; height:36px; accent-color:var(--accent); cursor:pointer; }
 </style>
 </head>
 <body>
@@ -272,8 +274,15 @@
         <div class="review-toolbar">
           <label class="form-label" for="review-limit" style="margin:0">本次读取</label>
           <input class="form-input" id="review-limit" type="number" min="1" max="1000" value="20" style="width:90px">
-          <label class="form-label" for="review-since" style="margin:0">起始时间</label>
-          <input class="form-input" id="review-since" type="datetime-local" style="width:200px">
+          <label class="form-label" for="review-time-range" style="margin:0">时间范围</label>
+          <select class="form-select" id="review-time-range" style="width:140px" onchange="updateReviewTimeRange()">
+            <option value="">不限时间</option>
+            <option value="24h">最近24小时</option>
+            <option value="3d">最近3天</option>
+            <option value="7d">最近7天</option>
+            <option value="custom">自定义时间</option>
+          </select>
+          <input class="form-input" id="review-since" type="datetime-local" style="width:200px;color-scheme:dark;display:none" aria-label="自定义起始时间">
           <button class="btn btn-primary" id="btn-review-generate" onclick="generateReviewDrafts()">生成最近评论草稿</button>
           <button class="btn btn-secondary" onclick="loadReviewDrafts()">刷新列表</button>
           <button class="btn btn-success" id="btn-review-send" onclick="sendApprovedDrafts()">发送已勾选</button>
@@ -400,6 +409,21 @@
             </div>
             <div class="form-group">
               <div class="form-hint" style="margin-top:28px">评论筛选和草拟默认使用 medium；修改后保存配置即可生效。</div>
+            </div>
+          </div>
+          <div class="form-row-3">
+            <div class="form-group">
+              <label class="form-label">请求起始间隔（秒）</label>
+              <input class="form-input" type="number" min="0.1" step="0.01" id="cfg-ark-request_interval_seconds" value="0.15">
+              <div class="form-hint">当前服务内错开发起；0.15秒约等于400 RPM。</div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">最大并发</label>
+              <input class="form-input" type="number" min="1" max="64" id="cfg-ark-max_concurrency" value="16">
+            </div>
+            <div class="form-group">
+              <label class="form-label">失败重试次数</label>
+              <input class="form-input" type="number" min="1" max="10" id="cfg-ark-max_retries" value="5">
             </div>
           </div>
           <div class="form-group">
@@ -735,6 +759,7 @@ let currentPage = 'dashboard';
 let historyPage = 1;
 let allLogs = [];
 let configData = {};
+let reviewPreferencesLoaded = false;
 
 // ── Socket 事件 ──
 socket.on('connect', () => { console.log('WS connected'); });
@@ -975,6 +1000,9 @@ function loadConfig() {
     set('cfg-ark-model', ark.model);
     set('cfg-ark-max_tokens', ark.max_tokens);
     set('cfg-ark-reasoning_effort', ark.reasoning_effort);
+    set('cfg-ark-request_interval_seconds', ark.request_interval_seconds);
+    set('cfg-ark-max_concurrency', ark.max_concurrency);
+    set('cfg-ark-max_retries', ark.max_retries);
     set('cfg-ark-system_prompt', ark.system_prompt);
 
     const r = cfg.reply || {};
@@ -985,8 +1013,10 @@ function loadConfig() {
     set('cfg-reply-like_user_video_only_followers', r.like_user_video_only_followers);
     set('cfg-reply-max_process', r.max_process);
     set('cfg-reply-review_since', r.review_since);
-    set('review-limit', r.max_process);
-    set('review-since', r.review_since);
+    if (!reviewPreferencesLoaded) {
+      restoreReviewPreferences(r.max_process, r.review_since);
+      reviewPreferencesLoaded = true;
+    }
     set('cfg-reply-reply_delay', r.reply_delay);
     set('cfg-reply-context_comments_count', r.context_comments_count);
     set('cfg-reply-chained_reply_enabled', r.chained_reply_enabled);
@@ -1062,6 +1092,9 @@ function saveConfig() {
       model: get('cfg-ark-model'),
       max_tokens: get('cfg-ark-max_tokens'),
       reasoning_effort: get('cfg-ark-reasoning_effort'),
+      request_interval_seconds: get('cfg-ark-request_interval_seconds'),
+      max_concurrency: get('cfg-ark-max_concurrency'),
+      max_retries: get('cfg-ark-max_retries'),
       system_prompt: get('cfg-ark-system_prompt'),
     },
     reply: {
@@ -1184,7 +1217,7 @@ function loadReviewDrafts(retryOnNetworkError = true) {
         : '';
       return `
         <tr>
-          <td style="text-align:center">
+          <td class="review-check-cell">
             <input class="review-check" type="checkbox"
               ${item.approved && item.status === 'approved' ? 'checked' : ''}
               ${canApprove ? '' : 'disabled'}
@@ -1192,7 +1225,10 @@ function loadReviewDrafts(retryOnNetworkError = true) {
           </td>
           <td class="review-comment">
             <div style="color:var(--text2);font-size:12px;margin-bottom:6px">${escHtml(item.video_title || '')}</div>
-            <div><span class="badge badge-blue">${escHtml(item.author || '')}</span></div>
+            <div>
+              <span class="badge badge-blue">${escHtml(item.author || '')}</span>
+              <span class="review-time">${formatCommentTime(item.comment_time)}</span>
+            </div>
             <div style="margin-top:7px">${escHtml(item.comment || '')}</div>
             ${parent}
           </td>
@@ -1219,10 +1255,72 @@ function loadReviewDrafts(retryOnNetworkError = true) {
   });
 }
 
+function localDateTimeValue(date) {
+  const pad = value => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatCommentTime(unixSeconds) {
+  const value = Number(unixSeconds);
+  if (!Number.isFinite(value) || value <= 0) return '时间未知';
+  const date = new Date(value * 1000);
+  const pad = part => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function saveReviewPreferences() {
+  localStorage.setItem('bilibot.review.limit', document.getElementById('review-limit').value);
+  localStorage.setItem('bilibot.review.timeRange', document.getElementById('review-time-range').value);
+  localStorage.setItem('bilibot.review.since', document.getElementById('review-since').value);
+}
+
+function restoreReviewPreferences(defaultLimit, defaultSince) {
+  const savedLimit = localStorage.getItem('bilibot.review.limit');
+  const savedRange = localStorage.getItem('bilibot.review.timeRange');
+  const savedSince = localStorage.getItem('bilibot.review.since');
+  const timeRange = document.getElementById('review-time-range');
+  const sinceInput = document.getElementById('review-since');
+  document.getElementById('review-limit').value = savedLimit || defaultLimit || 20;
+  timeRange.value = savedRange !== null ? savedRange : (defaultSince ? 'custom' : '');
+  sinceInput.value = savedSince !== null ? savedSince : (defaultSince || '');
+  sinceInput.style.display = timeRange.value === 'custom' ? '' : 'none';
+}
+
+function updateReviewTimeRange() {
+  const range = document.getElementById('review-time-range').value;
+  const sinceInput = document.getElementById('review-since');
+  sinceInput.style.display = range === 'custom' ? '' : 'none';
+  if (!range) {
+    sinceInput.value = '';
+  } else if (range !== 'custom') {
+    const milliseconds = {
+      '24h': 24 * 3600e3,
+      '3d': 3 * 24 * 3600e3,
+      '7d': 7 * 24 * 3600e3,
+    }[range];
+    sinceInput.value = localDateTimeValue(new Date(Date.now() - milliseconds));
+  }
+  saveReviewPreferences();
+}
+
+function selectedReviewSince() {
+  const range = document.getElementById('review-time-range').value;
+  if (!range) return '';
+  if (range === 'custom') return document.getElementById('review-since').value || '';
+  const milliseconds = {
+    '24h': 24 * 3600e3,
+    '3d': 3 * 24 * 3600e3,
+    '7d': 7 * 24 * 3600e3,
+  }[range];
+  return localDateTimeValue(new Date(Date.now() - milliseconds));
+}
+
 function generateReviewDrafts() {
   const button = document.getElementById('btn-review-generate');
   const limit = Math.max(1, Math.min(1000, Number(document.getElementById('review-limit').value) || 20));
-  const reviewSince = document.getElementById('review-since').value || '';
+  document.getElementById('review-limit').value = limit;
+  const reviewSince = selectedReviewSince();
+  saveReviewPreferences();
   button.disabled = true;
   button.textContent = '豆包生成中...';
   fetch('/api/review/generate', {
@@ -1419,6 +1517,8 @@ function escHtml(str) {
 // ── 初始化 ──
 (function init() {
   checkAuthGate();
+  document.getElementById('review-limit').addEventListener('input', saveReviewPreferences);
+  document.getElementById('review-since').addEventListener('change', saveReviewPreferences);
   loadConfig();
   fetch('/api/bot/status').then(r=>r.json()).then(d => updateStats(d));
 })();

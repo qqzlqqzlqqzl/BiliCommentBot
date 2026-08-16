@@ -29,6 +29,7 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.bot.socketio = None
         self.bot.save_history = Mock()
         self.bot.reply_comment = Mock(return_value=True)
+        self.bot._wait_for_ark_slot = Mock()
 
     def tearDown(self):
         self.file_patch.stop()
@@ -86,6 +87,7 @@ class ReviewWorkflowTests(unittest.TestCase):
             time=100,
         )
         response = Mock()
+        response.status_code = 200
         response.raise_for_status = Mock()
         response.json.return_value = {
             "output": [{
@@ -118,6 +120,7 @@ class ReviewWorkflowTests(unittest.TestCase):
             time=123,
         )
         response = Mock()
+        response.status_code = 200
         response.raise_for_status = Mock()
         response.json.return_value = {
             "output": [{
@@ -141,6 +144,40 @@ class ReviewWorkflowTests(unittest.TestCase):
         payload = post.call_args.kwargs["json"]
         self.assertEqual(payload["max_output_tokens"], 128000)
         self.assertEqual(payload["reasoning"], {"effort": "medium"})
+
+    def test_doubao_429_is_retried_without_aborting_batch(self):
+        comment = bot_module.Comment(
+            comment_id="1",
+            content="测试评论",
+            user="观众",
+            uid="42",
+            time=123,
+        )
+        limited = Mock()
+        limited.status_code = 429
+        limited.headers = {"Retry-After": "0"}
+        limited.text = '{"error":{"code":"rate_limit"}}'
+
+        success = Mock()
+        success.status_code = 200
+        success.raise_for_status = Mock()
+        success.json.return_value = {
+            "output": [{
+                "content": [{
+                    "type": "output_text",
+                    "text": '[{"id":"1","should_reply":true,"reply":"收到","reason":"可回复"}]',
+                }],
+            }],
+        }
+
+        with (
+            patch.object(bot_module.requests, "post", side_effect=[limited, success]) as post,
+            patch.object(bot_module.time, "sleep"),
+        ):
+            result = self.bot.generate_reply_decisions([{"comment": comment}])
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(result[0]["reply"], "收到")
 
     def test_bad_doubao_json_is_split_serially_without_losing_whole_batch(self):
         def item(comment_id):
@@ -322,10 +359,15 @@ class ReviewWorkflowTests(unittest.TestCase):
             }]
 
         self.bot.generate_reply_decisions_resilient = fake_generate
-        result = self.bot._generate_review_drafts([item(1), item(2)])
+        with self.assertLogs("review-tests", level="INFO") as captured:
+            result = self.bot._generate_review_drafts([item(1), item(2)])
 
         self.assertEqual(result["generated"], 2)
         self.assertEqual(result["replyable"], 2)
+        log_text = "\n".join(captured.output)
+        self.assertIn("开始豆包生成：共2条", log_text)
+        self.assertIn("豆包生成进度：已处理", log_text)
+        self.assertIn("豆包生成完成：新增2条草稿", log_text)
 
     def test_empty_requested_list_sends_nothing(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")

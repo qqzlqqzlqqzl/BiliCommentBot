@@ -65,6 +65,10 @@ DEFAULT_CONFIG = {
         "model": "doubao-seed-2-1-turbo-260628",
         "max_tokens": 128000,
         "reasoning_effort": "medium",
+        "request_interval_seconds": 0.15,
+        "max_concurrency": 16,
+        "max_retries": 5,
+        "retry_base_seconds": 2.0,
         "system_prompt": "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实。",
     },
     "reply": {
@@ -297,6 +301,10 @@ class ArkEmptyOutputError(RuntimeError):
     """方舟请求成功，但响应中没有可用的 output_text。"""
 
 
+class ArkTransientError(RuntimeError):
+    """方舟限流、服务端错误或网络异常在重试后仍未恢复。"""
+
+
 # ─────────────────────────────────────────────
 #  机器人核心
 # ─────────────────────────────────────────────
@@ -312,6 +320,8 @@ class BiliCommentBot:
         self.logger = logger
         self.socketio = socketio  # 可选，用于推送到前端
         self.on_config_changed = on_config_changed  # 配置变更回调，用于持久化
+        self._ark_pacer_lock = threading.Lock()
+        self._ark_last_started_at = 0.0
 
         self.session = requests.Session()
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=Retry(total=0))
@@ -1239,6 +1249,92 @@ class BiliCommentBot:
             cleaned = fenced.group(1).strip()
         return json.loads(cleaned)
 
+    def _wait_for_ark_slot(self):
+        """在当前服务实例内错开方舟请求起始时间，避免同一时刻突发。"""
+        api_config = self.config.get("ark", {})
+        interval = max(
+            0.0,
+            float(api_config.get("request_interval_seconds", 0.15)),
+        )
+        if interval <= 0:
+            return
+
+        with self._ark_pacer_lock:
+            wait_seconds = interval - (time.monotonic() - self._ark_last_started_at)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            self._ark_last_started_at = time.monotonic()
+
+    @staticmethod
+    def _ark_retry_after(response: requests.Response, fallback: float) -> float:
+        value = str(response.headers.get("Retry-After") or "").strip()
+        try:
+            return max(float(value), fallback)
+        except ValueError:
+            return fallback
+
+    def _post_ark(
+        self,
+        request_payload: dict,
+        api_config: dict,
+        api_key: str,
+    ) -> requests.Response:
+        proxy_url = os.environ.get("ARK_PROXY_URL", "").strip()
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        max_retries = max(1, int(api_config.get("max_retries", 5)))
+        retry_base = max(0.1, float(api_config.get("retry_base_seconds", 2.0)))
+        last_error = None
+
+        for attempt in range(max_retries):
+            self._wait_for_ark_slot()
+            try:
+                response = requests.post(
+                    api_config.get("base_url", DEFAULT_CONFIG["ark"]["base_url"]),
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=request_payload,
+                    timeout=120,
+                    proxies=proxies,
+                )
+            except requests.exceptions.RequestException as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                if attempt >= max_retries - 1:
+                    break
+                wait_seconds = retry_base * (2 ** attempt) + random.uniform(0, 0.5)
+                self.logger.warning(
+                    "豆包请求异常，第%s/%s次，%.1f秒后重试: %s",
+                    attempt + 1,
+                    max_retries,
+                    wait_seconds,
+                    last_error,
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            if response.status_code == 429 or response.status_code >= 500:
+                error_body = re.sub(r"\s+", " ", response.text or "")[:500]
+                last_error = f"HTTP {response.status_code}: {error_body}"
+                if attempt >= max_retries - 1:
+                    break
+                fallback = retry_base * (2 ** attempt) + random.uniform(0, 0.5)
+                wait_seconds = self._ark_retry_after(response, fallback)
+                self.logger.warning(
+                    "豆包限流/服务异常，第%s/%s次，%.1f秒后重试: %s",
+                    attempt + 1,
+                    max_retries,
+                    wait_seconds,
+                    last_error,
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            response.raise_for_status()
+            return response
+
+        raise ArkTransientError(last_error or "豆包请求重试后仍失败")
+
     def generate_reply_decisions(self, items: List[dict]) -> List[dict]:
         if not items:
             return []
@@ -1309,16 +1405,7 @@ class BiliCommentBot:
             },
             "max_output_tokens": int(api_config.get("max_tokens", 128000)),
         }
-        proxy_url = os.environ.get("ARK_PROXY_URL", "").strip()
-        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-        response = requests.post(
-            api_config.get("base_url", DEFAULT_CONFIG["ark"]["base_url"]),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json=request_payload,
-            timeout=90,
-            proxies=proxies,
-        )
-        response.raise_for_status()
+        response = self._post_ark(request_payload, api_config, api_key)
         response_payload = response.json()
         output_text = self._ark_output_text(response_payload)
         if not output_text:
@@ -1422,6 +1509,23 @@ class BiliCommentBot:
                 self.generate_reply_decisions_resilient(items[:middle])
                 + self.generate_reply_decisions_resilient(items[middle:])
             )
+        except ArkTransientError as exc:
+            self.logger.error(
+                "豆包批次重试后仍失败，当前%s条仅标记为暂不回复: %s",
+                len(items),
+                exc,
+            )
+            model = self.config.get("ark", {}).get(
+                "model",
+                DEFAULT_CONFIG["ark"]["model"],
+            )
+            return [{
+                "id": str(item["comment"].comment_id),
+                "should_reply": False,
+                "reply": "",
+                "reason": "豆包请求受限或暂时不可用，稍后可重新生成",
+                "model": model,
+            } for item in items]
 
     def generate_reply(self, comment: str, context: List[Comment] = None, video_title: str = None, video_desc: str = None) -> Optional[str]:
         placeholder = Comment(
@@ -1726,14 +1830,51 @@ class BiliCommentBot:
             for start in range(0, len(items), batch_size)
         ]
         decisions = {}
-        with ThreadPoolExecutor(max_workers=len(batches)) as executor:
-            futures = [
-                executor.submit(self.generate_reply_decisions_resilient, batch)
+        max_concurrency = max(
+            1,
+            int(self.config.get("ark", {}).get("max_concurrency", 16)),
+        )
+        request_interval = max(
+            0.0,
+            float(self.config.get("ark", {}).get("request_interval_seconds", 0.15)),
+        )
+        self.logger.info(
+            "开始豆包生成：共%s条，%s批，每批最多%s条，最大并发%s，请求起始间隔%.2f秒",
+            len(items),
+            len(batches),
+            batch_size,
+            min(len(batches), max_concurrency),
+            request_interval,
+        )
+        completed_items = 0
+        completed_batches = 0
+        replyable_so_far = 0
+        with ThreadPoolExecutor(max_workers=min(len(batches), max_concurrency)) as executor:
+            future_batches = {
+                executor.submit(self.generate_reply_decisions_resilient, batch): batch
                 for batch in batches
-            ]
-            for future in as_completed(futures):
-                for decision in future.result():
+            }
+            for future in as_completed(future_batches):
+                batch = future_batches[future]
+                batch_decisions = future.result()
+                for decision in batch_decisions:
                     decisions[decision["id"]] = decision
+                completed_items += len(batch)
+                completed_batches += 1
+                replyable_so_far += sum(
+                    1
+                    for decision in batch_decisions
+                    if decision.get("should_reply") and decision.get("reply")
+                )
+                self.logger.info(
+                    "豆包生成进度：已处理%s/%s条（%s/%s批；可回复%s，建议跳过%s）",
+                    completed_items,
+                    len(items),
+                    completed_batches,
+                    len(batches),
+                    replyable_so_far,
+                    completed_items - replyable_so_far,
+                )
 
         generated = 0
         replyable = 0
@@ -1781,6 +1922,12 @@ class BiliCommentBot:
                     skipped += 1
             self._save_review_drafts()
 
+        self.logger.info(
+            "豆包生成完成：新增%s条草稿，可回复%s条，建议跳过%s条",
+            generated,
+            replyable,
+            skipped,
+        )
         self._emit("review_updated", {
             "generated": generated,
             "replyable": replyable,
