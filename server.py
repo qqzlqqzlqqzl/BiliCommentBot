@@ -29,7 +29,9 @@ from flask_socketio import SocketIO, emit
 from bot import (
     BiliCommentBot,
     DEFAULT_CONFIG,
+    REVIEW_READ_DEFAULT,
     ReviewOperationBusyError,
+    normalize_review_read_limit,
     CONFIG_FILE,
     HISTORY_FILE,
     COOKIE_FILE,
@@ -380,7 +382,7 @@ def api_review_drafts():
 @app.route("/api/review/generate", methods=["POST"])
 def api_review_generate():
     data = request.get_json(silent=True) or {}
-    limit = data.get("limit", 20)
+    limit = normalize_review_read_limit(data.get("limit", REVIEW_READ_DEFAULT))
     review_since = data.get("review_since") if "review_since" in data else None
     try:
         result = get_bot().generate_review_drafts(

@@ -375,14 +375,24 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertIn("豆包生成进度：已处理", log_text)
         self.assertIn("豆包生成完成：新增2条草稿", log_text)
 
-    def test_review_read_limit_is_capped_at_fifty_thousand(self):
+    def test_review_read_limit_is_capped_at_one_hundred(self):
         self.bot.auto_refresh_cookie = False
         self.bot._collect_review_items = Mock(return_value=[])
 
         result = self.bot.generate_review_drafts(limit=99999)
 
         self.assertEqual(result, {"generated": 0, "replyable": 0, "skipped": 0})
-        self.assertEqual(self.bot._collect_review_items.call_args.args[0], 50000)
+        self.assertEqual(self.bot._collect_review_items.call_args.args[0], 100)
+
+    def test_review_read_limit_defaults_to_ten(self):
+        self.bot.auto_refresh_cookie = False
+        self.bot.config["reply"]["max_process"] = 10
+        self.bot._collect_review_items = Mock(return_value=[])
+
+        result = self.bot.generate_review_drafts()
+
+        self.assertEqual(result, {"generated": 0, "replyable": 0, "skipped": 0})
+        self.assertEqual(self.bot._collect_review_items.call_args.args[0], 10)
 
     def test_empty_requested_list_sends_nothing(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")

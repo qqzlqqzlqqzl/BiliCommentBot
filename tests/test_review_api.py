@@ -70,13 +70,31 @@ class ReviewApiTests(unittest.TestCase):
     def test_generate_passes_count_and_time_boundaries(self):
         response = self.client.post(
             "/api/review/generate",
-            json={"limit": 200, "review_since": "2026-08-10T00:00"},
+            json={"limit": 50, "review_since": "2026-08-10T00:00"},
         )
 
         self.assertEqual(response.status_code, 200)
         self.fake_bot.generate_review_drafts.assert_called_once_with(
-            limit=200,
+            limit=50,
             review_since="2026-08-10T00:00",
+        )
+
+    def test_generate_defaults_to_ten(self):
+        response = self.client.post("/api/review/generate", json={})
+
+        self.assertEqual(response.status_code, 200)
+        self.fake_bot.generate_review_drafts.assert_called_once_with(
+            limit=10,
+            review_since=None,
+        )
+
+    def test_generate_caps_requested_count_at_one_hundred(self):
+        response = self.client.post("/api/review/generate", json={"limit": 50000})
+
+        self.assertEqual(response.status_code, 200)
+        self.fake_bot.generate_review_drafts.assert_called_once_with(
+            limit=100,
+            review_since=None,
         )
 
     def test_duplicate_generate_returns_conflict(self):

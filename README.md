@@ -87,7 +87,7 @@ system_prompt = "你是B站UP主的评论回复助手。只回复语境清楚、
 
 [reply]
 enabled = true
-max_process = 100
+max_process = 10
 review_since = "" # 例如 2026-08-10T00:00；留空表示只按条数限制
 review_batch_size = 4
 reply_delay = 2
@@ -97,7 +97,8 @@ chained_reply_enabled = true
 `reply.enabled` 的含义是“启用自动生成审核草稿”，不是自动发送。
 
 正常审核从创作中心“评论管理”的账号评论流读取，按评论时间从新到旧跨视频排列。
-`max_process` 是最新评论扫描上限，支持 100、200 等数量；`review_since` 是可选的
+`max_process` 是最新评论扫描上限，默认 10，界面可选 10、20、50、100，后端硬上限
+也是 100，避免一次生成消耗过多豆包 Token；`review_since` 是可选的
 起始时间。两者同时设置时，先碰到哪个边界就停止。已有审核草稿、已经发送、
 UP 已回复及账号自己的评论不会再次交给豆包，除非手动点击单条“重新生成”。
 

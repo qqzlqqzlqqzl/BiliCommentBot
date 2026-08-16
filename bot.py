@@ -33,6 +33,19 @@ COOKIE_FILE = os.path.join(DATA_DIR, "bilibili_cookie.json") if DATA_DIR else "b
 VIDEO_CACHE_FILE = os.path.join(DATA_DIR, "video_cache.json") if DATA_DIR else "video_cache.json"
 REVIEW_DRAFTS_FILE = os.path.join(DATA_DIR, "review_drafts.json") if DATA_DIR else "review_drafts.json"
 
+REVIEW_READ_DEFAULT = 10
+REVIEW_READ_MAX = 100
+
+
+def normalize_review_read_limit(value, default: int = REVIEW_READ_DEFAULT) -> int:
+    """把审核读取数量限制在低成本、安全范围内。"""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = default
+    return max(1, min(limit, REVIEW_READ_MAX))
+
+
 # ─────────────────────────────────────────────
 #  默认配置
 # ─────────────────────────────────────────────
@@ -2046,8 +2059,9 @@ class BiliCommentBot:
         ) as task_config:
             if self.auto_refresh_cookie:
                 self.refresh_cookie_if_needed()
-            limit = int(limit or task_config["reply"].get("max_process", 10))
-            limit = max(1, min(limit, 50000))
+            limit = normalize_review_read_limit(
+                limit or task_config["reply"].get("max_process", REVIEW_READ_DEFAULT)
+            )
             items = self._collect_review_items(
                 limit,
                 review_since=review_since,

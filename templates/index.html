@@ -274,19 +274,12 @@
         <div class="review-toolbar">
           <label class="form-label" for="review-limit" style="margin:0">本次读取</label>
           <select class="form-select" id="review-limit" style="width:190px">
-            <option value="10">最近 10 条</option>
-            <option value="20" selected>最近 20 条</option>
+            <option value="10" selected>最近 10 条（默认）</option>
+            <option value="20">最近 20 条</option>
             <option value="50">最近 50 条</option>
             <option value="100">最近 100 条</option>
-            <option value="200">最近 200 条</option>
-            <option value="300">最近 300 条</option>
-            <option value="500">最近 500 条</option>
-            <option value="1000">最近 1000 条</option>
-            <option value="2000">最近 2000 条</option>
-            <option value="5000">最近 5000 条</option>
-            <option value="10000">最近 10000 条</option>
-            <option value="50000">尽可能读取（最多 50000 条，耗时很长）</option>
           </select>
+          <span class="form-hint" style="margin:0">读取后会交给豆包判断，会消耗 Token；单次最多 100 条。</span>
           <label class="form-label" for="review-time-range" style="margin:0">时间范围</label>
           <select class="form-select" id="review-time-range" style="width:140px" onchange="updateReviewTimeRange()">
             <option value="">不限时间</option>
@@ -484,8 +477,13 @@
           <div class="form-row">
             <div class="form-group">
               <label class="form-label">最新评论扫描上限</label>
-              <input class="form-input" type="number" id="cfg-reply-max_process" value="10" min="1" max="50000">
-              <div class="form-hint">按时间从新到旧读取，例如填 100 或 200；这些评论再交给豆包判断。</div>
+              <select class="form-select" id="cfg-reply-max_process">
+                <option value="10">10 条（默认）</option>
+                <option value="20">20 条</option>
+                <option value="50">50 条</option>
+                <option value="100">100 条</option>
+              </select>
+              <div class="form-hint">按时间从新到旧读取并交给豆包判断。为控制 Token 消耗，单次最多 100 条。</div>
             </div>
             <div class="form-group">
               <label class="form-label">只读取此时间之后的评论（可选）</label>
@@ -1026,7 +1024,7 @@ function loadConfig() {
     set('cfg-reply-like_enabled', r.like_enabled);
     set('cfg-reply-like_user_video_enabled', r.like_user_video_enabled);
     set('cfg-reply-like_user_video_only_followers', r.like_user_video_only_followers);
-    set('cfg-reply-max_process', r.max_process);
+    set('cfg-reply-max_process', normalizeReviewLimit(r.max_process));
     set('cfg-reply-review_since', r.review_since);
     if (!reviewPreferencesLoaded) {
       restoreReviewPreferences(r.max_process, r.review_since);
@@ -1118,7 +1116,7 @@ function saveConfig() {
       like_enabled: get('cfg-reply-like_enabled'),
       like_user_video_enabled: get('cfg-reply-like_user_video_enabled'),
       like_user_video_only_followers: get('cfg-reply-like_user_video_only_followers'),
-      max_process: get('cfg-reply-max_process'),
+      max_process: normalizeReviewLimit(get('cfg-reply-max_process')),
       review_since: get('cfg-reply-review_since'),
       reply_delay: get('cfg-reply-reply_delay'),
       context_comments_count: get('cfg-reply-context_comments_count'),
@@ -1304,6 +1302,16 @@ function saveReviewPreferences() {
   localStorage.setItem('bilibot.review.since', document.getElementById('review-since').value);
 }
 
+const REVIEW_LIMIT_OPTIONS = [10, 20, 50, 100];
+
+function normalizeReviewLimit(value, fallback = 10) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  if (parsed >= 100) return 100;
+  const allowed = REVIEW_LIMIT_OPTIONS.filter(option => option <= parsed);
+  return allowed.length ? allowed[allowed.length - 1] : 10;
+}
+
 function restoreReviewPreferences(defaultLimit, defaultSince) {
   const savedLimit = localStorage.getItem('bilibot.review.limit');
   const savedRange = localStorage.getItem('bilibot.review.timeRange');
@@ -1311,18 +1319,8 @@ function restoreReviewPreferences(defaultLimit, defaultSince) {
   const timeRange = document.getElementById('review-time-range');
   const sinceInput = document.getElementById('review-since');
   const limitSelect = document.getElementById('review-limit');
-  const preferredLimit = String(
-    Math.max(1, Math.min(50000, Number(savedLimit || defaultLimit || 20) || 20))
-  );
-  if (![...limitSelect.options].some(option => option.value === preferredLimit)) {
-    const option = document.createElement('option');
-    option.value = preferredLimit;
-    option.textContent = `最近 ${preferredLimit} 条（上次设置）`;
-    limitSelect.appendChild(option);
-  }
-  limitSelect.value = [...limitSelect.options].some(option => option.value === preferredLimit)
-    ? preferredLimit
-    : '20';
+  const preferredLimit = String(normalizeReviewLimit(savedLimit || defaultLimit || 10));
+  limitSelect.value = preferredLimit;
   timeRange.value = savedRange !== null ? savedRange : (defaultSince ? 'custom' : '');
   sinceInput.value = savedSince !== null ? savedSince : (defaultSince || '');
   sinceInput.style.display = timeRange.value === 'custom' ? '' : 'none';
@@ -1359,7 +1357,7 @@ function selectedReviewSince() {
 
 function generateReviewDrafts() {
   const button = document.getElementById('btn-review-generate');
-  const limit = Math.max(1, Math.min(50000, Number(document.getElementById('review-limit').value) || 20));
+  const limit = normalizeReviewLimit(document.getElementById('review-limit').value);
   const reviewSince = selectedReviewSince();
   saveReviewPreferences();
   button.disabled = true;
