@@ -136,6 +136,26 @@ class ServerAccountApiTests(unittest.TestCase):
             "SESSDATA=second; bili_jct=csrf-second",
         )
 
+    def test_detected_identity_updates_uid_and_account_name(self):
+        account_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+
+        server._save_identity(
+            "3546589337487797",
+            "喵酱第一",
+            account_id,
+        )
+
+        self.assertEqual(
+            server.load_config(account_id)["bilibili"]["uid"],
+            "3546589337487797",
+        )
+        account = next(
+            item
+            for item in self.client.get("/api/accounts").get_json()["accounts"]
+            if item["id"] == account_id
+        )
+        self.assertEqual(account["name"], "喵酱第一")
+
     def test_config_get_does_not_return_saved_secrets(self):
         self.client.post(
             "/api/config",

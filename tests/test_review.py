@@ -396,15 +396,47 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(result, {"generated": 0, "replyable": 0, "skipped": 0})
         self.assertEqual(self.bot._collect_review_items.call_args.args[0], 50000)
 
-    def test_review_read_limit_defaults_to_ten(self):
+    def test_review_read_limit_defaults_to_five_hundred(self):
         self.bot.auto_refresh_cookie = False
-        self.bot.config["reply"]["max_process"] = 10
+        self.bot.config["reply"]["max_process"] = 500
         self.bot._collect_review_items = Mock(return_value=[])
 
         result = self.bot.generate_review_drafts()
 
         self.assertEqual(result, {"generated": 0, "replyable": 0, "skipped": 0})
-        self.assertEqual(self.bot._collect_review_items.call_args.args[0], 10)
+        self.assertEqual(self.bot._collect_review_items.call_args.args[0], 500)
+
+    def test_default_product_parameters_match_confirmed_values(self):
+        self.assertEqual(DEFAULT_CONFIG["bilibili"]["check_interval"], 600)
+        self.assertEqual(DEFAULT_CONFIG["rate_limit"]["min_request_interval"], 10.0)
+        self.assertEqual(DEFAULT_CONFIG["rate_limit"]["max_retries"], 3)
+        self.assertEqual(DEFAULT_CONFIG["rate_limit"]["retry_delay"], 20)
+        self.assertEqual(DEFAULT_CONFIG["reply"]["max_process"], 500)
+        self.assertIn("不要显得太过幼稚", DEFAULT_CONFIG["ark"]["system_prompt"])
+        self.assertIn("不要一直哈哈哈", DEFAULT_CONFIG["ark"]["system_prompt"])
+
+    def test_verify_login_updates_uid_and_persists_identity(self):
+        self.bot.config["bilibili"]["uid"] = ""
+        self.bot.cookie_manager = Mock()
+        self.bot.cookie_manager.verify_cookie.return_value = (
+            True,
+            {
+                "message": "Cookie有效",
+                "user_info": {"mid": 3546589337487797, "name": "喵酱第一"},
+            },
+        )
+        self.bot.on_identity_changed = Mock()
+        self.bot._identity_verified = False
+
+        result = self.bot.verify_login()
+
+        self.assertTrue(result["valid"])
+        self.assertEqual(self.bot.config["bilibili"]["uid"], "3546589337487797")
+        self.assertEqual(self.bot._identity_name, "喵酱第一")
+        self.bot.on_identity_changed.assert_called_once_with(
+            "3546589337487797",
+            "喵酱第一",
+        )
 
     def test_instance_data_directories_isolate_drafts_and_history(self):
         account_a_dir = os.path.join(self.temp_dir.name, "account-a")
@@ -744,6 +776,86 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(request.kwargs["params"]["ps"], 10)
         self.assertFalse(request.kwargs["use_cache"])
 
+    def test_creator_feed_excludes_own_rows_and_comments_already_replied_to(self):
+        payload = {
+            "code": 0,
+            "message": "OK",
+            "data": {
+                "page": {"num": 1, "size": 10, "total": 4},
+                "list": [
+                    {
+                        "rpid": 200,
+                        "oid": 20,
+                        "type": 1,
+                        "root": 100,
+                        "parent": 900,
+                        "bvid": "BV2",
+                        "title": "观众的新追评",
+                        "ctime": 400,
+                        "member": {"mid": 42, "uname": "观众"},
+                        "content": {"message": "新的追问"},
+                        "parent_info": {
+                            "rpid": 900,
+                            "ctime": 350,
+                            "member": {"mid": 999, "uname": "UP"},
+                            "content": {"message": "UP之前的回复"},
+                        },
+                        "up_action": {"reply": False},
+                    },
+                    {
+                        "rpid": 900,
+                        "oid": 20,
+                        "type": 1,
+                        "root": 100,
+                        "parent": 100,
+                        "bvid": "BV2",
+                        "title": "UP自己的回复",
+                        "ctime": 350,
+                        "member": {"mid": 999, "uname": "UP"},
+                        "content": {"message": "已经答过"},
+                        "up_action": {"reply": False},
+                    },
+                    {
+                        "rpid": 100,
+                        "oid": 20,
+                        "type": 1,
+                        "root": 0,
+                        "parent": 0,
+                        "bvid": "BV2",
+                        "title": "已回复的原评论",
+                        "ctime": 300,
+                        "member": {"mid": 42, "uname": "观众"},
+                        "content": {"message": "原问题"},
+                        "up_action": {"reply": False},
+                    },
+                    {
+                        "rpid": 50,
+                        "oid": 10,
+                        "type": 1,
+                        "root": 0,
+                        "parent": 0,
+                        "bvid": "BV1",
+                        "title": "接口标记已回复",
+                        "ctime": 200,
+                        "member": {"mid": 43, "uname": "另一位观众"},
+                        "content": {"message": "另一条"},
+                        "up_action": {"reply": True},
+                    },
+                ],
+            },
+        }
+        self.bot.make_request_with_retry = Mock(
+            return_value=bot_module.CachedResponse(payload)
+        )
+
+        items = self.bot.get_creator_comment_feed(limit=10, my_uid="999")
+
+        self.assertEqual(
+            [item["comment"].comment_id for item in items],
+            ["200"],
+        )
+        self.assertEqual(items[0]["parent_comment"].uid, "999")
+
     def test_collect_review_items_uses_creator_timeline_and_skips_replied(self):
         self.bot.config["reply"]["only_bvid"] = ""
         self.bot.config["reply"]["review_since"] = "2026-08-10 00:00"
@@ -809,6 +921,14 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(
             since_timestamp,
             self.bot._parse_review_since("2026-08-10 00:00"),
+        )
+        self.assertEqual(
+            self.bot.get_creator_comment_feed.call_args.kwargs["my_uid"],
+            "999",
+        )
+        self.assertIn(
+            "202",
+            self.bot.get_creator_comment_feed.call_args.kwargs["skip_comment_ids"],
         )
 
     def test_collect_review_items_keeps_original_chain_for_only_bvid(self):

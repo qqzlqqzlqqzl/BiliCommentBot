@@ -33,7 +33,7 @@ COOKIE_FILE = os.path.join(DATA_DIR, "bilibili_cookie.json") if DATA_DIR else "b
 VIDEO_CACHE_FILE = os.path.join(DATA_DIR, "video_cache.json") if DATA_DIR else "video_cache.json"
 REVIEW_DRAFTS_FILE = os.path.join(DATA_DIR, "review_drafts.json") if DATA_DIR else "review_drafts.json"
 
-REVIEW_READ_DEFAULT = 10
+REVIEW_READ_DEFAULT = 500
 REVIEW_READ_MAX = 50000
 
 
@@ -64,16 +64,16 @@ DEFAULT_CONFIG = {
         "cookie": "",
         "refresh_token": "",
         "uid": "",
-        "check_interval": 60,
+        "check_interval": 600,
         "auto_refresh_cookie": True,
         "cookie_refresh_interval": 30,
         "max_comment_pages": 10,
         "max_video_pages": 10,
     },
     "rate_limit": {
-        "min_request_interval": 3.0,
+        "min_request_interval": 10.0,
         "max_retries": 3,
-        "retry_delay": 5,
+        "retry_delay": 20,
     },
     "cache": {
         "expire_time": 300,
@@ -93,13 +93,13 @@ DEFAULT_CONFIG = {
         "max_concurrency": 16,
         "max_retries": 5,
         "retry_base_seconds": 2.0,
-        "system_prompt": "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实。",
+        "system_prompt": "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实，同时不要显得太过幼稚，不要一直哈哈哈。",
     },
     "reply": {
         "enabled": True,
         "prefix": "",
         "only_new": True,
-        "max_process": 10,
+        "max_process": 500,
         "review_since": "",
         "reply_delay": 2,
         "like_enabled": False,
@@ -132,10 +132,6 @@ DEFAULT_CONFIG = {
         "level": "INFO",
         "file": "logs/bot.log",
         "console": True,
-    },
-    "auth": {
-        "enabled": False,
-        "password": "",
     },
 }
 
@@ -359,6 +355,7 @@ class BiliCommentBot:
         logger: logging.Logger,
         socketio=None,
         on_config_changed=None,
+        on_identity_changed=None,
         data_dir: str = None,
         account_id: str = None,
     ):
@@ -366,6 +363,9 @@ class BiliCommentBot:
         self.logger = logger
         self.socketio = socketio  # 可选，用于推送到前端
         self.on_config_changed = on_config_changed  # 配置变更回调，用于持久化
+        self.on_identity_changed = on_identity_changed
+        self._identity_verified = False
+        self._identity_name = ""
         self.account_id = str(account_id or "")
         self.data_dir = DATA_DIR if data_dir is None else os.path.abspath(data_dir)
         if self.data_dir:
@@ -441,9 +441,9 @@ class BiliCommentBot:
         # 频率控制
         self.last_request_time = 0
         rl = self.config.get("rate_limit", {})
-        self.min_request_interval = rl.get("min_request_interval", 2.0)
+        self.min_request_interval = rl.get("min_request_interval", 10.0)
         self.max_retries = rl.get("max_retries", 3)
-        self.retry_delay = rl.get("retry_delay", 5)
+        self.retry_delay = rl.get("retry_delay", 20)
         self.consecutive_failures = 0
         self.adaptive_interval = self.min_request_interval
 
@@ -483,6 +483,8 @@ class BiliCommentBot:
 
     # ── Cookie 初始化 ──
     def _init_cookie(self):
+        self._identity_verified = False
+        self._identity_name = ""
         self.cookie_manager = None
         self.csrf_token = ""
         self.session.cookies.clear()
@@ -520,9 +522,9 @@ class BiliCommentBot:
         self.cookie_refresh_interval = config["bilibili"].get("cookie_refresh_interval", 30) * 60
         self.auto_refresh_cookie = config["bilibili"].get("auto_refresh_cookie", True)
         rl = config.get("rate_limit", {})
-        self.min_request_interval = rl.get("min_request_interval", 2.0)
+        self.min_request_interval = rl.get("min_request_interval", 10.0)
         self.max_retries = rl.get("max_retries", 3)
-        self.retry_delay = rl.get("retry_delay", 5)
+        self.retry_delay = rl.get("retry_delay", 20)
         self.adaptive_interval = self.min_request_interval
         vc = config.get("video_cache", {})
         self.video_cache_expire_time = vc.get("expire_time", 43200)
@@ -687,7 +689,7 @@ class BiliCommentBot:
             except Exception as e:
                 self.logger.error(f"处理评论异常: {e}", exc_info=True)
             self._emit("stats", self.get_stats())
-            interval = max(1, int(self.config["bilibili"].get("check_interval", 60)))
+            interval = max(1, int(self.config["bilibili"].get("check_interval", 600)))
             self.logger.info(f"等待 {interval} 秒后进行下次检查")
             # 使用 Event.wait() 可被停止信号立即唤醒，避免循环 sleep
             self._stop_event.wait(timeout=interval)
@@ -1313,6 +1315,16 @@ class BiliCommentBot:
                 break
 
         if chained_reply_enabled:
+            my_uid = str(self.config.get("bilibili", {}).get("uid") or "")
+            if my_uid:
+                answered_ids = {
+                    str(comment.parent_id)
+                    for comment in all_comments
+                    if comment.uid == my_uid and comment.parent_id
+                }
+                for comment in all_comments:
+                    if comment.comment_id in answered_ids:
+                        comment.replied = True
             main_count = sum(1 for c in all_comments if c.depth == 0)
             child_count = len(all_comments) - main_count
             self.logger.info(f"共获取 {main_count} 条主评论和 {child_count} 条子评论")
@@ -1399,16 +1411,29 @@ class BiliCommentBot:
             depth=1 if root_id else 0,
         )
 
-    def get_creator_comment_feed(self, limit: int, since_timestamp: int = None) -> List[dict]:
-        """读取创作中心“评论管理”的账号最新评论流。"""
+    def get_creator_comment_feed(
+        self,
+        limit: int,
+        since_timestamp: int = None,
+        my_uid: str = "",
+        skip_comment_ids=None,
+    ) -> List[dict]:
+        """读取创作中心最新评论，并在计数前排除自己的回复和已回复目标。"""
         url = "https://api.bilibili.com/x/v2/reply/up/fulllist"
         page_size = 10
-        max_pages = max(1, (limit + page_size - 1) // page_size)
-        all_items = []
+        my_uid = str(my_uid or "")
+        skip_comment_ids = {str(value) for value in (skip_comment_ids or set())}
+        eligible_items = {}
         seen_ids = set()
+        answered_ids = set()
         reached_since = False
+        scanned_count = 0
+        self_count = 0
+        replied_count = 0
+        skipped_known_count = 0
+        pn = 1
 
-        for pn in range(1, max_pages + 1):
+        while True:
             params = {
                 "order": 1,
                 "filter": -1,
@@ -1451,6 +1476,22 @@ class BiliCommentBot:
                 if not comment.comment_id or comment.comment_id in seen_ids:
                     continue
                 seen_ids.add(comment.comment_id)
+                scanned_count += 1
+
+                if my_uid and comment.uid == my_uid:
+                    self_count += 1
+                    replied_target = str(reply.get("parent") or "")
+                    if replied_target:
+                        answered_ids.add(replied_target)
+                        if eligible_items.pop(replied_target, None) is not None:
+                            replied_count += 1
+                    continue
+                if comment.replied or comment.comment_id in answered_ids:
+                    replied_count += 1
+                    continue
+                if comment.comment_id in skip_comment_ids:
+                    skipped_known_count += 1
+                    continue
 
                 parent_data = reply.get("parent_info") or {}
                 if not parent_data and comment.parent_id:
@@ -1463,7 +1504,7 @@ class BiliCommentBot:
                     else None
                 )
 
-                all_items.append({
+                eligible_items[comment.comment_id] = {
                     "bvid": str(reply.get("bvid") or ""),
                     "oid": str(reply.get("oid") or ""),
                     "comment_type": int(reply.get("type") or 1),
@@ -1471,27 +1512,31 @@ class BiliCommentBot:
                     "video_desc": "",
                     "comment": comment,
                     "parent_comment": parent_comment,
-                })
-                if len(all_items) >= limit:
-                    break
+                }
 
             page = data.get("page") or {}
             total = int(page.get("total") or 0)
             self.logger.info(
-                "创作中心最新评论第%s页获取到%s条，累计%s条",
+                "创作中心最新评论第%s页扫描%s条；累计扫描%s条，待生成%s条，"
+                "排除自己的回复%s条、已回复%s条、已有记录%s条",
                 pn,
                 len(replies),
-                len(all_items),
+                scanned_count,
+                len(eligible_items),
+                self_count,
+                replied_count,
+                skipped_known_count,
             )
             if (
                 reached_since
-                or len(all_items) >= limit
+                or len(eligible_items) >= limit
                 or len(replies) < page_size
                 or (total and pn * page_size >= total)
             ):
                 break
+            pn += 1
 
-        return all_items
+        return list(eligible_items.values())[:limit]
 
     @staticmethod
     def _parse_review_since(value: str) -> Optional[int]:
@@ -2041,7 +2086,12 @@ class BiliCommentBot:
                 if review_since is None
                 else review_since
             )
-            feed_items = self.get_creator_comment_feed(limit, since_timestamp)
+            feed_items = self.get_creator_comment_feed(
+                limit,
+                since_timestamp,
+                my_uid=my_uid,
+                skip_comment_ids=self.processed_comments | existing_ids,
+            )
             for feed_item in feed_items:
                 if len(items) >= limit:
                     break
@@ -2073,6 +2123,8 @@ class BiliCommentBot:
                 if len(items) >= limit:
                     break
                 if comment.comment_id in self.processed_comments or comment.comment_id in existing_ids:
+                    continue
+                if comment.replied:
                     continue
                 if my_uid and comment.uid == my_uid:
                     continue
@@ -2108,6 +2160,7 @@ class BiliCommentBot:
 
     def generate_review_drafts(self, limit: int = None, review_since: str = None) -> dict:
         self._ensure_review_operation_state()
+        self._ensure_login_identity()
         with self._review_operation(
             "generating",
             gate=self._review_generation_gate,
@@ -2492,8 +2545,42 @@ class BiliCommentBot:
             "review_operations": self.get_review_operation_status(),
         }
 
+    def _ensure_login_identity(self) -> dict:
+        configured_uid = str(self.config.get("bilibili", {}).get("uid") or "")
+        if getattr(self, "_identity_verified", False) and configured_uid:
+            return {
+                "valid": True,
+                "message": "登录身份已识别",
+                "user_info": {
+                    "mid": configured_uid,
+                    "name": getattr(self, "_identity_name", ""),
+                },
+            }
+        if not hasattr(self, "cookie_manager"):
+            return {
+                "valid": bool(configured_uid),
+                "message": "测试实例未初始化Cookie",
+                "user_info": {"mid": configured_uid, "name": ""},
+            }
+        result = self.verify_login()
+        if not result.get("valid"):
+            raise RuntimeError(f"无法识别当前登录账号: {result.get('message', 'Cookie验证失败')}")
+        return result
+
     def verify_login(self) -> dict:
         if not self.cookie_manager:
             return {"valid": False, "message": "未配置Cookie"}
         valid, result = self.cookie_manager.verify_cookie()
+        if valid:
+            user_info = result.get("user_info") or {}
+            uid = str(user_info.get("mid") or "")
+            name = str(user_info.get("name") or "").strip()
+            if not uid:
+                return {"valid": False, "message": "B站未返回当前账号 UID"}
+            self.config.setdefault("bilibili", {})["uid"] = uid
+            self._identity_verified = True
+            self._identity_name = name
+            callback = getattr(self, "on_identity_changed", None)
+            if callback:
+                callback(uid, name)
         return {"valid": valid, **result}

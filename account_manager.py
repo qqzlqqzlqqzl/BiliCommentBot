@@ -257,6 +257,23 @@ class AccountManager:
                 if account["id"] == account_id
             )
 
+    def rename_account(self, account_id: str, name: str) -> dict:
+        account_id = self.resolve_account_id(account_id)
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("账号名称不能为空")
+        if len(clean_name) > 40:
+            raise ValueError("账号名称不能超过 40 个字符")
+        with self._lock:
+            account = next(
+                item for item in self._manifest["accounts"]
+                if item["id"] == account_id
+            )
+            if account.get("name") != clean_name:
+                account["name"] = clean_name
+                self._save_manifest()
+            return copy.deepcopy(account)
+
     def get_bot(self, account_id: str = None):
         account_id = self.resolve_account_id(account_id)
         with self._lock:

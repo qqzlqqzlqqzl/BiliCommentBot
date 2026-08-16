@@ -75,6 +75,18 @@ class AccountManagerTests(unittest.TestCase):
             os.path.normcase(second_bot.account["data_dir"]),
         )
 
+    def test_rename_account_persists_detected_bilibili_name(self):
+        account_id = self.manager.current_account_id()
+
+        renamed = self.manager.rename_account(account_id, "喵酱第一")
+        reloaded = AccountManager(
+            self.temp_dir.name,
+            lambda account: FakeBot(account),
+        )
+
+        self.assertEqual(renamed["name"], "喵酱第一")
+        self.assertEqual(reloaded.list_accounts()[0]["name"], "喵酱第一")
+
     def test_switch_is_blocked_while_current_account_is_busy(self):
         first_id = self.manager.current_account_id()
         second = self.manager.create_account("第二个账号")

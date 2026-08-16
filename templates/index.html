@@ -183,9 +183,6 @@
     .main { margin-left: 60px; padding: 16px; }
     .form-row, .form-row-3 { grid-template-columns: 1fr; }
   }
-  /* Auth Gate */
-  .auth-gate { position: fixed; inset: 0; z-index: 9999; background: var(--bg); display: flex; align-items: center; justify-content: center; }
-  .auth-box { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 40px; width: 380px; box-shadow: 0 8px 32px rgba(0,0,0,.15); }
   .review-toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }
   .review-summary { color:var(--text2); font-size:13px; margin-left:auto; }
   .review-table td { vertical-align:top; line-height:1.55; }
@@ -202,30 +199,12 @@
 </head>
 <body>
 <div id="toast-container"></div>
-<!-- Auth Gate -->
-<div class="auth-gate" id="auth-gate" style="display:none">
-  <div class="auth-box">
-    <div style="text-align:center;margin-bottom:24px">
-      <div style="font-size:48px;margin-bottom:8px">🔒</div>
-      <div style="font-size:20px;font-weight:600">BiliBot 访问验证</div>
-      <div style="font-size:14px;color:var(--text2);margin-top:4px">请输入登录密码以继续</div>
-    </div>
-    <div style="position:relative">
-      <input class="form-input" id="auth-password-input" type="password" placeholder="请输入密码" 
-        style="width:100%;padding:12px 16px;font-size:16px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text)"
-        onkeydown="if(event.key==='Enter')submitAuth()">
-      <button class="btn btn-primary" onclick="submitAuth()" style="position:absolute;right:4px;top:50%;transform:translateY(-50%)">进入</button>
-    </div>
-    <div id="auth-error" style="margin-top:12px;text-align:center;color:var(--danger);font-size:14px"></div>
-  </div>
-</div>
 <div class="app">
   <!-- Sidebar -->
   <aside class="sidebar">
     <div class="sidebar-logo">
       <div class="logo-title">🤖 BiliBot</div>
       <div class="logo-sub" id="sidebar-account-name">{{ instance_name }}</div>
-      <div class="logo-sub">UID {{ instance_uid }}</div>
       <div class="logo-sub">B站评论人工审核回复</div>
     </div>
     <ul class="nav-list">
@@ -315,20 +294,20 @@
         <div class="review-toolbar">
           <label class="form-label" for="review-limit" style="margin:0">本次读取</label>
           <select class="form-select" id="review-limit" style="width:190px">
-            <option value="10" selected>最近 10 条（默认）</option>
+            <option value="10">最近 10 条</option>
             <option value="20">最近 20 条</option>
             <option value="50">最近 50 条</option>
             <option value="100">最近 100 条</option>
             <option value="200">最近 200 条</option>
             <option value="300">最近 300 条</option>
-            <option value="500">最近 500 条</option>
+            <option value="500" selected>最近 500 条（默认）</option>
             <option value="1000">最近 1000 条</option>
             <option value="2000">最近 2000 条</option>
             <option value="5000">最近 5000 条</option>
             <option value="10000">最近 10000 条</option>
             <option value="50000">尽可能读取（最多 50000 条）</option>
           </select>
-          <span class="form-hint" style="margin:0">默认 10 条；读取后会交给豆包判断并消耗 Token。</span>
+          <span class="form-hint" style="margin:0">默认 500 条；自己的回复、已经回复过的评论和已有草稿会在送豆包前排除。</span>
           <label class="form-label" for="review-time-range" style="margin:0">时间范围</label>
           <select class="form-select" id="review-time-range" style="width:140px" onchange="updateReviewTimeRange()">
             <option value="">不限时间</option>
@@ -382,7 +361,6 @@
         <button class="tab-btn" data-tab="tab-rate">B站请求</button>
         <button class="tab-btn legacy-config" data-tab="tab-cache">缓存</button>
         <button class="tab-btn" data-tab="tab-logging">日志</button>
-        <button class="tab-btn" data-tab="tab-auth">安全</button>
       </div>
 
       <!-- B站 -->
@@ -401,14 +379,10 @@
           <div class="form-group">
             <button class="btn btn-danger" type="button" onclick="clearStoredSecret('bilibili_login')">清除当前账号登录凭据</button>
           </div>
-          <div class="form-group">
-            <label class="form-label">B站用户 ID（UID）</label>
-            <input class="form-input" id="cfg-bilibili-uid" placeholder="如：123456789">
-          </div>
           <div class="form-row">
             <div class="form-group">
               <label class="form-label">检查评论间隔（秒）</label>
-              <input class="form-input" type="number" id="cfg-bilibili-check_interval" value="60">
+              <input class="form-input" type="number" id="cfg-bilibili-check_interval" value="600">
             </div>
             <div class="form-group">
               <label class="form-label">Cookie 刷新间隔（分钟）</label>
@@ -537,13 +511,13 @@
             <div class="form-group">
               <label class="form-label">最新评论扫描上限</label>
               <select class="form-select" id="cfg-reply-max_process">
-                <option value="10">10 条（默认）</option>
+                <option value="10">10 条</option>
                 <option value="20">20 条</option>
                 <option value="50">50 条</option>
                 <option value="100">100 条</option>
                 <option value="200">200 条</option>
                 <option value="300">300 条</option>
-                <option value="500">500 条</option>
+                <option value="500" selected>500 条（默认）</option>
                 <option value="1000">1000 条</option>
                 <option value="2000">2000 条</option>
                 <option value="5000">5000 条</option>
@@ -679,7 +653,7 @@
           <div class="form-row-3">
             <div class="form-group">
               <label class="form-label">最小请求间隔（秒）</label>
-              <input class="form-input" type="number" step="0.5" id="cfg-rate_limit-min_request_interval" value="3">
+              <input class="form-input" type="number" step="0.5" id="cfg-rate_limit-min_request_interval" value="10">
             </div>
             <div class="form-group">
               <label class="form-label">最大重试次数</label>
@@ -687,7 +661,7 @@
             </div>
             <div class="form-group">
               <label class="form-label">重试基础延迟（秒）</label>
-              <input class="form-input" type="number" id="cfg-rate_limit-retry_delay" value="5">
+              <input class="form-input" type="number" id="cfg-rate_limit-retry_delay" value="20">
             </div>
           </div>
         </div>
@@ -740,27 +714,6 @@
               输出到控制台
             </label>
           </div>
-        </div>
-      </div>
-
-      <div class="tab-panel" id="tab-auth">
-        <div class="card">
-          <div class="card-title">登录密码保护</div>
-          <p style="font-size:14px;color:var(--text2);margin-bottom:20px">
-            启用后，访问 Web UI 时需要输入密码才能进入。密码以 SHA-256 哈希存储在配置文件中。
-          </p>
-          <div class="form-group">
-            <label class="form-check">
-              <input type="checkbox" id="cfg-auth-enabled">
-              启用登录密码保护
-            </label>
-          </div>
-          <div id="auth-actions" style="margin-top:16px;display:flex;flex-wrap:wrap;gap:10px">
-            <button class="btn btn-primary" onclick="changePassword()">🔑 修改密码</button>
-            <button class="btn btn-secondary" onclick="generatePassword()">🎲 随机生成密码</button>
-            <button class="btn btn-danger" onclick="clearPassword()">🗑 清除密码</button>
-          </div>
-          <div id="auth-result" style="margin-top:12px"></div>
         </div>
       </div>
 
@@ -965,6 +918,7 @@ socket.on('qr_cookie', d => {
   showToast('登录成功，正在保存配置...', 'success');
   showToast('Cookie 已保存到当前账号', 'success');
   loadConfig();
+  loadAccounts();
   document.getElementById('btn-gen-qr').disabled = false;
 });
 socket.on('video_list', d => {
@@ -1055,6 +1009,7 @@ function verifyLogin() {
     if (d.valid) {
       const u = d.user_info || {};
       el.innerHTML = `<div class="alert alert-success">✅ 登录有效 — ${u.name || ''} (UID: ${u.mid || ''})</div>`;
+      loadAccounts();
     } else {
       el.innerHTML = `<div class="alert alert-danger">❌ ${d.message}</div>`;
     }
@@ -1066,85 +1021,6 @@ function clearCache() {
     document.getElementById('stat-videos').textContent = '0';
   });
 }
-
-// ── 密码保护 ──
-function checkAuthGate() {
-  fetch('/api/config').then(r=>r.json()).then(d=>{
-    if (!d.ok) return;
-    const auth = d.config.auth || {};
-    if (auth.enabled && auth.password) {
-      document.getElementById('auth-gate').style.display = 'flex';
-      document.getElementById('auth-password-input').focus();
-    }
-  });
-}
-
-function submitAuth() {
-  const pwd = document.getElementById('auth-password-input').value;
-  if (!pwd) { document.getElementById('auth-error').textContent = '请输入密码'; return; }
-  fetch('/api/auth/login', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({password: pwd})
-  }).then(r=>r.json()).then(d=>{
-    if (d.ok) {
-      document.getElementById('auth-gate').style.display = 'none';
-      document.getElementById('auth-error').textContent = '';
-    } else {
-      document.getElementById('auth-error').textContent = d.message;
-      document.getElementById('auth-password-input').value = '';
-      document.getElementById('auth-password-input').focus();
-    }
-  });
-}
-
-function changePassword() {
-  const oldPwd = prompt('请输入旧密码:');
-  if (oldPwd === null) return;
-  const newPwd = prompt('请输入新密码（至少4位）:');
-  if (newPwd === null) return;
-  fetch('/api/auth/password', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({action: 'change', old_password: oldPwd, new_password: newPwd})
-  }).then(r=>r.json()).then(d=>{
-    const el = document.getElementById('auth-result');
-    if (d.ok) { el.innerHTML = '<div class="alert alert-success">' + d.message + '</div>'; loadConfig(); }
-    else { el.innerHTML = '<div class="alert alert-danger">' + d.message + '</div>'; }
-    setTimeout(()=> el.innerHTML = '', 4000);
-  });
-}
-
-function generatePassword() {
-  if (!confirm('将随机生成一个16位强密码并启用密码保护，是否继续？')) return;
-  fetch('/api/auth/password', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({action: 'generate'})
-  }).then(r=>r.json()).then(d=>{
-    const el = document.getElementById('auth-result');
-    if (d.ok) {
-      el.innerHTML = '<div class="alert alert-success">密码已生成并保存！<br><strong>新密码: ' + escHtml(d.password) + '</strong><br><span style="font-size:12px;color:var(--text2)">请立即复制保存，关闭后无法再次查看！</span></div>';
-      loadConfig();
-    } else {
-      el.innerHTML = '<div class="alert alert-danger">' + d.message + '</div>';
-    }
-  });
-}
-
-function clearPassword() {
-  if (!confirm('确定要关闭密码保护吗？')) return;
-  fetch('/api/auth/password', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({action: 'clear'})
-  }).then(r=>r.json()).then(d=>{
-    const el = document.getElementById('auth-result');
-    if (d.ok) { el.innerHTML = '<div class="alert alert-success">' + d.message + '</div>'; loadConfig(); }
-    else { el.innerHTML = '<div class="alert alert-danger">' + d.message + '</div>'; }
-    setTimeout(()=> el.innerHTML = '', 4000);
-  });
-}
-
-document.getElementById('cfg-auth-enabled').addEventListener('change', function() {
-  document.getElementById('auth-actions').style.display = this.checked ? 'flex' : 'none';
-});
 
 // ── 配置 ──
 function loadConfig() {
@@ -1168,7 +1044,6 @@ function loadConfig() {
       d.capabilities?.bilibili_cookie_configured ? '已保存；留空不修改' : 'SESSDATA=xxx; bili_jct=xxx; DedeUserID=xxx';
     document.getElementById('cfg-bilibili-refresh_token').placeholder =
       d.capabilities?.bilibili_refresh_token_configured ? '已保存；留空不修改' : 'refresh_token';
-    set('cfg-bilibili-uid', b.uid);
     set('cfg-bilibili-check_interval', b.check_interval);
     set('cfg-bilibili-cookie_refresh_interval', b.cookie_refresh_interval);
     set('cfg-bilibili-max_comment_pages', b.max_comment_pages);
@@ -1243,9 +1118,6 @@ function loadConfig() {
     set('cfg-logging-file', lg.file);
     set('cfg-logging-console', lg.console);
 
-    const au = cfg.auth || {};
-    set('cfg-auth-enabled', au.enabled);
-    document.getElementById('auth-actions').style.display = au.enabled ? 'flex' : 'none';
   });
 }
 
@@ -1260,7 +1132,6 @@ function saveConfig() {
 
   const cfg = {
     bilibili: {
-      uid: get('cfg-bilibili-uid'),
       check_interval: get('cfg-bilibili-check_interval'),
       cookie_refresh_interval: get('cfg-bilibili-cookie_refresh_interval'),
       max_comment_pages: get('cfg-bilibili-max_comment_pages'),
@@ -1327,9 +1198,6 @@ function saveConfig() {
       level: get('cfg-logging-level'),
       file: get('cfg-logging-file'),
       console: get('cfg-logging-console'),
-    },
-    auth: {
-      enabled: get('cfg-auth-enabled'),
     },
   };
   const cookie = get('cfg-bilibili-cookie').trim();
@@ -1501,7 +1369,7 @@ function formatCommentTime(unixSeconds) {
 }
 
 function saveReviewPreferences() {
-  localStorage.setItem('bilibot.review.limit', document.getElementById('review-limit').value);
+  localStorage.setItem('bilibot.review.limit.v2', document.getElementById('review-limit').value);
   localStorage.setItem('bilibot.review.timeRange', document.getElementById('review-time-range').value);
   localStorage.setItem('bilibot.review.since', document.getElementById('review-since').value);
 }
@@ -1509,22 +1377,22 @@ function saveReviewPreferences() {
 const REVIEW_LIMIT_OPTIONS = [10, 20, 50, 100, 200, 300, 500, 1000, 2000, 5000, 10000, 50000];
 const REVIEW_HARD_LIMIT = Number({{ review_hard_limit|tojson }}) || 50000;
 
-function normalizeReviewLimit(value, fallback = 10) {
+function normalizeReviewLimit(value, fallback = 500) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   const bounded = Math.min(parsed, REVIEW_HARD_LIMIT);
   const allowed = REVIEW_LIMIT_OPTIONS.filter(option => option <= bounded);
-  return allowed.length ? allowed[allowed.length - 1] : 10;
+  return allowed.length ? allowed[allowed.length - 1] : 500;
 }
 
 function restoreReviewPreferences(defaultLimit, defaultSince) {
-  const savedLimit = localStorage.getItem('bilibot.review.limit');
+  const savedLimit = localStorage.getItem('bilibot.review.limit.v2');
   const savedRange = localStorage.getItem('bilibot.review.timeRange');
   const savedSince = localStorage.getItem('bilibot.review.since');
   const timeRange = document.getElementById('review-time-range');
   const sinceInput = document.getElementById('review-since');
   const limitSelect = document.getElementById('review-limit');
-  const preferredLimit = String(normalizeReviewLimit(savedLimit || defaultLimit || 10));
+  const preferredLimit = String(normalizeReviewLimit(savedLimit || defaultLimit || 500));
   limitSelect.value = preferredLimit;
   timeRange.value = savedRange !== null ? savedRange : (defaultSince ? 'custom' : '');
   sinceInput.value = savedSince !== null ? savedSince : (defaultSince || '');
@@ -1765,7 +1633,6 @@ function escHtml(str) {
 // ── 初始化 ──
 (function init() {
   initTheme();
-  checkAuthGate();
   document.getElementById('review-limit').addEventListener('change', saveReviewPreferences);
   document.getElementById('review-since').addEventListener('change', saveReviewPreferences);
   loadAccounts().then(() => {

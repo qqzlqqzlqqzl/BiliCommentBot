@@ -78,6 +78,22 @@ class ProductAppTests(unittest.TestCase):
                 self.assertTrue(product_app.open_existing_instance(root))
                 open_browser.assert_not_called()
 
+    def test_product_ui_uses_automatic_identity_and_confirmed_defaults(self):
+        template = (
+            Path(__file__).resolve().parents[1] / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('value="500" selected>最近 500 条（默认）', template)
+        self.assertIn('id="cfg-bilibili-check_interval" value="600"', template)
+        self.assertIn(
+            'id="cfg-rate_limit-min_request_interval" value="10"',
+            template,
+        )
+        self.assertIn('id="cfg-rate_limit-retry_delay" value="20"', template)
+        self.assertNotIn('id="cfg-bilibili-uid"', template)
+        self.assertNotIn('data-tab="tab-auth"', template)
+        self.assertNotIn('id="cfg-auth-enabled"', template)
+
 
 if __name__ == "__main__":
     unittest.main()

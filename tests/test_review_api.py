@@ -79,12 +79,12 @@ class ReviewApiTests(unittest.TestCase):
             review_since="2026-08-10T00:00",
         )
 
-    def test_generate_defaults_to_ten(self):
+    def test_generate_defaults_to_five_hundred(self):
         response = self.client.post("/api/review/generate", json={})
 
         self.assertEqual(response.status_code, 200)
         self.fake_bot.generate_review_drafts.assert_called_once_with(
-            limit=10,
+            limit=500,
             review_since=None,
         )
 

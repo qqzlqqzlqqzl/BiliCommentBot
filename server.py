@@ -269,6 +269,11 @@ def _create_account_bot(account: dict) -> BiliCommentBot:
         logger,
         socketio=socketio,
         on_config_changed=lambda rt, aid=account_id: _save_refresh_token(rt, aid),
+        on_identity_changed=lambda uid, name, aid=account_id: _save_identity(
+            uid,
+            name,
+            aid,
+        ),
         data_dir=data_dir,
         account_id=account_id,
     )
@@ -292,7 +297,8 @@ def get_bot(account_id: str = None) -> BiliCommentBot:
         cfg = load_config()
         _bot_logger = _setup_logger(cfg)
         _bot = BiliCommentBot(cfg, _bot_logger, socketio=socketio,
-                              on_config_changed=lambda rt: _save_refresh_token(rt))
+                              on_config_changed=lambda rt: _save_refresh_token(rt),
+                              on_identity_changed=lambda uid, name: _save_identity(uid, name))
     return _bot
 
 
@@ -301,6 +307,19 @@ def _save_refresh_token(new_token: str, account_id: str = None):
     cfg = load_config(account_id)
     cfg.setdefault("bilibili", {})["refresh_token"] = new_token
     save_config(cfg, account_id)
+
+
+def _save_identity(uid: str, name: str = "", account_id: str = None):
+    uid = str(uid or "").strip()
+    if not uid:
+        raise ValueError("B站账号 UID 为空")
+    cfg = load_config(account_id)
+    changed = str(cfg.setdefault("bilibili", {}).get("uid") or "") != uid
+    cfg["bilibili"]["uid"] = uid
+    if changed and not save_config(cfg, account_id):
+        raise RuntimeError("B站账号身份保存失败")
+    if is_product_mode() and name:
+        get_account_manager().rename_account(account_id, name)
 
 
 # ─────────────────────────────────────────────
@@ -382,6 +401,12 @@ def _poll_qr_login(account_id: str, qr_key: str, session: requests.Session):
                             cookies[k] = v[0]
                 cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
                 _persist_qr_cookie(account_id, cookie_str)
+                target_account_id = None if account_id == "legacy" else account_id
+                identity = get_bot(target_account_id).verify_login()
+                if not identity.get("valid"):
+                    raise RuntimeError(
+                        f"登录成功但账号身份识别失败: {identity.get('message', '未知错误')}"
+                    )
                 _emit_qr(
                     "qr_cookie",
                     account_id,
@@ -425,7 +450,6 @@ def index():
         "index.html",
         instance_name=instance_name,
         instance_port=get_server_port(),
-        instance_uid=str(cfg.get("bilibili", {}).get("uid", "") or "未配置"),
         product_mode=is_product_mode(),
         review_hard_limit=get_review_read_max(),
     )
@@ -449,7 +473,11 @@ def api_accounts():
             "current_account_id": "legacy",
             "accounts": [{
                 "id": "legacy",
-                "name": get_instance_name(),
+                "name": (
+                    getattr(_bot, "_identity_name", "")
+                    if _bot is not None
+                    else ""
+                ) or get_instance_name(),
                 "current": True,
                 "running": bool(_bot and _bot.is_running),
                 "loaded": _bot is not None,
@@ -915,12 +943,16 @@ def main():
         or os.environ.get("VOLCENGINE_ARK_API_KEY")
         or cfg.get("ark", {}).get("api_key", "")
     )
-    auth_enabled = cfg.get("auth", {}).get("enabled", False)
-
-    if auth_enabled:
-        print("🔒 登录密码保护已启用")
-    else:
-        print("⚠️  未启用登录密码保护，建议在配置 > 安全中设置密码")
+    if cookie:
+        try:
+            identity = bot.verify_login()
+            if identity.get("valid"):
+                user_info = identity.get("user_info") or {}
+                print(f"✓ 已识别当前 B站账号: {user_info.get('name') or '未知昵称'}")
+            else:
+                print(f"⚠️  B站账号身份识别失败: {identity.get('message', '未知错误')}")
+        except Exception as exc:
+            print(f"⚠️  B站账号身份识别失败: {exc}")
 
     auto_start_monitor = os.environ.get("BILI_AUTO_START_MONITOR", "1").strip() == "1"
     if cookie and api_key and auto_start_monitor:
