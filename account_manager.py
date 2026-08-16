@@ -4,13 +4,22 @@ import copy
 import json
 import os
 import re
+import shutil
 import threading
+import tomllib
 import uuid
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
 
 ACCOUNT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+LEGACY_ACCOUNT_FILES = (
+    "config.toml",
+    "bilibili_cookie.json",
+    "history.json",
+    "review_drafts.json",
+    "video_cache.json",
+)
 
 
 class AccountNotFoundError(KeyError):
@@ -39,6 +48,13 @@ class AccountManager:
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _is_path_within(parent: str, child: str) -> bool:
+        try:
+            return os.path.commonpath([parent, child]) == parent
+        except ValueError:
+            return False
 
     def _default_manifest(self) -> dict:
         account_id = self._new_account_id()
@@ -148,6 +164,14 @@ class AccountManager:
         self.account_dir(resolved)
         return resolved
 
+    def _assert_current_idle(self):
+        current_bot = self._bots.get(self._manifest["current_account_id"])
+        if not current_bot:
+            return
+        operations = current_bot.get_review_operation_status()
+        if any(operations.get("active", {}).values()):
+            raise AccountBusyError("当前账号有审核任务正在执行，暂时不能切换")
+
     def create_account(self, name: str) -> dict:
         clean_name = str(name or "").strip()
         if not clean_name:
@@ -155,6 +179,7 @@ class AccountManager:
         if len(clean_name) > 40:
             raise ValueError("账号名称不能超过 40 个字符")
         with self._lock:
+            self._assert_current_idle()
             account = {
                 "id": self._new_account_id(),
                 "name": clean_name,
@@ -166,14 +191,64 @@ class AccountManager:
             self._save_manifest()
             return copy.deepcopy(account)
 
+    def import_legacy_account(self, name: str, source_dir: str) -> dict:
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("账号名称不能为空")
+        if len(clean_name) > 40:
+            raise ValueError("账号名称不能超过 40 个字符")
+        source = os.path.abspath(os.path.expanduser(str(source_dir or "").strip()))
+        if not os.path.isdir(source):
+            raise ValueError("旧数据目录不存在")
+        if self._is_path_within(self.root_dir, source):
+            raise ValueError("不能从当前产品数据目录内部导入")
+
+        existing_files = [
+            filename
+            for filename in LEGACY_ACCOUNT_FILES
+            if os.path.isfile(os.path.join(source, filename))
+        ]
+        if not existing_files:
+            raise ValueError("目录中没有识别到旧版账号数据")
+        for filename in existing_files:
+            path = os.path.join(source, filename)
+            if filename == "config.toml":
+                with open(path, "rb") as f:
+                    tomllib.load(f)
+            else:
+                with open(path, "r", encoding="utf-8") as f:
+                    json.load(f)
+
+        with self._lock:
+            self._assert_current_idle()
+            account = {
+                "id": self._new_account_id(),
+                "name": clean_name,
+                "created_at": self._now(),
+                "imported_at": self._now(),
+            }
+            destination = os.path.abspath(
+                os.path.join(self.accounts_dir, account["id"])
+            )
+            if not self._is_path_within(self.accounts_dir, destination):
+                raise ValueError("导入目标目录非法")
+            os.makedirs(destination, exist_ok=False)
+            for filename in existing_files:
+                shutil.copy2(
+                    os.path.join(source, filename),
+                    os.path.join(destination, filename),
+                )
+            self._manifest["accounts"].append(account)
+            self._manifest["current_account_id"] = account["id"]
+            self._save_manifest()
+            result = copy.deepcopy(account)
+            result["imported_files"] = existing_files
+            return result
+
     def select_account(self, account_id: str) -> dict:
         account_id = self.resolve_account_id(account_id)
         with self._lock:
-            current_bot = self._bots.get(self._manifest["current_account_id"])
-            if current_bot:
-                operations = current_bot.get_review_operation_status()
-                if any(operations.get("active", {}).values()):
-                    raise AccountBusyError("当前账号有审核任务正在执行，暂时不能切换")
+            self._assert_current_idle()
             self._manifest["current_account_id"] = account_id
             self._save_manifest()
             return next(

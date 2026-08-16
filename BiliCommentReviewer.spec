@@ -6,8 +6,10 @@ a = Analysis(
     binaries=[],
     datas=[
         ("templates", "templates"),
+        ("static", "static"),
         ("README.md", "."),
         ("LICENSE", "."),
+        ("THIRD_PARTY_NOTICES.md", "."),
     ],
     hiddenimports=[
         "engineio.async_drivers.threading",

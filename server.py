@@ -474,6 +474,25 @@ def api_account_create():
         return jsonify({"ok": True, "account": account})
     except ValueError as exc:
         return jsonify({"ok": False, "message": str(exc)}), 400
+    except AccountBusyError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 409
+
+
+@app.route("/api/accounts/import", methods=["POST"])
+def api_account_import():
+    if not is_product_mode():
+        return jsonify({"ok": False, "message": "当前启动方式不支持账号导入"}), 409
+    data = request.get_json(silent=True) or {}
+    try:
+        account = get_account_manager().import_legacy_account(
+            data.get("name", ""),
+            data.get("source_dir", ""),
+        )
+        return jsonify({"ok": True, "account": account})
+    except AccountBusyError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 409
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return jsonify({"ok": False, "message": f"导入失败：{exc}"}), 400
 
 
 @app.route("/api/accounts/select", methods=["POST"])

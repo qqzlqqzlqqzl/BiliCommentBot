@@ -86,6 +86,39 @@ class AccountManagerTests(unittest.TestCase):
 
         self.assertEqual(self.manager.current_account_id(), first_id)
 
+    def test_create_is_blocked_while_current_account_is_busy(self):
+        first_id = self.manager.current_account_id()
+        self.manager.get_bot(first_id).busy = True
+
+        with self.assertRaises(AccountBusyError):
+            self.manager.create_account("不应创建")
+
+        self.assertEqual(len(self.manager.list_accounts()), 1)
+
+    def test_imports_recognized_legacy_files_without_changing_source(self):
+        with tempfile.TemporaryDirectory() as source_dir:
+            config_path = os.path.join(source_dir, "config.toml")
+            history_path = os.path.join(source_dir, "history.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                f.write('[bilibili]\nuid = "123"\n')
+            with open(history_path, "w", encoding="utf-8") as f:
+                json.dump([{"comment_id": "1"}], f)
+
+            imported = self.manager.import_legacy_account(
+                "旧账号",
+                source_dir,
+            )
+            destination = self.manager.account_dir(imported["id"])
+
+            self.assertEqual(
+                imported["imported_files"],
+                ["config.toml", "history.json"],
+            )
+            self.assertTrue(os.path.isfile(os.path.join(destination, "config.toml")))
+            self.assertTrue(os.path.isfile(os.path.join(destination, "history.json")))
+            self.assertTrue(os.path.isfile(config_path))
+            self.assertTrue(os.path.isfile(history_path))
+
     def test_rejects_unknown_or_path_like_account_id(self):
         with self.assertRaises(AccountNotFoundError):
             self.manager.account_dir("../escape")

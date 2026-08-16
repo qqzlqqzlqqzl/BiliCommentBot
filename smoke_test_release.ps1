@@ -13,6 +13,10 @@ $testRoot = Join-Path (
     [System.IO.Path]::GetTempPath()
 ) ("BiliCommentReviewer-smoke-" + [guid]::NewGuid().ToString("N"))
 [void](New-Item -ItemType Directory -Path $testRoot)
+$legacyRoot = Join-Path (
+    [System.IO.Path]::GetTempPath()
+) ("BiliCommentReviewer-legacy-" + [guid]::NewGuid().ToString("N"))
+[void](New-Item -ItemType Directory -Path $legacyRoot)
 $process = $null
 
 function Wait-ForRuntime([string]$RuntimePath, [int]$TimeoutSeconds = 30) {
@@ -95,11 +99,24 @@ try {
     if ($page.Content -notmatch '<option value="50000">') {
         throw "页面缺少 50000 档位"
     }
+    $socketClient = Invoke-WebRequest `
+        -Uri "$baseUrl/static/socket.io.min.js" `
+        -TimeoutSec 10
+    if (
+        $socketClient.StatusCode -ne 200 -or
+        $socketClient.Content -notmatch "Socket.IO v4.7.2"
+    ) {
+        throw "本地 Socket.IO 客户端未随 EXE 提供"
+    }
 
     $accounts = Invoke-RestMethod -Uri "$baseUrl/api/accounts" -TimeoutSec 10
     $firstId = [string]$accounts.current_account_id
     $saved = Post-Json "$baseUrl/api/config" @{
-        bilibili = @{ uid = "smoke-account-1" }
+        bilibili = @{
+            uid = "smoke-account-1"
+            cookie = "SESSDATA=smoke-secret"
+        }
+        ark = @{ api_key = "smoke-ark-secret" }
     }
     if (-not $saved.ok) {
         throw "账号 1 配置保存失败"
@@ -127,6 +144,32 @@ try {
     $config1 = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
     if ([string]$config1.config.bilibili.uid -ne "smoke-account-1") {
         throw "账号 1 配置串号"
+    }
+    if (
+        $config1.config.bilibili.PSObject.Properties.Name -contains "cookie" -or
+        $config1.config.ark.PSObject.Properties.Name -contains "api_key"
+    ) {
+        throw "保存的凭据被重新暴露给浏览器"
+    }
+
+    Set-Content `
+        -LiteralPath (Join-Path $legacyRoot "config.toml") `
+        -Value "[bilibili]`nuid = `"smoke-legacy`"" `
+        -Encoding utf8
+    Set-Content `
+        -LiteralPath (Join-Path $legacyRoot "history.json") `
+        -Value "[]" `
+        -Encoding utf8
+    $imported = Post-Json "$baseUrl/api/accounts/import" @{
+        name = "烟测导入账号"
+        source_dir = $legacyRoot
+    }
+    if ($imported.account.imported_files.Count -ne 2) {
+        throw "旧账号导入文件数量不正确"
+    }
+    $legacyConfig = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
+    if ([string]$legacyConfig.config.bilibili.uid -ne "smoke-legacy") {
+        throw "旧账号导入后配置不正确"
     }
 
     $secondProcess = Start-Process `
@@ -156,7 +199,7 @@ try {
     $manifest = Get-Content `
         -LiteralPath (Join-Path $testRoot "accounts.json") `
         -Raw | ConvertFrom-Json
-    if ($manifest.accounts.Count -ne 2) {
+    if ($manifest.accounts.Count -ne 3) {
         throw "账号清单数量不正确"
     }
 
@@ -166,6 +209,9 @@ try {
         Port = $runtime.port
         ReleaseHardLimit = 50000
         AccountCount = $manifest.accounts.Count
+        LocalSocketClient = $true
+        SecretsRedacted = $true
+        LegacyImportFiles = $imported.account.imported_files.Count
         FirstAccountUid = $config1.config.bilibili.uid
         SecondAccountUid = $config2.config.bilibili.uid
         SecondLaunchExited = $secondProcess.HasExited
@@ -182,5 +228,6 @@ finally {
     Remove-Item Env:BILI_REVIEW_HARD_LIMIT -ErrorAction SilentlyContinue
     if (-not $KeepData) {
         Move-TestDataToRecycleBin $testRoot
+        Move-TestDataToRecycleBin $legacyRoot
     }
 }

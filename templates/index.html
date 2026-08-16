@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{{ instance_name }} · B站评论审核助手</title>
-<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script src="/static/socket.io.min.js"></script>
 <style>
   :root, html[data-theme="dark"] {
     --bg: #0f1117;
@@ -242,6 +242,7 @@
         <option value="">加载中...</option>
       </select>
       <button class="btn btn-secondary" id="btn-add-account" onclick="createAccount()" style="display:none">＋ 添加账号</button>
+      <button class="btn btn-secondary" id="btn-import-account" onclick="importAccount()" style="display:none">导入旧账号</button>
       <label class="form-label" for="theme-select" style="margin:4px 0 0">界面主题</label>
       <select class="form-select" id="theme-select" onchange="setThemePreference(this.value)">
         <option value="system">跟随系统</option>
@@ -878,6 +879,7 @@ function loadAccounts() {
     const current = (d.accounts || []).find(account => String(account.id) === currentAccountId);
     if (current) document.getElementById('sidebar-account-name').textContent = current.name;
     document.getElementById('btn-add-account').style.display = d.product_mode ? '' : 'none';
+    document.getElementById('btn-import-account').style.display = d.product_mode ? '' : 'none';
     return d;
   });
 }
@@ -909,6 +911,23 @@ function createAccount() {
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.message || '添加账号失败');
     location.reload();
+  }).catch(error => showToast(error.message, 'error'));
+}
+
+function importAccount() {
+  const sourceDir = prompt('旧版账号数据目录：\\n例如 C:\\\\Users\\\\你\\\\Desktop\\\\Y2A\\\\BiliCommentBot-review');
+  if (sourceDir === null) return;
+  const name = prompt('导入后的账号名称：', '导入账号');
+  if (name === null) return;
+  fetch('/api/accounts/import', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({source_dir: sourceDir, name}),
+  }).then(async response => {
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.message || '导入账号失败');
+    showToast(`已复制 ${data.account.imported_files.length} 个旧数据文件，原目录未改动`, 'success');
+    setTimeout(() => location.reload(), 500);
   }).catch(error => showToast(error.message, 'error'));
 }
 

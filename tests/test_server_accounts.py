@@ -57,6 +57,28 @@ class ServerAccountApiTests(unittest.TestCase):
             first_id,
         )
 
+    def test_imports_legacy_account_through_api(self):
+        with tempfile.TemporaryDirectory() as source_dir:
+            with open(
+                os.path.join(source_dir, "config.toml"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write('[bilibili]\nuid = "legacy-uid"\n')
+
+            response = self.client.post(
+                "/api/accounts/import",
+                json={"name": "旧账号", "source_dir": source_dir},
+            )
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["account"]["name"], "旧账号")
+        self.assertEqual(
+            server.load_config()["bilibili"]["uid"],
+            "legacy-uid",
+        )
+
     def test_account_configs_are_isolated(self):
         first_id = self.client.get("/api/accounts").get_json()["current_account_id"]
         first_save = self.client.post(
