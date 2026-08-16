@@ -398,6 +398,15 @@ def index():
     )
 
 
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    return jsonify({
+        "ok": True,
+        "product": "BiliCommentReviewer",
+        "product_mode": is_product_mode(),
+    })
+
+
 @app.route("/api/accounts", methods=["GET"])
 def api_accounts():
     if not is_product_mode():
@@ -842,7 +851,10 @@ def main():
         print("提示: 请在 Web UI 中完成配置后启动")
 
     # 延迟打开浏览器（Docker 环境下不打开）
-    if os.getenv('DOCKER_ENV') != 'true':
+    if (
+        os.getenv("DOCKER_ENV") != "true"
+        and os.getenv("BILI_OPEN_BROWSER", "1").strip() != "0"
+    ):
         threading.Timer(1.5, lambda: webbrowser.open(browser_url)).start()
     try:
         socketio.run(

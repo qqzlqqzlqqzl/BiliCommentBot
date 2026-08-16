@@ -22,6 +22,7 @@ video_cache.json
 /build
 /dist
 *.spec
+!BiliCommentReviewer.spec
 
 # 开发环境
 /.idea

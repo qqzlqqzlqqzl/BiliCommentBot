@@ -1,0 +1,186 @@
+param(
+    [string]$ExePath = "",
+    [switch]$KeepData
+)
+
+$ErrorActionPreference = "Stop"
+$projectRoot = $PSScriptRoot
+if (-not $ExePath) {
+    $ExePath = Join-Path $projectRoot "dist\BiliCommentReviewer\BiliCommentReviewer.exe"
+}
+$ExePath = (Resolve-Path -LiteralPath $ExePath).Path
+$testRoot = Join-Path (
+    [System.IO.Path]::GetTempPath()
+) ("BiliCommentReviewer-smoke-" + [guid]::NewGuid().ToString("N"))
+[void](New-Item -ItemType Directory -Path $testRoot)
+$process = $null
+
+function Wait-ForRuntime([string]$RuntimePath, [int]$TimeoutSeconds = 30) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while (-not (Test-Path -LiteralPath $RuntimePath)) {
+        if ([DateTime]::UtcNow -gt $deadline) {
+            throw "等待 runtime.json 超时"
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    Get-Content -LiteralPath $RuntimePath -Raw | ConvertFrom-Json
+}
+
+function Wait-ForHealth([string]$BaseUrl, [int]$TimeoutSeconds = 30) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            return Invoke-RestMethod -Uri "$BaseUrl/api/health" -TimeoutSec 2
+        }
+        catch {
+            Start-Sleep -Milliseconds 250
+        }
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "等待健康检查超时"
+}
+
+function Post-Json([string]$Url, [hashtable]$Body) {
+    Invoke-RestMethod `
+        -Uri $Url `
+        -Method Post `
+        -ContentType "application/json" `
+        -Body ($Body | ConvertTo-Json -Depth 8) `
+        -TimeoutSec 10
+}
+
+function Move-TestDataToRecycleBin([string]$Target) {
+    if (-not (Test-Path -LiteralPath $Target)) {
+        return
+    }
+    $resolved = (Resolve-Path -LiteralPath $Target).Path
+    $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+    if (-not $resolved.StartsWith(
+        $tempRoot,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "拒绝清理临时目录之外的路径: $resolved"
+    }
+    Add-Type -AssemblyName Microsoft.VisualBasic
+    [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory(
+        $resolved,
+        [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs,
+        [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin
+    )
+}
+
+try {
+    $env:BILI_PRODUCT_DATA_DIR = $testRoot
+    $env:BILI_DISABLE_BROWSER = "1"
+    # 故意给父进程一个调试上限，验证发布入口会清除它。
+    $env:BILI_REVIEW_HARD_LIMIT = "110"
+    $process = Start-Process `
+        -FilePath $ExePath `
+        -PassThru `
+        -WindowStyle Hidden
+
+    $runtime = Wait-ForRuntime (Join-Path $testRoot "runtime.json")
+    $baseUrl = "http://127.0.0.1:$($runtime.port)"
+    $health = Wait-ForHealth $baseUrl
+    if (-not $health.ok -or -not $health.product_mode) {
+        throw "health/product mode 校验失败"
+    }
+
+    $page = Invoke-WebRequest -Uri "$baseUrl/" -TimeoutSec 10
+    if ($page.StatusCode -ne 200) {
+        throw "首页不是 HTTP 200"
+    }
+    if ($page.Content -notmatch "const REVIEW_HARD_LIMIT = Number\(50000\)") {
+        throw "发布 EXE 仍带调试读取上限"
+    }
+    if ($page.Content -notmatch '<option value="50000">') {
+        throw "页面缺少 50000 档位"
+    }
+
+    $accounts = Invoke-RestMethod -Uri "$baseUrl/api/accounts" -TimeoutSec 10
+    $firstId = [string]$accounts.current_account_id
+    $saved = Post-Json "$baseUrl/api/config" @{
+        bilibili = @{ uid = "smoke-account-1" }
+    }
+    if (-not $saved.ok) {
+        throw "账号 1 配置保存失败"
+    }
+
+    $created = Post-Json "$baseUrl/api/accounts" @{ name = "烟测账号 2" }
+    $secondId = [string]$created.account.id
+    $saved = Post-Json "$baseUrl/api/config" @{
+        bilibili = @{ uid = "smoke-account-2" }
+    }
+    if (-not $saved.ok) {
+        throw "账号 2 配置保存失败"
+    }
+    $config2 = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
+    if ([string]$config2.config.bilibili.uid -ne "smoke-account-2") {
+        throw "账号 2 配置串号"
+    }
+
+    $selected = Post-Json "$baseUrl/api/accounts/select" @{
+        account_id = $firstId
+    }
+    if (-not $selected.ok) {
+        throw "切回账号 1 失败"
+    }
+    $config1 = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
+    if ([string]$config1.config.bilibili.uid -ne "smoke-account-1") {
+        throw "账号 1 配置串号"
+    }
+
+    $secondProcess = Start-Process `
+        -FilePath $ExePath `
+        -PassThru `
+        -WindowStyle Hidden
+    if (-not $secondProcess.WaitForExit(10000)) {
+        throw "第二次启动未及时退出，单实例失效"
+    }
+    if ($process.HasExited) {
+        throw "第二次启动误杀首个实例"
+    }
+
+    $accountRoot = Join-Path $testRoot "accounts"
+    $configPath1 = Join-Path (
+        Join-Path $accountRoot $firstId
+    ) "config.toml"
+    $configPath2 = Join-Path (
+        Join-Path $accountRoot $secondId
+    ) "config.toml"
+    if (
+        -not (Test-Path -LiteralPath $configPath1) -or
+        -not (Test-Path -LiteralPath $configPath2)
+    ) {
+        throw "账号配置文件未隔离落盘"
+    }
+    $manifest = Get-Content `
+        -LiteralPath (Join-Path $testRoot "accounts.json") `
+        -Raw | ConvertFrom-Json
+    if ($manifest.accounts.Count -ne 2) {
+        throw "账号清单数量不正确"
+    }
+
+    [pscustomobject]@{
+        Result = "PASS"
+        ExePid = $runtime.pid
+        Port = $runtime.port
+        ReleaseHardLimit = 50000
+        AccountCount = $manifest.accounts.Count
+        FirstAccountUid = $config1.config.bilibili.uid
+        SecondAccountUid = $config2.config.bilibili.uid
+        SecondLaunchExited = $secondProcess.HasExited
+        TestRoot = $testRoot
+    } | Format-List
+}
+finally {
+    if ($process -and -not $process.HasExited) {
+        Stop-Process -Id $process.Id -Force
+        [void]$process.WaitForExit(5000)
+    }
+    Remove-Item Env:BILI_PRODUCT_DATA_DIR -ErrorAction SilentlyContinue
+    Remove-Item Env:BILI_DISABLE_BROWSER -ErrorAction SilentlyContinue
+    Remove-Item Env:BILI_REVIEW_HARD_LIMIT -ErrorAction SilentlyContinue
+    if (-not $KeepData) {
+        Move-TestDataToRecycleBin $testRoot
+    }
+}

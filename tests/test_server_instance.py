@@ -25,6 +25,12 @@ class ServerInstanceTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 server.get_server_port()
 
+    def test_health_endpoint_identifies_product(self):
+        response = server.app.test_client().get("/api/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["product"], "BiliCommentReviewer")
+
 
 if __name__ == "__main__":
     unittest.main()
