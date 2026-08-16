@@ -451,7 +451,21 @@ def api_account_select():
 @app.route("/api/config", methods=["GET"])
 def api_get_config():
     cfg = load_config()
-    return jsonify({"ok": True, "config": cfg})
+    has_ark_api_key = bool(
+        os.environ.get("ARK_API_KEY")
+        or os.environ.get("VOLCENGINE_ARK_API_KEY")
+        or cfg.get("ark", {}).get("api_key", "")
+    )
+    return jsonify({
+        "ok": True,
+        "config": cfg,
+        "capabilities": {
+            "bilibili_cookie_configured": bool(
+                cfg.get("bilibili", {}).get("cookie", "")
+            ),
+            "ark_api_key_configured": has_ark_api_key,
+        },
+    })
 
 
 @app.route("/api/config", methods=["POST"])

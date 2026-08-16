@@ -197,6 +197,7 @@
   .review-empty { padding:32px; color:var(--text2); text-align:center; }
   .review-check-cell { width:64px; min-width:64px; text-align:center; vertical-align:top !important; padding-top:12px !important; }
   .review-check { display:block; width:36px; height:36px; margin:0 auto; accent-color:var(--accent); cursor:pointer; }
+  .legacy-config { display:none !important; }
 </style>
 </head>
 <body>
@@ -266,7 +267,7 @@
           <div class="stat-value" id="stat-processed">0</div>
           <div class="stat-label">已处理评论</div>
         </div>
-        <div class="stat-card">
+        <div class="stat-card legacy-config">
           <div class="stat-value" id="stat-videos">0</div>
           <div class="stat-label">缓存视频数</div>
         </div>
@@ -282,9 +283,16 @@
           <button class="btn btn-success" id="btn-start" onclick="botStart()">▶ 启动草稿监控</button>
           <button class="btn btn-danger" id="btn-stop" onclick="botStop()" disabled>⏹ 停止</button>
           <button class="btn btn-secondary" onclick="verifyLogin()">🔍 验证登录状态</button>
-          <button class="btn btn-secondary" onclick="clearCache()">🗑 清除视频缓存</button>
+          <button class="btn btn-secondary legacy-config" onclick="clearCache()">🗑 清除视频缓存</button>
         </div>
         <div id="verify-result" style="margin-top:12px"></div>
+      </div>
+
+      <div class="alert alert-info" id="setup-guide" style="display:none;margin-bottom:20px">
+        <strong>首次使用：</strong>
+        <span id="setup-guide-text"></span>
+        <button class="btn btn-secondary" id="setup-login-button" onclick="navigateTo('login')" style="margin-left:10px;padding:5px 10px">去扫码登录</button>
+        <button class="btn btn-secondary" id="setup-ark-button" onclick="openConfigTab('tab-ark')" style="margin-left:6px;padding:5px 10px">配置豆包</button>
       </div>
 
       <div class="card">
@@ -367,11 +375,11 @@
     <div class="page" id="page-config">
       <div class="page-title"><span class="icon">⚙️</span>配置</div>
       <div class="tab-bar">
-        <button class="tab-btn active" data-tab="tab-bilibili">B站配置</button>
-        <button class="tab-btn" data-tab="tab-ark">豆包 / 火山方舟</button>
-        <button class="tab-btn" data-tab="tab-reply">回复策略</button>
-        <button class="tab-btn" data-tab="tab-rate">频率控制</button>
-        <button class="tab-btn" data-tab="tab-cache">缓存</button>
+        <button class="tab-btn active" data-tab="tab-bilibili">账号与 B站</button>
+        <button class="tab-btn" data-tab="tab-ark">豆包</button>
+        <button class="tab-btn" data-tab="tab-reply">草稿与发送</button>
+        <button class="tab-btn" data-tab="tab-rate">B站请求</button>
+        <button class="tab-btn legacy-config" data-tab="tab-cache">缓存</button>
         <button class="tab-btn" data-tab="tab-logging">日志</button>
         <button class="tab-btn" data-tab="tab-auth">安全</button>
       </div>
@@ -402,7 +410,7 @@
               <input class="form-input" type="number" id="cfg-bilibili-cookie_refresh_interval" value="30">
             </div>
           </div>
-          <div class="form-row">
+          <div class="form-row legacy-config">
             <div class="form-group">
               <label class="form-label">指定单个 BV 时的评论页数</label>
               <input class="form-input" type="number" id="cfg-bilibili-max_comment_pages" value="10">
@@ -487,34 +495,37 @@
           <div class="form-group">
             <label class="form-check">
               <input type="checkbox" id="cfg-reply-enabled" checked>
-              启用自动生成审核草稿
+              启用定时生成审核草稿（仍需人工批准）
             </label>
           </div>
-          <div class="form-group">
+          <div class="form-group legacy-config">
             <label class="form-check">
               <input type="checkbox" id="cfg-reply-only_new" checked>
               只回复未处理过的评论
             </label>
           </div>
-          <div class="form-group">
+          <div class="form-group legacy-config">
             <label class="form-check">
               <input type="checkbox" id="cfg-reply-like_enabled">
               回复时同时点赞评论
             </label>
           </div>
-          <div class="form-group">
+          <div class="form-group legacy-config">
             <label class="form-check">
               <input type="checkbox" id="cfg-reply-like_user_video_enabled">
               回复后点赞评论用户的最新视频
             </label>
           </div>
-          <div class="form-group">
+          <div class="form-group legacy-config">
             <label class="form-check">
               <input type="checkbox" id="cfg-reply-like_user_video_only_followers">
               仅给粉丝视频点赞（仅点赞关注了你的用户的视频）
             </label>
           </div>
-          <div class="form-row">
+          <div class="alert alert-info">
+            每次读取数量和时间范围统一在“回复审核”页选择，避免两套设置互相覆盖。
+          </div>
+          <div class="form-row legacy-config">
             <div class="form-group">
               <label class="form-label">最新评论扫描上限</label>
               <select class="form-select" id="cfg-reply-max_process">
@@ -542,29 +553,30 @@
           <div class="form-group">
             <label class="form-label">回复延迟（秒）</label>
             <input class="form-input" type="number" id="cfg-reply-reply_delay" value="2">
+            <div class="form-hint">只控制 B站发送间隔；发送始终串行。</div>
           </div>
-          <div class="form-group">
+          <div class="form-group legacy-config">
             <label class="form-label">上下文评论数（0=不使用上下文）</label>
             <input class="form-input" type="number" id="cfg-reply-context_comments_count" value="0">
             <div class="form-hint">生成回复时参考前 N 条评论作为上下文</div>
           </div>
-          <div class="form-group">
+          <div class="form-group legacy-config">
             <label class="form-check">
               <input type="checkbox" id="cfg-reply-chained_reply_enabled" checked>
               启用链式回复（楼中楼）
             </label>
             <div class="form-hint">启用后，机器人会监控并回复主评论下的子评论（楼中楼）</div>
           </div>
-          <div class="form-group">
+          <div class="form-group legacy-config">
             <label class="form-label">最大回复深度（层数）</label>
             <input class="form-input" type="number" id="cfg-reply-max_reply_depth" value="3" min="1" max="10">
             <div class="form-hint">设置楼中楼回复的最大嵌套层数（例如：3 表示最多回复到第 3 层评论）</div>
           </div>
-          <div class="form-group">
+          <div class="form-group legacy-config">
             <label class="form-label">回复前缀（可留空）</label>
             <input class="form-input" id="cfg-reply-prefix" placeholder="">
           </div>
-          <div class="form-group">
+          <div class="form-group legacy-config">
             <label class="form-label">仅回复指定视频（BVID）</label>
             <input class="form-input" id="cfg-reply-only_bvid" placeholder="如：BV1xx411c7mD">
             <div class="form-hint">留空则回复所有视频的评论；填写后仅回复该指定视频的评论</div>
@@ -573,17 +585,17 @@
 
         <!-- 关键词过滤 -->
         <div class="card">
-          <div class="card-title">🔍 关键词过滤</div>
+          <div class="card-title">🔍 送豆包前：关键词预筛选</div>
           <div class="form-group">
             <label class="form-check">
               <input type="checkbox" id="cfg-reply-keyword_filter-enabled">
-              启用关键词过滤
+              启用关键词预筛选
             </label>
           </div>
           <div class="form-group">
             <label class="form-label">白名单关键词（逗号分隔）</label>
             <textarea class="form-textarea" id="cfg-reply-keyword_filter-whitelist" rows="2" placeholder="谢谢,请问,好看"></textarea>
-            <div class="form-hint">评论必须包含至少一个白名单关键词才回复（留空=不限制）</div>
+            <div class="form-hint">评论必须包含至少一个白名单关键词才会交给豆包（留空=不限制）</div>
           </div>
           <div class="form-group">
             <label class="form-label">黑名单关键词（逗号分隔）</label>
@@ -609,11 +621,11 @@
 
         <!-- 评论长度过滤 -->
         <div class="card">
-          <div class="card-title">📏 评论长度过滤</div>
+          <div class="card-title">📏 送豆包前：评论长度预筛选</div>
           <div class="form-group">
             <label class="form-check">
               <input type="checkbox" id="cfg-reply-length_filter-enabled">
-              启用长度过滤
+              启用长度预筛选
             </label>
           </div>
           <div class="form-row">
@@ -632,7 +644,7 @@
 
         <!-- 用户过滤 -->
         <div class="card">
-          <div class="card-title">👤 用户过滤</div>
+          <div class="card-title">👤 送豆包前：用户预筛选</div>
           <div class="form-group">
             <label class="form-check">
               <input type="checkbox" id="cfg-reply-user_filter-enabled">
@@ -953,6 +965,12 @@ function navigateTo(page) {
   if (page === 'config') loadConfig();
 }
 
+function openConfigTab(tabId) {
+  navigateTo('config');
+  const button = document.querySelector(`.tab-btn[data-tab="${tabId}"]`);
+  if (button) button.click();
+}
+
 // ── Tab 切换 ──
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -1108,6 +1126,7 @@ function loadConfig() {
     if (!d.ok) return;
     configData = d.config;
     const cfg = d.config;
+    updateSetupGuide(d.capabilities || {});
 
     function set(id, val) {
       const el = document.getElementById(id);
@@ -1400,6 +1419,23 @@ function loadReviewDrafts(retryOnNetworkError = true) {
     }
     showToast('读取审核草稿失败：本地服务暂时没有响应，请刷新页面', 'error');
   });
+}
+
+function updateSetupGuide(capabilities) {
+  const missingLogin = !capabilities.bilibili_cookie_configured;
+  const missingArk = !capabilities.ark_api_key_configured;
+  const guide = document.getElementById('setup-guide');
+  if (!missingLogin && !missingArk) {
+    guide.style.display = 'none';
+    return;
+  }
+  const missing = [];
+  if (missingLogin) missing.push('扫码登录 B站');
+  if (missingArk) missing.push('配置豆包 API Key');
+  document.getElementById('setup-guide-text').textContent = `还需要：${missing.join('、')}。`;
+  document.getElementById('setup-login-button').style.display = missingLogin ? '' : 'none';
+  document.getElementById('setup-ark-button').style.display = missingArk ? '' : 'none';
+  guide.style.display = '';
 }
 
 function localDateTimeValue(date) {

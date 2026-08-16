@@ -1961,8 +1961,6 @@ class BiliCommentBot:
         if not aid:
             self.logger.error(f"无法确定评论所属稿件: comment_id={comment_id}")
             return ReplyAttemptResult(False, False, "无法确定评论所属稿件")
-        prefix = self.config["reply"].get("prefix", "")
-
         root = root_id if root_id else comment_id
         parent = parent_id if parent_id else comment_id
 
@@ -1971,7 +1969,7 @@ class BiliCommentBot:
             "oid": aid,
             "root": root,
             "parent": parent,
-            "message": f"{prefix}{content}",
+            "message": content,
             "csrf": self.csrf_token,
         }
 

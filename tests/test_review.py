@@ -459,6 +459,31 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(result, {"sent": 0, "failed": 0, "unknown": 0})
         self.bot.reply_comment.assert_not_called()
 
+    def test_reply_comment_sends_doubao_text_without_configured_prefix(self):
+        reply_bot = BiliCommentBot.__new__(BiliCommentBot)
+        reply_bot.config = copy.deepcopy(DEFAULT_CONFIG)
+        reply_bot.config["reply"]["prefix"] = "不应发送的前缀"
+        reply_bot.logger = logging.getLogger("reply-original-text-test")
+        reply_bot.csrf_token = "csrf"
+        reply_bot.cookie_manager = Mock()
+        reply_bot.cookie_manager._get_csrf_from_cookie.return_value = "csrf"
+        reply_bot.cookie_manager.verify_cookie.return_value = (True, {})
+        reply_bot.bvid_to_aid = Mock(return_value="123")
+        response = Mock()
+        response.__bool__ = Mock(return_value=True)
+        response.json.return_value = {"code": 0}
+        reply_bot.make_request_with_retry = Mock(return_value=response)
+
+        result = reply_bot.reply_comment(
+            "BV1test",
+            "100",
+            "豆包原始候选",
+        )
+
+        self.assertTrue(result.ok)
+        sent_data = reply_bot.make_request_with_retry.call_args.kwargs["data"]
+        self.assertEqual(sent_data["message"], "豆包原始候选")
+
     def test_only_explicitly_approved_requested_draft_is_sent(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
         self.bot._review_drafts["2"] = self._draft("2", approved=False, status="pending")
