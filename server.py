@@ -172,6 +172,39 @@ def save_config(cfg: dict, account_id: str = None) -> bool:
     return _save_config_file(CONFIG_FILE, cfg)
 
 
+SENSITIVE_CONFIG_KEYS = {
+    "bilibili": {"cookie", "refresh_token"},
+    "ark": {"api_key"},
+    "auth": {"password"},
+}
+
+
+def config_for_client(cfg: dict) -> dict:
+    """返回浏览器可编辑配置，不把本地凭据重新暴露给页面。"""
+    safe_cfg = copy.deepcopy(cfg)
+    for section, keys in SENSITIVE_CONFIG_KEYS.items():
+        section_cfg = safe_cfg.get(section)
+        if not isinstance(section_cfg, dict):
+            continue
+        for key in keys:
+            section_cfg.pop(key, None)
+    return safe_cfg
+
+
+def preserve_blank_sensitive_updates(data: dict) -> dict:
+    """密钥输入框留空表示保持原值，清除必须走显式接口。"""
+    safe_data = copy.deepcopy(data)
+    for section, keys in SENSITIVE_CONFIG_KEYS.items():
+        section_cfg = safe_data.get(section)
+        if not isinstance(section_cfg, dict):
+            continue
+        for key in keys:
+            value = section_cfg.get(key)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                section_cfg.pop(key, None)
+    return safe_data
+
+
 # ─────────────────────────────────────────────
 #  日志设置
 # ─────────────────────────────────────────────
@@ -467,10 +500,13 @@ def api_get_config():
     )
     return jsonify({
         "ok": True,
-        "config": cfg,
+        "config": config_for_client(cfg),
         "capabilities": {
             "bilibili_cookie_configured": bool(
                 cfg.get("bilibili", {}).get("cookie", "")
+            ),
+            "bilibili_refresh_token_configured": bool(
+                cfg.get("bilibili", {}).get("refresh_token", "")
             ),
             "ark_api_key_configured": has_ark_api_key,
         },
@@ -482,6 +518,7 @@ def api_save_config():
     data = request.get_json()
     if not data:
         return jsonify({"ok": False, "message": "无效数据"})
+    data = preserve_blank_sensitive_updates(data)
     cfg = load_config()
 
     def deep_update(base, upd):
@@ -501,6 +538,34 @@ def api_save_config():
         )
         return jsonify({"ok": True, "message": message, "deferred": not applied})
     return jsonify({"ok": False, "message": "保存失败"})
+
+
+@app.route("/api/config/secrets/clear", methods=["POST"])
+def api_clear_config_secret():
+    data = request.get_json(silent=True) or {}
+    secret = str(data.get("secret", "")).strip()
+    cfg = load_config()
+    if secret == "bilibili_login":
+        cfg.setdefault("bilibili", {})["cookie"] = ""
+        cfg.setdefault("bilibili", {})["refresh_token"] = ""
+        message = "当前账号保存的 B站登录凭据已清除"
+    elif secret == "ark_api_key":
+        cfg.setdefault("ark", {})["api_key"] = ""
+        message = "当前账号保存的豆包 API Key 已清除"
+        if os.environ.get("ARK_API_KEY") or os.environ.get("VOLCENGINE_ARK_API_KEY"):
+            message += "；环境变量中的 API Key 仍然生效"
+    else:
+        return jsonify({"ok": False, "message": "不支持的凭据类型"}), 400
+
+    if not save_config(cfg):
+        return jsonify({"ok": False, "message": "清除失败"}), 500
+    bot = get_bot()
+    applied = bot.reload_config(cfg)
+    return jsonify({
+        "ok": True,
+        "message": message,
+        "deferred": not applied,
+    })
 
 
 @app.route("/api/bot/start", methods=["POST"])

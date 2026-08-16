@@ -390,11 +390,15 @@
           <div class="form-group">
             <label class="form-label">B站 Cookie</label>
             <textarea class="form-textarea" id="cfg-bilibili-cookie" rows="4" placeholder="SESSDATA=xxx; bili_jct=xxx; DedeUserID=xxx"></textarea>
-            <div class="form-hint">请确保包含 SESSDATA、bili_jct、DedeUserID 字段。可在「登录」页扫码自动获取。</div>
+            <div class="form-hint">已保存的 Cookie 不会回显到页面；留空表示不修改。也可以在「登录」页扫码自动获取。</div>
           </div>
           <div class="form-group">
             <label class="form-label">Refresh Token（用于自动刷新 Cookie）</label>
             <input class="form-input" id="cfg-bilibili-refresh_token" placeholder="refresh_token">
+            <div class="form-hint">已保存的 Refresh Token 不会回显；留空表示不修改。</div>
+          </div>
+          <div class="form-group">
+            <button class="btn btn-danger" type="button" onclick="clearStoredSecret('bilibili_login')">清除当前账号登录凭据</button>
           </div>
           <div class="form-group">
             <label class="form-label">B站用户 ID（UID）</label>
@@ -437,7 +441,10 @@
           <div class="form-group">
             <label class="form-label">火山方舟 API Key</label>
             <input class="form-input" id="cfg-ark-api_key" placeholder="建议使用 ARK_API_KEY 环境变量" type="password">
-            <div class="form-hint">API Key 不要提交到仓库。环境变量 ARK_API_KEY 优先于这里的配置。</div>
+            <div class="form-hint">已保存的 Key 不会回显；留空表示不修改。环境变量 ARK_API_KEY 优先于这里的配置。</div>
+          </div>
+          <div class="form-group">
+            <button class="btn btn-danger" type="button" onclick="clearStoredSecret('ark_api_key')">清除当前账号保存的 API Key</button>
           </div>
           <div class="form-group">
             <label class="form-label">Responses API 地址</label>
@@ -1136,8 +1143,12 @@ function loadConfig() {
     }
 
     const b = cfg.bilibili || {};
-    set('cfg-bilibili-cookie', b.cookie);
-    set('cfg-bilibili-refresh_token', b.refresh_token);
+    set('cfg-bilibili-cookie', '');
+    set('cfg-bilibili-refresh_token', '');
+    document.getElementById('cfg-bilibili-cookie').placeholder =
+      d.capabilities?.bilibili_cookie_configured ? '已保存；留空不修改' : 'SESSDATA=xxx; bili_jct=xxx; DedeUserID=xxx';
+    document.getElementById('cfg-bilibili-refresh_token').placeholder =
+      d.capabilities?.bilibili_refresh_token_configured ? '已保存；留空不修改' : 'refresh_token';
     set('cfg-bilibili-uid', b.uid);
     set('cfg-bilibili-check_interval', b.check_interval);
     set('cfg-bilibili-cookie_refresh_interval', b.cookie_refresh_interval);
@@ -1146,7 +1157,9 @@ function loadConfig() {
     set('cfg-bilibili-auto_refresh_cookie', b.auto_refresh_cookie);
 
     const ark = cfg.ark || {};
-    set('cfg-ark-api_key', ark.api_key);
+    set('cfg-ark-api_key', '');
+    document.getElementById('cfg-ark-api_key').placeholder =
+      d.capabilities?.ark_api_key_configured ? '已配置；留空不修改' : '输入火山方舟 API Key';
     set('cfg-ark-base_url', ark.base_url);
     set('cfg-ark-model', ark.model);
     set('cfg-ark-max_tokens', ark.max_tokens);
@@ -1228,8 +1241,6 @@ function saveConfig() {
 
   const cfg = {
     bilibili: {
-      cookie: get('cfg-bilibili-cookie'),
-      refresh_token: get('cfg-bilibili-refresh_token'),
       uid: get('cfg-bilibili-uid'),
       check_interval: get('cfg-bilibili-check_interval'),
       cookie_refresh_interval: get('cfg-bilibili-cookie_refresh_interval'),
@@ -1238,7 +1249,6 @@ function saveConfig() {
       auto_refresh_cookie: get('cfg-bilibili-auto_refresh_cookie'),
     },
     ark: {
-      api_key: get('cfg-ark-api_key'),
       base_url: get('cfg-ark-base_url'),
       model: get('cfg-ark-model'),
       max_tokens: get('cfg-ark-max_tokens'),
@@ -1303,6 +1313,12 @@ function saveConfig() {
       enabled: get('cfg-auth-enabled'),
     },
   };
+  const cookie = get('cfg-bilibili-cookie').trim();
+  const refreshToken = get('cfg-bilibili-refresh_token').trim();
+  const apiKey = get('cfg-ark-api_key').trim();
+  if (cookie) cfg.bilibili.cookie = cookie;
+  if (refreshToken) cfg.bilibili.refresh_token = refreshToken;
+  if (apiKey) cfg.ark.api_key = apiKey;
 
   fetch('/api/config', {
     method: 'POST',
@@ -1310,6 +1326,20 @@ function saveConfig() {
     body: JSON.stringify(cfg),
   }).then(r=>r.json()).then(d=>{
     showToast(d.message, d.ok ? 'success' : 'error');
+    if (d.ok) loadConfig();
+  });
+}
+
+function clearStoredSecret(secret) {
+  const label = secret === 'bilibili_login' ? 'B站登录凭据' : '豆包 API Key';
+  if (!confirm(`确定清除当前账号保存的${label}吗？`)) return;
+  fetch('/api/config/secrets/clear', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({secret}),
+  }).then(r=>r.json()).then(d=>{
+    showToast(d.message, d.ok ? 'success' : 'error');
+    if (d.ok) loadConfig();
   });
 }
 

@@ -114,6 +114,82 @@ class ServerAccountApiTests(unittest.TestCase):
             "SESSDATA=second; bili_jct=csrf-second",
         )
 
+    def test_config_get_does_not_return_saved_secrets(self):
+        self.client.post(
+            "/api/config",
+            json={
+                "bilibili": {
+                    "cookie": "SESSDATA=secret",
+                    "refresh_token": "refresh-secret",
+                },
+                "ark": {"api_key": "ark-secret"},
+                "auth": {"password": "password-hash"},
+            },
+        )
+
+        payload = self.client.get("/api/config").get_json()
+
+        self.assertNotIn("cookie", payload["config"]["bilibili"])
+        self.assertNotIn("refresh_token", payload["config"]["bilibili"])
+        self.assertNotIn("api_key", payload["config"]["ark"])
+        self.assertNotIn("password", payload["config"]["auth"])
+        self.assertTrue(payload["capabilities"]["bilibili_cookie_configured"])
+        self.assertTrue(payload["capabilities"]["ark_api_key_configured"])
+
+    def test_blank_secret_fields_preserve_existing_values(self):
+        self.client.post(
+            "/api/config",
+            json={
+                "bilibili": {
+                    "cookie": "SESSDATA=secret",
+                    "refresh_token": "refresh-secret",
+                },
+                "ark": {"api_key": "ark-secret"},
+            },
+        )
+
+        self.client.post(
+            "/api/config",
+            json={
+                "bilibili": {"cookie": "", "refresh_token": "", "uid": "123"},
+                "ark": {"api_key": "", "model": "model-test"},
+            },
+        )
+        stored = server.load_config()
+
+        self.assertEqual(stored["bilibili"]["cookie"], "SESSDATA=secret")
+        self.assertEqual(stored["bilibili"]["refresh_token"], "refresh-secret")
+        self.assertEqual(stored["ark"]["api_key"], "ark-secret")
+        self.assertEqual(stored["bilibili"]["uid"], "123")
+
+    def test_saved_secrets_require_explicit_clear_action(self):
+        self.client.post(
+            "/api/config",
+            json={
+                "bilibili": {
+                    "cookie": "SESSDATA=secret",
+                    "refresh_token": "refresh-secret",
+                },
+                "ark": {"api_key": "ark-secret"},
+            },
+        )
+
+        login_result = self.client.post(
+            "/api/config/secrets/clear",
+            json={"secret": "bilibili_login"},
+        )
+        ark_result = self.client.post(
+            "/api/config/secrets/clear",
+            json={"secret": "ark_api_key"},
+        )
+        stored = server.load_config()
+
+        self.assertEqual(login_result.status_code, 200)
+        self.assertEqual(ark_result.status_code, 200)
+        self.assertEqual(stored["bilibili"]["cookie"], "")
+        self.assertEqual(stored["bilibili"]["refresh_token"], "")
+        self.assertEqual(stored["ark"]["api_key"], "")
+
     def test_rendered_product_page_uses_debug_cap_without_removing_full_options(self):
         with patch.dict(
             os.environ,
