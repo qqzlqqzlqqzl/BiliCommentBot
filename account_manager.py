@@ -119,12 +119,14 @@ class AccountManager:
                 item["current"] = item["id"] == current_id
                 bot = self._bots.get(item["id"])
                 item["loaded"] = bot is not None
-                item["running"] = bool(bot and bot.is_running())
-                item["operations"] = (
+                running_state = getattr(bot, "is_running", False) if bot else False
+                item["running"] = bool(
+                    running_state() if callable(running_state) else running_state
+                )
+                operations = (
                     bot.get_review_operation_status()
                     if bot is not None
                     else {
-                        "busy": False,
                         "active": {
                             "generating": 0,
                             "regenerating": 0,
@@ -132,6 +134,8 @@ class AccountManager:
                         },
                     }
                 )
+                operations["busy"] = any(operations.get("active", {}).values())
+                item["operations"] = operations
                 result.append(item)
             return result
 
@@ -166,8 +170,10 @@ class AccountManager:
         account_id = self.resolve_account_id(account_id)
         with self._lock:
             current_bot = self._bots.get(self._manifest["current_account_id"])
-            if current_bot and current_bot.get_review_operation_status()["busy"]:
-                raise AccountBusyError("当前账号有审核任务正在执行，暂时不能切换")
+            if current_bot:
+                operations = current_bot.get_review_operation_status()
+                if any(operations.get("active", {}).values()):
+                    raise AccountBusyError("当前账号有审核任务正在执行，暂时不能切换")
             self._manifest["current_account_id"] = account_id
             self._save_manifest()
             return next(
@@ -196,3 +202,8 @@ class AccountManager:
             bots = list(self._bots.values())
         for bot in bots:
             bot.prepare_shutdown()
+            logger = getattr(bot, "logger", None)
+            if logger:
+                for handler in list(logger.handlers):
+                    handler.close()
+                    logger.removeHandler(handler)

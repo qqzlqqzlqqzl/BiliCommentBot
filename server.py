@@ -26,6 +26,7 @@ import tomli_w
 from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO, emit
 
+from account_manager import AccountBusyError, AccountManager, AccountNotFoundError
 from bot import (
     BiliCommentBot,
     DEFAULT_CONFIG,
@@ -70,9 +71,10 @@ def get_instance_name() -> str:
 #  日志 Handler（推送到前端）
 # ─────────────────────────────────────────────
 class WebSocketLogHandler(logging.Handler):
-    def __init__(self, sio: SocketIO):
+    def __init__(self, sio: SocketIO, account_id: str = ""):
         super().__init__()
         self.sio = sio
+        self.account_id = account_id
         self.log_buffer: list = []
         self.max_buffer = 500
 
@@ -82,6 +84,8 @@ class WebSocketLogHandler(logging.Handler):
             "level": record.levelname,
             "msg": self.format(record),
         }
+        if self.account_id:
+            entry["account_id"] = self.account_id
         self.log_buffer.append(entry)
         if len(self.log_buffer) > self.max_buffer:
             self.log_buffer = self.log_buffer[-self.max_buffer:]
@@ -96,15 +100,24 @@ ws_log_handler = WebSocketLogHandler(socketio)
 ws_log_handler.setFormatter(
     logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
 )
+_account_log_handlers = {}
+
+
+def get_product_data_root() -> str:
+    return os.environ.get("BILI_PRODUCT_DATA_DIR", "").strip()
+
+
+def is_product_mode() -> bool:
+    return bool(get_product_data_root())
 
 # ─────────────────────────────────────────────
 #  配置管理
 # ─────────────────────────────────────────────
-def load_config() -> dict:
-    if not os.path.exists(CONFIG_FILE):
+def _load_config_file(config_file: str) -> dict:
+    if not os.path.exists(config_file):
         return copy.deepcopy(DEFAULT_CONFIG)
     try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(config_file, "r", encoding="utf-8") as f:
             cfg = toml.load(f)
 
         def merge(base, override):
@@ -122,32 +135,65 @@ def load_config() -> dict:
         return copy.deepcopy(DEFAULT_CONFIG)
 
 
-def save_config(cfg: dict) -> bool:
+def _save_config_file(config_file: str, cfg: dict) -> bool:
     try:
-        with open(CONFIG_FILE, "wb") as f:
+        directory = os.path.dirname(config_file)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temp_file = f"{config_file}.tmp"
+        with open(temp_file, "wb") as f:
             tomli_w.dump(cfg, f)
+        os.replace(temp_file, config_file)
         return True
     except Exception as e:
         print(f"保存配置文件失败: {e}")
         return False
 
 
+def load_config(account_id: str = None) -> dict:
+    if is_product_mode():
+        manager = get_account_manager()
+        account_id = manager.resolve_account_id(account_id)
+        return _load_config_file(
+            os.path.join(manager.account_dir(account_id), "config.toml")
+        )
+    return _load_config_file(CONFIG_FILE)
+
+
+def save_config(cfg: dict, account_id: str = None) -> bool:
+    if is_product_mode():
+        manager = get_account_manager()
+        account_id = manager.resolve_account_id(account_id)
+        return _save_config_file(
+            os.path.join(manager.account_dir(account_id), "config.toml"),
+            cfg,
+        )
+    return _save_config_file(CONFIG_FILE, cfg)
+
+
 # ─────────────────────────────────────────────
 #  日志设置
 # ─────────────────────────────────────────────
-def _setup_logger(cfg: dict) -> logging.Logger:
+def _setup_logger(
+    cfg: dict,
+    data_dir: str = None,
+    account_id: str = "",
+) -> logging.Logger:
     log_cfg = cfg.get("logging", {})
     level = getattr(logging, log_cfg.get("level", "INFO").upper(), logging.INFO)
     log_file = log_cfg.get("file", "logs/bot.log")
-    data_dir = os.environ.get("BILI_DATA_DIR", "")
+    if data_dir is None:
+        data_dir = os.environ.get("BILI_DATA_DIR", "")
     if data_dir and not os.path.isabs(log_file):
         log_file = os.path.join(data_dir, log_file)
     log_dir = os.path.dirname(log_file)
     if log_dir and not os.path.exists(log_dir):
         os.makedirs(log_dir, exist_ok=True)
 
-    logger = logging.getLogger("BiliBot")
+    logger_name = f"BiliBot.{account_id}" if account_id else "BiliBot"
+    logger = logging.getLogger(logger_name)
     logger.setLevel(level)
+    logger.propagate = False
     logger.handlers.clear()
 
     fh = logging.FileHandler(log_file, encoding="utf-8")
@@ -159,7 +205,15 @@ def _setup_logger(cfg: dict) -> logging.Logger:
         ch.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
         logger.addHandler(ch)
 
-    logger.addHandler(ws_log_handler)
+    if account_id:
+        handler = WebSocketLogHandler(socketio, account_id=account_id)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+        )
+        _account_log_handlers[account_id] = handler
+        logger.addHandler(handler)
+    else:
+        logger.addHandler(ws_log_handler)
     return logger
 
 
@@ -168,10 +222,38 @@ def _setup_logger(cfg: dict) -> logging.Logger:
 # ─────────────────────────────────────────────
 _bot: Optional[BiliCommentBot] = None
 _bot_logger: Optional[logging.Logger] = None
+_account_manager: Optional[AccountManager] = None
 
 
-def get_bot() -> BiliCommentBot:
+def _create_account_bot(account: dict) -> BiliCommentBot:
+    account_id = account["id"]
+    data_dir = account["data_dir"]
+    cfg = _load_config_file(os.path.join(data_dir, "config.toml"))
+    logger = _setup_logger(cfg, data_dir=data_dir, account_id=account_id)
+    return BiliCommentBot(
+        cfg,
+        logger,
+        socketio=socketio,
+        on_config_changed=lambda rt, aid=account_id: _save_refresh_token(rt, aid),
+        data_dir=data_dir,
+        account_id=account_id,
+    )
+
+
+def get_account_manager() -> AccountManager:
+    global _account_manager
+    root_dir = get_product_data_root()
+    if not root_dir:
+        raise RuntimeError("当前不是产品多账号模式")
+    if _account_manager is None or _account_manager.root_dir != os.path.abspath(root_dir):
+        _account_manager = AccountManager(root_dir, _create_account_bot)
+    return _account_manager
+
+
+def get_bot(account_id: str = None) -> BiliCommentBot:
     global _bot, _bot_logger
+    if is_product_mode():
+        return get_account_manager().get_bot(account_id)
     if _bot is None:
         cfg = load_config()
         _bot_logger = _setup_logger(cfg)
@@ -180,11 +262,11 @@ def get_bot() -> BiliCommentBot:
     return _bot
 
 
-def _save_refresh_token(new_token: str):
+def _save_refresh_token(new_token: str, account_id: str = None):
     """持久化 refresh_token 到配置文件"""
-    cfg = load_config()
+    cfg = load_config(account_id)
     cfg.setdefault("bilibili", {})["refresh_token"] = new_token
-    save_config(cfg)
+    save_config(cfg, account_id)
 
 
 # ─────────────────────────────────────────────
@@ -253,12 +335,74 @@ def _poll_qr_login(qr_key: str, session: requests.Session):
 @app.route("/")
 def index():
     cfg = load_config()
+    if is_product_mode():
+        manager = get_account_manager()
+        current_id = manager.current_account_id()
+        current = next(
+            account
+            for account in manager.list_accounts()
+            if account["id"] == current_id
+        )
+        instance_name = current["name"]
+    else:
+        instance_name = get_instance_name()
     return render_template(
         "index.html",
-        instance_name=get_instance_name(),
+        instance_name=instance_name,
         instance_port=get_server_port(),
         instance_uid=str(cfg.get("bilibili", {}).get("uid", "") or "未配置"),
+        product_mode=is_product_mode(),
     )
+
+
+@app.route("/api/accounts", methods=["GET"])
+def api_accounts():
+    if not is_product_mode():
+        return jsonify({
+            "ok": True,
+            "product_mode": False,
+            "current_account_id": "legacy",
+            "accounts": [{
+                "id": "legacy",
+                "name": get_instance_name(),
+                "current": True,
+                "running": bool(_bot and _bot.is_running),
+                "loaded": _bot is not None,
+            }],
+        })
+    manager = get_account_manager()
+    return jsonify({
+        "ok": True,
+        "product_mode": True,
+        "current_account_id": manager.current_account_id(),
+        "accounts": manager.list_accounts(),
+    })
+
+
+@app.route("/api/accounts", methods=["POST"])
+def api_account_create():
+    if not is_product_mode():
+        return jsonify({"ok": False, "message": "当前启动方式不支持应用内多账号"}), 409
+    data = request.get_json(silent=True) or {}
+    try:
+        account = get_account_manager().create_account(data.get("name", ""))
+        return jsonify({"ok": True, "account": account})
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.route("/api/accounts/select", methods=["POST"])
+def api_account_select():
+    if not is_product_mode():
+        return jsonify({"ok": False, "message": "当前启动方式不支持应用内多账号"}), 409
+    data = request.get_json(silent=True) or {}
+    try:
+        account = get_account_manager().select_account(data.get("account_id", ""))
+        return jsonify({"ok": True, "account": account})
+    except AccountNotFoundError:
+        return jsonify({"ok": False, "message": "账号不存在"}), 404
+    except AccountBusyError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 409
 
 
 @app.route("/api/config", methods=["GET"])
@@ -356,12 +500,11 @@ def api_history():
 @app.route("/api/history/clear", methods=["POST"])
 def api_history_clear():
     try:
-        if os.path.exists(HISTORY_FILE):
-            os.remove(HISTORY_FILE)
         bot = get_bot()
         bot.processed_comments.clear()
-        # 清空内存缓冲
         bot._history_buffer = []
+        bot._history_dirty = True
+        bot._flush_history()
         return jsonify({"ok": True, "message": "历史记录已清除"})
     except Exception as e:
         return jsonify({"ok": False, "message": str(e)})
@@ -445,7 +588,14 @@ def api_review_send():
 
 @app.route("/api/logs", methods=["GET"])
 def api_logs():
-    return jsonify({"ok": True, "logs": ws_log_handler.log_buffer[-200:]})
+    if is_product_mode():
+        account_id = get_account_manager().current_account_id()
+        get_bot(account_id)
+        handler = _account_log_handlers.get(account_id)
+        logs = handler.log_buffer[-200:] if handler else []
+    else:
+        logs = ws_log_handler.log_buffer[-200:]
+    return jsonify({"ok": True, "logs": logs})
 
 
 @app.route("/api/qr/generate", methods=["POST"])
@@ -472,8 +622,7 @@ def api_cache_clear():
     bot = get_bot()
     bot.cached_videos = []
     bot.last_video_fetch_time = 0
-    if os.path.exists(VIDEO_CACHE_FILE):
-        os.remove(VIDEO_CACHE_FILE)
+    bot._partial_save_video_cache([], 0)
     return jsonify({"ok": True, "message": "视频缓存已清除"})
 
 
@@ -553,7 +702,13 @@ def on_connect():
     bot = get_bot()
     emit("bot_status", {"running": bot.is_running})
     emit("stats", bot.get_stats())
-    emit("log_history", {"logs": ws_log_handler.log_buffer[-100:]})
+    if is_product_mode():
+        account_id = get_account_manager().current_account_id()
+        handler = _account_log_handlers.get(account_id)
+        logs = handler.log_buffer[-100:] if handler else []
+    else:
+        logs = ws_log_handler.log_buffer[-100:]
+    emit("log_history", {"logs": logs})
 
 
 # ─────────────────────────────────────────────
@@ -562,7 +717,16 @@ def on_connect():
 def main():
     host = os.environ.get("BILI_HOST", "127.0.0.1").strip() or "127.0.0.1"
     port = get_server_port()
-    instance_name = get_instance_name()
+    if is_product_mode():
+        manager = get_account_manager()
+        current_id = manager.current_account_id()
+        instance_name = next(
+            account["name"]
+            for account in manager.list_accounts()
+            if account["id"] == current_id
+        )
+    else:
+        instance_name = get_instance_name()
     url = f"http://{host}:{port}"
     browser_url = f"http://127.0.0.1:{port}"
     print(f"""
@@ -618,7 +782,10 @@ def main():
             allow_unsafe_werkzeug=True,
         )
     finally:
-        bot.prepare_shutdown()
+        if is_product_mode():
+            get_account_manager().shutdown_all()
+        else:
+            bot.prepare_shutdown()
 
 
 if __name__ == "__main__":
