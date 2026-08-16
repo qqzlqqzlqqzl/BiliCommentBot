@@ -29,6 +29,7 @@ from flask_socketio import SocketIO, emit
 from bot import (
     BiliCommentBot,
     DEFAULT_CONFIG,
+    ReviewOperationBusyError,
     CONFIG_FILE,
     HISTORY_FILE,
     COOKIE_FILE,
@@ -280,8 +281,13 @@ def api_save_config():
     deep_update(cfg, data)
     if save_config(cfg):
         bot = get_bot()
-        bot.reload_config(cfg)
-        return jsonify({"ok": True, "message": "配置已保存"})
+        applied = bot.reload_config(cfg)
+        message = (
+            "配置已保存并生效"
+            if applied
+            else "配置已保存；当前任务继续使用启动时配置，结束后自动生效"
+        )
+        return jsonify({"ok": True, "message": message, "deferred": not applied})
     return jsonify({"ok": False, "message": "保存失败"})
 
 
@@ -296,7 +302,24 @@ def api_bot_start():
 def api_bot_stop():
     bot = get_bot()
     result = bot.stop()
-    return jsonify({"ok": result, "message": "已停止" if result else "未在运行"})
+    if not result:
+        return jsonify({"ok": False, "message": "草稿监控未在运行"})
+    operations = bot.get_review_operation_status()["active"]
+    active = [
+        {
+            "generating": "生成",
+            "regenerating": "重新生成",
+            "sending": "发送",
+        }.get(name, name)
+        for name, count in operations.items()
+        if count
+    ]
+    message = (
+        f"草稿监控已停止；当前{'、'.join(active)}任务继续完成"
+        if active
+        else "草稿监控已停止"
+    )
+    return jsonify({"ok": True, "message": message})
 
 
 @app.route("/api/bot/status", methods=["GET"])
@@ -346,7 +369,12 @@ def api_history_clear():
 def api_review_drafts():
     bot = get_bot()
     drafts = bot.get_review_drafts()
-    return jsonify({"ok": True, "total": len(drafts), "drafts": drafts})
+    return jsonify({
+        "ok": True,
+        "total": len(drafts),
+        "drafts": drafts,
+        "operations": bot.get_review_operation_status(),
+    })
 
 
 @app.route("/api/review/generate", methods=["POST"])
@@ -360,6 +388,8 @@ def api_review_generate():
             review_since=review_since,
         )
         return jsonify({"ok": True, **result})
+    except ReviewOperationBusyError as e:
+        return jsonify({"ok": False, "message": str(e)}), 409
     except Exception as e:
         get_bot().logger.exception("生成审核草稿失败")
         return jsonify({"ok": False, "message": str(e)}), 500
@@ -405,6 +435,8 @@ def api_review_send():
     try:
         result = get_bot().send_approved_drafts(comment_ids=comment_ids)
         return jsonify({"ok": True, **result})
+    except ReviewOperationBusyError as e:
+        return jsonify({"ok": False, "message": str(e)}), 409
     except Exception as e:
         return jsonify({"ok": False, "message": str(e)}), 500
 
@@ -573,7 +605,18 @@ def main():
     # 延迟打开浏览器（Docker 环境下不打开）
     if os.getenv('DOCKER_ENV') != 'true':
         threading.Timer(1.5, lambda: webbrowser.open(browser_url)).start()
-    socketio.run(app, host=host, port=port, debug=False, use_reloader=False, log_output=False, allow_unsafe_werkzeug=True)
+    try:
+        socketio.run(
+            app,
+            host=host,
+            port=port,
+            debug=False,
+            use_reloader=False,
+            log_output=False,
+            allow_unsafe_werkzeug=True,
+        )
+    finally:
+        bot.prepare_shutdown()
 
 
 if __name__ == "__main__":

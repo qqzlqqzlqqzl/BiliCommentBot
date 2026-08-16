@@ -14,6 +14,7 @@ import re
 import random
 import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
@@ -305,6 +306,20 @@ class ArkTransientError(RuntimeError):
     """方舟限流、服务端错误或网络异常在重试后仍未恢复。"""
 
 
+class ReviewOperationBusyError(RuntimeError):
+    """同一实例已有同类审核操作正在执行。"""
+
+
+@dataclass
+class ReplyAttemptResult:
+    ok: bool
+    uncertain: bool = False
+    message: str = ""
+
+    def __bool__(self):
+        return self.ok
+
+
 # ─────────────────────────────────────────────
 #  机器人核心
 # ─────────────────────────────────────────────
@@ -322,6 +337,15 @@ class BiliCommentBot:
         self.on_config_changed = on_config_changed  # 配置变更回调，用于持久化
         self._ark_pacer_lock = threading.Lock()
         self._ark_last_started_at = 0.0
+        self._review_operation_lock = threading.RLock()
+        self._review_generation_gate = threading.Lock()
+        self._review_send_gate = threading.Lock()
+        self._active_review_operations = {
+            "generating": 0,
+            "regenerating": 0,
+            "sending": 0,
+        }
+        self._pending_config: Optional[dict] = None
 
         self.session = requests.Session()
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=Retry(total=0))
@@ -417,9 +441,25 @@ class BiliCommentBot:
         if self.cookie_manager:
             self.csrf_token = self.cookie_manager._get_csrf_from_cookie()
 
-    def reload_config(self, config: dict):
-        """热更新配置"""
-        self.config = config
+    def _ensure_review_operation_state(self):
+        """兼容测试中绕过 __init__ 构造的实例。"""
+        if not hasattr(self, "_review_operation_lock"):
+            self._review_operation_lock = threading.RLock()
+        if not hasattr(self, "_review_generation_gate"):
+            self._review_generation_gate = threading.Lock()
+        if not hasattr(self, "_review_send_gate"):
+            self._review_send_gate = threading.Lock()
+        if not hasattr(self, "_active_review_operations"):
+            self._active_review_operations = {
+                "generating": 0,
+                "regenerating": 0,
+                "sending": 0,
+            }
+        if not hasattr(self, "_pending_config"):
+            self._pending_config = None
+
+    def _apply_config(self, config: dict):
+        self.config = copy.deepcopy(config)
         self.cookie_refresh_interval = config["bilibili"].get("cookie_refresh_interval", 30) * 60
         self.auto_refresh_cookie = config["bilibili"].get("auto_refresh_cookie", True)
         rl = config.get("rate_limit", {})
@@ -434,6 +474,74 @@ class BiliCommentBot:
         self.cache = {}  # 清空缓存让新配置立即生效
         # 重新初始化 Cookie
         self._init_cookie()
+
+    def reload_config(self, config: dict) -> bool:
+        """热更新配置；有审核任务时延迟到所有当前任务结束后生效。"""
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            if any(self._active_review_operations.values()):
+                self._pending_config = copy.deepcopy(config)
+                operation_labels = {
+                    "generating": "生成",
+                    "regenerating": "重新生成",
+                    "sending": "发送",
+                }
+                active = "、".join(
+                    operation_labels.get(name, name)
+                    for name, count in self._active_review_operations.items()
+                    if count
+                )
+                self.logger.info(
+                    "配置已保存；当前%s任务继续使用启动时配置，任务结束后自动生效",
+                    active,
+                )
+                return False
+            self._apply_config(config)
+            return True
+
+    @contextmanager
+    def _review_operation(self, name: str, gate: threading.Lock = None):
+        self._ensure_review_operation_state()
+        if gate is not None and not gate.acquire(blocking=False):
+            label = "生成" if name == "generating" else "发送"
+            raise ReviewOperationBusyError(f"已有{label}任务正在执行，请等待当前任务完成")
+
+        with self._review_operation_lock:
+            self._active_review_operations[name] = (
+                self._active_review_operations.get(name, 0) + 1
+            )
+            config_snapshot = copy.deepcopy(self.config)
+
+        try:
+            yield config_snapshot
+        finally:
+            pending_config = None
+            try:
+                with self._review_operation_lock:
+                    self._active_review_operations[name] = max(
+                        0,
+                        self._active_review_operations.get(name, 1) - 1,
+                    )
+                    if (
+                        not any(self._active_review_operations.values())
+                        and self._pending_config is not None
+                    ):
+                        pending_config = self._pending_config
+                        self._pending_config = None
+                        self._apply_config(pending_config)
+                if pending_config is not None:
+                    self.logger.info("当前审核任务已结束，刚才保存的新配置现已生效")
+            finally:
+                if gate is not None:
+                    gate.release()
+
+    def get_review_operation_status(self) -> dict:
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            return {
+                "active": dict(self._active_review_operations),
+                "config_pending": self._pending_config is not None,
+            }
 
     @property
     def is_running(self) -> bool:
@@ -456,7 +564,23 @@ class BiliCommentBot:
             return False
         self._running = False
         self._stop_event.set()
-        self.logger.info("机器人已停止")
+        operation_status = self.get_review_operation_status()
+        active = [
+            {
+                "generating": "生成",
+                "regenerating": "重新生成",
+                "sending": "发送",
+            }.get(name, name)
+            for name, count in operation_status["active"].items()
+            if count
+        ]
+        if active:
+            self.logger.info(
+                "草稿监控已停止，不再开始下一轮；当前%s任务继续完成",
+                "、".join(active),
+            )
+        else:
+            self.logger.info("机器人已停止")
         self._emit("bot_status", {"running": False})
         # 刷出历史记录和 Cookie
         self._flush_history()
@@ -466,6 +590,37 @@ class BiliCommentBot:
             except Exception:
                 pass
         return True
+
+    def prepare_shutdown(self):
+        """服务退出前落盘；无法确认的在途发送绝不自动重发。"""
+        self._running = False
+        self._stop_event.set()
+        changed = False
+        with self._review_lock:
+            for draft in self._review_drafts.values():
+                if draft.get("status") == "sending":
+                    draft["approved"] = False
+                    draft["status"] = "send_unknown"
+                    draft["error"] = (
+                        "程序在发送过程中退出，B站是否已收到无法自动确认；"
+                        "请先到创作中心核对，系统不会自动重发"
+                    )
+                    changed = True
+                elif draft.get("status") == "regenerating":
+                    draft["approved"] = False
+                    draft["status"] = (
+                        "pending" if draft.get("should_reply") else "skipped"
+                    )
+                    draft["error"] = "程序在重新生成过程中退出，已保留退出前的候选回复"
+                    changed = True
+            if changed:
+                self._save_review_drafts()
+        self._flush_history()
+        if self.cookie_manager:
+            try:
+                self.cookie_manager.save_to_file(COOKIE_FILE)
+            except Exception:
+                pass
 
     def _run_loop(self):
         while self._running:
@@ -696,6 +851,8 @@ class BiliCommentBot:
     # ── 人工审核草稿 ──
     def load_review_drafts(self):
         try:
+            recovered_sending = 0
+            recovered_regenerating = 0
             if os.path.exists(REVIEW_DRAFTS_FILE):
                 with open(REVIEW_DRAFTS_FILE, "r", encoding="utf-8") as f:
                     items = json.load(f)
@@ -705,7 +862,35 @@ class BiliCommentBot:
                         for item in items
                         if isinstance(item, dict) and item.get("comment_id")
                     }
+                    for draft in self._review_drafts.values():
+                        if draft.get("status") == "sending":
+                            draft["approved"] = False
+                            draft["status"] = "send_unknown"
+                            draft["error"] = (
+                                "程序在发送过程中退出，B站是否已收到无法自动确认；"
+                                "请先到创作中心核对，系统不会自动重发"
+                            )
+                            recovered_sending += 1
+                        elif draft.get("status") == "regenerating":
+                            draft["approved"] = False
+                            draft["status"] = (
+                                "pending" if draft.get("should_reply") else "skipped"
+                            )
+                            draft["error"] = "程序在重新生成过程中退出，已保留退出前的候选回复"
+                            recovered_regenerating += 1
+                    if recovered_sending or recovered_regenerating:
+                        self._save_review_drafts()
             self.logger.info(f"加载审核草稿 {len(self._review_drafts)} 条")
+            if recovered_sending:
+                self.logger.warning(
+                    "发现%s条上次退出时仍在发送的回复，已标记为发送结果待核对，绝不自动重发",
+                    recovered_sending,
+                )
+            if recovered_regenerating:
+                self.logger.warning(
+                    "发现%s条上次退出时仍在重新生成的草稿，已恢复退出前候选并取消批准",
+                    recovered_regenerating,
+                )
         except Exception as e:
             self.logger.error(f"加载审核草稿失败: {e}")
             self._review_drafts = {}
@@ -743,6 +928,10 @@ class BiliCommentBot:
                 raise ValueError("该回复已经发送")
             if draft.get("status") == "regenerating":
                 raise ValueError("豆包正在重新生成该回复")
+            if draft.get("status") == "sending":
+                raise ValueError("该回复正在发送，不能更改批准状态")
+            if draft.get("status") == "send_unknown":
+                raise ValueError("该回复发送结果待核对，不能直接重发")
             draft["approved"] = bool(approved)
             draft["status"] = "approved" if approved else "pending"
             self._save_review_drafts()
@@ -751,80 +940,91 @@ class BiliCommentBot:
     def regenerate_review_draft(self, comment_id: str) -> dict:
         """使用当前最新配置重新生成单条候选回复，不访问 B站接口。"""
         comment_id = str(comment_id)
-        with self._review_lock:
-            current = self._review_drafts.get(comment_id)
-            if not current:
-                raise KeyError("草稿不存在")
-            if current.get("status") == "sent":
-                raise ValueError("已发送的回复不能重新生成")
-            if current.get("status") == "regenerating":
-                raise ValueError("该回复已经在重新生成")
-            original = dict(current)
-            current["approved"] = False
-            current["status"] = "regenerating"
-            self._save_review_drafts()
-
-        comment = Comment(
-            comment_id=comment_id,
-            content=str(original.get("comment") or ""),
-            user=str(original.get("author") or ""),
-            uid=str(original.get("author_uid") or ""),
-            time=int(original.get("comment_time") or 0),
-            parent_id=original.get("parent_id"),
-            root_id=original.get("root_id"),
-            depth=int(original.get("depth") or 0),
-        )
-        parent = None
-        if original.get("parent_comment"):
-            parent = Comment(
-                comment_id=str(original.get("parent_id") or original.get("root_id") or "context"),
-                content=str(original["parent_comment"]),
-                user=str(original.get("parent_author") or "上级评论"),
-                uid="",
-                time=0,
-            )
-
-        item = {
-            "bvid": original.get("bvid", ""),
-            "oid": original.get("oid", ""),
-            "comment_type": original.get("comment_type", 1),
-            "video_title": original.get("video_title", ""),
-            "video_desc": "",
-            "comment": comment,
-            "context": [parent] if parent else [],
-            "parent_comment": parent,
-            "is_follow_up": bool(original.get("root_id") or original.get("depth")),
-            "regenerate": True,
-            "previous_reply": str(original.get("reply") or ""),
-        }
-
-        try:
-            decision = self.generate_distinct_reply_decision(item)
-            should_reply = bool(decision.get("should_reply") and decision.get("reply"))
+        with self._review_operation("regenerating") as task_config:
             with self._review_lock:
                 current = self._review_drafts.get(comment_id)
                 if not current:
                     raise KeyError("草稿不存在")
                 if current.get("status") == "sent":
-                    raise ValueError("回复已在重新生成期间发送，不能覆盖")
-                current.update({
-                    "should_reply": should_reply,
-                    "reply": decision.get("reply", "") if should_reply else "",
-                    "reason": decision.get("reason", ""),
-                    "model": decision.get("model", ""),
-                    "approved": False,
-                    "status": "pending" if should_reply else "skipped",
-                    "regenerated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                })
+                    raise ValueError("已发送的回复不能重新生成")
+                if current.get("status") == "regenerating":
+                    raise ValueError("该回复已经在重新生成")
+                if current.get("status") == "sending":
+                    raise ValueError("该回复正在发送，不能重新生成")
+                if current.get("status") == "send_unknown":
+                    raise ValueError("该回复发送结果待核对，不能重新生成")
+                original = dict(current)
+                current["approved"] = False
+                current["status"] = "regenerating"
                 self._save_review_drafts()
-                result = dict(current)
-        except Exception:
-            with self._review_lock:
-                current = self._review_drafts.get(comment_id)
-                if current and current.get("status") == "regenerating":
-                    self._review_drafts[comment_id] = original
+
+            comment = Comment(
+                comment_id=comment_id,
+                content=str(original.get("comment") or ""),
+                user=str(original.get("author") or ""),
+                uid=str(original.get("author_uid") or ""),
+                time=int(original.get("comment_time") or 0),
+                parent_id=original.get("parent_id"),
+                root_id=original.get("root_id"),
+                depth=int(original.get("depth") or 0),
+            )
+            parent = None
+            if original.get("parent_comment"):
+                parent = Comment(
+                    comment_id=str(
+                        original.get("parent_id")
+                        or original.get("root_id")
+                        or "context"
+                    ),
+                    content=str(original["parent_comment"]),
+                    user=str(original.get("parent_author") or "上级评论"),
+                    uid="",
+                    time=0,
+                )
+
+            item = {
+                "bvid": original.get("bvid", ""),
+                "oid": original.get("oid", ""),
+                "comment_type": original.get("comment_type", 1),
+                "video_title": original.get("video_title", ""),
+                "video_desc": "",
+                "comment": comment,
+                "context": [parent] if parent else [],
+                "parent_comment": parent,
+                "is_follow_up": bool(original.get("root_id") or original.get("depth")),
+                "regenerate": True,
+                "previous_reply": str(original.get("reply") or ""),
+                "_ark_config_snapshot": copy.deepcopy(task_config.get("ark", {})),
+            }
+
+            try:
+                decision = self.generate_distinct_reply_decision(item)
+                should_reply = bool(decision.get("should_reply") and decision.get("reply"))
+                with self._review_lock:
+                    current = self._review_drafts.get(comment_id)
+                    if not current:
+                        raise KeyError("草稿不存在")
+                    if current.get("status") != "regenerating":
+                        raise ValueError("草稿状态已变化，不能覆盖当前内容")
+                    current.update({
+                        "should_reply": should_reply,
+                        "reply": decision.get("reply", "") if should_reply else "",
+                        "reason": decision.get("reason", ""),
+                        "model": decision.get("model", ""),
+                        "approved": False,
+                        "status": "pending" if should_reply else "skipped",
+                        "regenerated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    current.pop("error", None)
                     self._save_review_drafts()
-            raise
+                    result = dict(current)
+            except Exception:
+                with self._review_lock:
+                    current = self._review_drafts.get(comment_id)
+                    if current and current.get("status") == "regenerating":
+                        self._review_drafts[comment_id] = original
+                        self._save_review_drafts()
+                raise
 
         self._emit("review_updated", {"regenerated": comment_id})
         return result
@@ -1249,9 +1449,9 @@ class BiliCommentBot:
             cleaned = fenced.group(1).strip()
         return json.loads(cleaned)
 
-    def _wait_for_ark_slot(self):
+    def _wait_for_ark_slot(self, api_config: dict = None):
         """在当前服务实例内错开方舟请求起始时间，避免同一时刻突发。"""
-        api_config = self.config.get("ark", {})
+        api_config = api_config or self.config.get("ark", {})
         interval = max(
             0.0,
             float(api_config.get("request_interval_seconds", 0.15)),
@@ -1286,7 +1486,7 @@ class BiliCommentBot:
         last_error = None
 
         for attempt in range(max_retries):
-            self._wait_for_ark_slot()
+            self._wait_for_ark_slot(api_config)
             try:
                 response = requests.post(
                     api_config.get("base_url", DEFAULT_CONFIG["ark"]["base_url"]),
@@ -1339,7 +1539,10 @@ class BiliCommentBot:
         if not items:
             return []
 
-        api_config = self.config.get("ark", {})
+        api_config = copy.deepcopy(
+            items[0].get("_ark_config_snapshot")
+            or self.config.get("ark", {})
+        )
         api_key = (
             os.environ.get("ARK_API_KEY")
             or os.environ.get("VOLCENGINE_ARK_API_KEY")
@@ -1457,7 +1660,10 @@ class BiliCommentBot:
                     "should_reply": False,
                     "reply": "",
                     "reason": "豆包未返回该条，暂不回复",
-                    "model": self.config.get("ark", {}).get(
+                    "model": (
+                        item.get("_ark_config_snapshot")
+                        or self.config.get("ark", {})
+                    ).get(
                         "model",
                         DEFAULT_CONFIG["ark"]["model"],
                     ),
@@ -1498,7 +1704,10 @@ class BiliCommentBot:
                         if isinstance(exc, ArkEmptyOutputError)
                         else "豆包返回格式异常，暂不回复"
                     ),
-                    "model": self.config.get("ark", {}).get(
+                    "model": (
+                        items[0].get("_ark_config_snapshot")
+                        or self.config.get("ark", {})
+                    ).get(
                         "model",
                         DEFAULT_CONFIG["ark"]["model"],
                     ),
@@ -1515,7 +1724,10 @@ class BiliCommentBot:
                 len(items),
                 exc,
             )
-            model = self.config.get("ark", {}).get(
+            model = (
+                items[0].get("_ark_config_snapshot")
+                or self.config.get("ark", {})
+            ).get(
                 "model",
                 DEFAULT_CONFIG["ark"]["model"],
             )
@@ -1662,23 +1874,23 @@ class BiliCommentBot:
         parent_id: str = None,
         oid: str = None,
         comment_type: int = 1,
-    ) -> bool:
+    ) -> ReplyAttemptResult:
         if self.cookie_manager:
             self.csrf_token = self.cookie_manager._get_csrf_from_cookie()
         if not self.csrf_token:
             self.logger.error("未找到CSRF token")
-            return False
+            return ReplyAttemptResult(False, False, "未找到CSRF token")
         if self.cookie_manager:
             is_valid, result = self.cookie_manager.verify_cookie()
             if not is_valid:
                 self.logger.error(f"Cookie无效: {result.get('message')}")
-                return False
+                return ReplyAttemptResult(False, False, f"Cookie无效: {result.get('message')}")
 
         url = "https://api.bilibili.com/x/v2/reply/add"
         aid = str(oid or self.bvid_to_aid(bvid))
         if not aid:
             self.logger.error(f"无法确定评论所属稿件: comment_id={comment_id}")
-            return False
+            return ReplyAttemptResult(False, False, "无法确定评论所属稿件")
         prefix = self.config["reply"].get("prefix", "")
 
         root = root_id if root_id else comment_id
@@ -1702,16 +1914,25 @@ class BiliCommentBot:
         try:
             response = self.make_request_with_retry("POST", url, data=data)
             if not response:
-                return False
+                return ReplyAttemptResult(
+                    False,
+                    True,
+                    "B站请求没有返回；请求可能已被服务端接收",
+                )
             result = response.json()
             if result.get("code") == 0:
                 self.logger.info(f"回复成功: {comment_id} (类型: {reply_type})")
-                return True
-            self.logger.error(f"回复失败: {result.get('message')}")
-            return False
+                return ReplyAttemptResult(True)
+            message = str(result.get("message") or "B站回复接口返回失败")
+            self.logger.error(f"回复失败: {message}")
+            return ReplyAttemptResult(False, False, message)
         except Exception as e:
             self.logger.error(f"回复异常: {e}")
-            return False
+            return ReplyAttemptResult(
+                False,
+                True,
+                f"回复请求异常: {type(e).__name__}: {e}",
+            )
 
     def refresh_cookie_if_needed(self):
         if not self.cookie_manager or not self.cookie_manager.refresh_token:
@@ -1731,10 +1952,16 @@ class BiliCommentBot:
         self.last_cookie_refresh_time = current_time
 
     # ── 人工审核处理循环 ──
-    def _collect_review_items(self, limit: int, review_since: str = None) -> List[dict]:
-        only_bvid = self.config["reply"].get("only_bvid", "").strip()
-        context_count = self.config["reply"].get("context_comments_count", 0)
-        my_uid = self.config["bilibili"].get("uid", "")
+    def _collect_review_items(
+        self,
+        limit: int,
+        review_since: str = None,
+        config_snapshot: dict = None,
+    ) -> List[dict]:
+        task_config = config_snapshot or self.config
+        only_bvid = task_config["reply"].get("only_bvid", "").strip()
+        context_count = task_config["reply"].get("context_comments_count", 0)
+        my_uid = task_config["bilibili"].get("uid", "")
         items = []
 
         with self._review_lock:
@@ -1742,7 +1969,7 @@ class BiliCommentBot:
 
         if not only_bvid:
             since_timestamp = self._parse_review_since(
-                self.config["reply"].get("review_since", "")
+                task_config["reply"].get("review_since", "")
                 if review_since is None
                 else review_since
             )
@@ -1812,31 +2039,58 @@ class BiliCommentBot:
         return items
 
     def generate_review_drafts(self, limit: int = None, review_since: str = None) -> dict:
-        if self.auto_refresh_cookie:
-            self.refresh_cookie_if_needed()
-        limit = int(limit or self.config["reply"].get("max_process", 10))
-        limit = max(1, min(limit, 1000))
-        items = self._collect_review_items(limit, review_since=review_since)
-        return self._generate_review_drafts(items)
+        self._ensure_review_operation_state()
+        with self._review_operation(
+            "generating",
+            gate=self._review_generation_gate,
+        ) as task_config:
+            if self.auto_refresh_cookie:
+                self.refresh_cookie_if_needed()
+            limit = int(limit or task_config["reply"].get("max_process", 10))
+            limit = max(1, min(limit, 50000))
+            items = self._collect_review_items(
+                limit,
+                review_since=review_since,
+                config_snapshot=task_config,
+            )
+            return self._generate_review_drafts(
+                items,
+                config_snapshot=task_config,
+            )
 
-    def _generate_review_drafts(self, items: List[dict]) -> dict:
+    def _generate_review_drafts(
+        self,
+        items: List[dict],
+        config_snapshot: dict = None,
+    ) -> dict:
         if not items:
             return {"generated": 0, "replyable": 0, "skipped": 0}
 
+        task_config = copy.deepcopy(config_snapshot or self.config)
+        ark_config = copy.deepcopy(task_config.get("ark", {}))
+        generation_items = []
+        for item in items:
+            generation_item = dict(item)
+            generation_item["_ark_config_snapshot"] = ark_config
+            generation_items.append(generation_item)
+
         # 评论可能很长。按小批次保证 JSON 稳定，不同批次可并发调用豆包。
-        batch_size = max(1, min(int(self.config["reply"].get("review_batch_size", 4)), 4))
+        batch_size = max(
+            1,
+            min(int(task_config["reply"].get("review_batch_size", 4)), 4),
+        )
         batches = [
-            items[start:start + batch_size]
-            for start in range(0, len(items), batch_size)
+            generation_items[start:start + batch_size]
+            for start in range(0, len(generation_items), batch_size)
         ]
         decisions = {}
         max_concurrency = max(
             1,
-            int(self.config.get("ark", {}).get("max_concurrency", 16)),
+            int(ark_config.get("max_concurrency", 16)),
         )
         request_interval = max(
             0.0,
-            float(self.config.get("ark", {}).get("request_interval_seconds", 0.15)),
+            float(ark_config.get("request_interval_seconds", 0.15)),
         )
         self.logger.info(
             "开始豆包生成：共%s条，%s批，每批最多%s条，最大并发%s，请求起始间隔%.2f秒",
@@ -1887,7 +2141,7 @@ class BiliCommentBot:
                     "should_reply": False,
                     "reply": "",
                     "reason": "豆包未返回该条，暂不回复",
-                    "model": self.config.get("ark", {}).get("model", DEFAULT_CONFIG["ark"]["model"]),
+                    "model": ark_config.get("model", DEFAULT_CONFIG["ark"]["model"]),
                 })
                 parent = item.get("parent_comment")
                 should_reply = bool(decision.get("should_reply") and decision.get("reply"))
@@ -1936,66 +2190,159 @@ class BiliCommentBot:
         return {"generated": generated, "replyable": replyable, "skipped": skipped}
 
     def send_approved_drafts(self, comment_ids: List[str] = None) -> dict:
-        requested = None if comment_ids is None else {str(value) for value in comment_ids}
-        with self._review_lock:
-            drafts = [
-                dict(draft)
-                for draft in self._review_drafts.values()
-                if draft.get("approved")
-                and draft.get("status") == "approved"
-                and (requested is None or str(draft["comment_id"]) in requested)
-            ]
-
-        sent = 0
-        failed = 0
-        for draft in drafts:
-            comment_id = str(draft["comment_id"])
-            ok = self.reply_comment(
-                draft["bvid"],
-                comment_id,
-                draft["reply"],
-                root_id=draft.get("root_id") if draft.get("depth", 0) > 0 else None,
-                parent_id=draft.get("parent_id") if draft.get("depth", 0) > 0 else None,
-                oid=draft.get("oid"),
-                comment_type=draft.get("comment_type", 1),
-            )
+        self._ensure_review_operation_state()
+        with self._review_operation(
+            "sending",
+            gate=self._review_send_gate,
+        ) as task_config:
+            requested = None if comment_ids is None else {
+                str(value) for value in comment_ids
+            }
             with self._review_lock:
-                current = self._review_drafts[comment_id]
-                if ok:
-                    current["status"] = "sent"
-                    current["sent_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    sent += 1
-                    self.processed_comments.add(comment_id)
-                    comment = Comment(
-                        comment_id=comment_id,
-                        content=draft["comment"],
-                        user=draft["author"],
-                        uid=draft["author_uid"],
-                        time=int(draft["comment_time"]),
-                        parent_id=draft.get("parent_id"),
-                        root_id=draft.get("root_id"),
-                        depth=int(draft.get("depth", 0)),
+                draft_ids = [
+                    str(draft["comment_id"])
+                    for draft in self._review_drafts.values()
+                    if draft.get("approved")
+                    and draft.get("status") == "approved"
+                    and (
+                        requested is None
+                        or str(draft["comment_id"]) in requested
                     )
-                    self.save_history(comment, draft["reply"])
-                    self.stats["total_replied"] += 1
+                ]
+
+            sent = 0
+            failed = 0
+            unknown = 0
+            total = len(draft_ids)
+            self.logger.info("开始串行发送：共%s条已批准回复", total)
+            for index, comment_id in enumerate(draft_ids, start=1):
+                with self._review_lock:
+                    current = self._review_drafts.get(comment_id)
+                    if (
+                        not current
+                        or not current.get("approved")
+                        or current.get("status") != "approved"
+                    ):
+                        continue
+                    current["approved"] = False
+                    current["status"] = "sending"
+                    current["sending_started_at"] = datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    current.pop("error", None)
+                    self._save_review_drafts()
+                    draft = dict(current)
+
+                self.logger.info(
+                    "发送进度：正在发送第%s/%s条，comment_id=%s",
+                    index,
+                    total,
+                    comment_id,
+                )
+                self._emit("review_updated", {"sending": comment_id})
+                attempt = self.reply_comment(
+                    draft["bvid"],
+                    comment_id,
+                    draft["reply"],
+                    root_id=(
+                        draft.get("root_id")
+                        if draft.get("depth", 0) > 0
+                        else None
+                    ),
+                    parent_id=(
+                        draft.get("parent_id")
+                        if draft.get("depth", 0) > 0
+                        else None
+                    ),
+                    oid=draft.get("oid"),
+                    comment_type=draft.get("comment_type", 1),
+                )
+                if isinstance(attempt, ReplyAttemptResult):
+                    ok = attempt.ok
+                    uncertain = attempt.uncertain
+                    error_message = attempt.message
                 else:
-                    current["status"] = "failed"
-                    current["error"] = "B站回复接口返回失败"
-                    failed += 1
-                self._save_review_drafts()
+                    ok = bool(attempt)
+                    uncertain = False
+                    error_message = "" if ok else "B站回复接口返回失败"
 
-            delay = self.config["reply"].get("reply_delay", 2)
-            if ok and delay > 0:
-                time.sleep(delay)
+                history_comment = None
+                with self._review_lock:
+                    current = self._review_drafts.get(comment_id)
+                    if not current:
+                        continue
+                    current.pop("sending_started_at", None)
+                    if ok:
+                        current["status"] = "sent"
+                        current["sent_at"] = datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        current.pop("error", None)
+                        sent += 1
+                        self.processed_comments.add(comment_id)
+                        history_comment = Comment(
+                            comment_id=comment_id,
+                            content=draft["comment"],
+                            user=draft["author"],
+                            uid=draft["author_uid"],
+                            time=int(draft["comment_time"]),
+                            parent_id=draft.get("parent_id"),
+                            root_id=draft.get("root_id"),
+                            depth=int(draft.get("depth", 0)),
+                        )
+                        self.stats["total_replied"] += 1
+                    elif uncertain:
+                        current["status"] = "send_unknown"
+                        current["error"] = (
+                            f"{error_message}；请先到B站创作中心核对，系统不会自动重发"
+                        )
+                        unknown += 1
+                    else:
+                        current["status"] = "failed"
+                        current["error"] = (
+                            error_message or "B站回复接口明确返回失败"
+                        )
+                        failed += 1
+                    self._save_review_drafts()
 
-        self._emit("review_updated", {"sent": sent, "failed": failed})
-        return {"sent": sent, "failed": failed}
+                if history_comment is not None:
+                    self.save_history(history_comment, draft["reply"])
+                    self._flush_history()
+
+                self.logger.info(
+                    "发送进度：已处理%s/%s条（成功%s，失败%s，待核对%s）",
+                    index,
+                    total,
+                    sent,
+                    failed,
+                    unknown,
+                )
+                self._emit(
+                    "review_updated",
+                    {"sent": sent, "failed": failed, "unknown": unknown},
+                )
+
+                delay = task_config["reply"].get("reply_delay", 2)
+                if ok and delay > 0 and index < total:
+                    time.sleep(delay)
+
+            self.logger.info(
+                "串行发送完成：成功%s条，失败%s条，发送结果待核对%s条",
+                sent,
+                failed,
+                unknown,
+            )
+            return {"sent": sent, "failed": failed, "unknown": unknown}
 
     def process_comments(self):
         """后台轮询只生成审核草稿，绝不自动发送。"""
         if not self.config["reply"].get("enabled", True):
             return
-        result = self.generate_review_drafts()
+        try:
+            result = self.generate_review_drafts()
+        except ReviewOperationBusyError:
+            self.logger.info("已有人工生成任务正在执行，本轮后台检查跳过")
+            return
         self.logger.info(
             "审核草稿更新：生成 %s 条，可回复 %s 条，跳过 %s 条",
             result["generated"],
@@ -2073,6 +2420,7 @@ class BiliCommentBot:
             "last_check": self.stats["last_check"],
             "processed_count": len(self.processed_comments),
             "cached_videos": len(self.cached_videos),
+            "review_operations": self.get_review_operation_status(),
         }
 
     def verify_login(self) -> dict:

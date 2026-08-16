@@ -176,8 +176,8 @@
   .review-reason { margin-top:8px; color:var(--text2); font-size:12px; }
   .review-time { color:var(--text2); font-size:12px; margin-left:8px; white-space:nowrap; }
   .review-empty { padding:32px; color:var(--text2); text-align:center; }
-  .review-check-cell { width:64px; min-width:64px; text-align:center; vertical-align:middle !important; }
-  .review-check { width:36px; height:36px; accent-color:var(--accent); cursor:pointer; }
+  .review-check-cell { width:64px; min-width:64px; text-align:center; vertical-align:top !important; padding-top:12px !important; }
+  .review-check { display:block; width:36px; height:36px; margin:0 auto; accent-color:var(--accent); cursor:pointer; }
 </style>
 </head>
 <body>
@@ -273,7 +273,20 @@
         </div>
         <div class="review-toolbar">
           <label class="form-label" for="review-limit" style="margin:0">本次读取</label>
-          <input class="form-input" id="review-limit" type="number" min="1" max="1000" value="20" style="width:90px">
+          <select class="form-select" id="review-limit" style="width:190px">
+            <option value="10">最近 10 条</option>
+            <option value="20" selected>最近 20 条</option>
+            <option value="50">最近 50 条</option>
+            <option value="100">最近 100 条</option>
+            <option value="200">最近 200 条</option>
+            <option value="300">最近 300 条</option>
+            <option value="500">最近 500 条</option>
+            <option value="1000">最近 1000 条</option>
+            <option value="2000">最近 2000 条</option>
+            <option value="5000">最近 5000 条</option>
+            <option value="10000">最近 10000 条</option>
+            <option value="50000">尽可能读取（最多 50000 条，耗时很长）</option>
+          </select>
           <label class="form-label" for="review-time-range" style="margin:0">时间范围</label>
           <select class="form-select" id="review-time-range" style="width:140px" onchange="updateReviewTimeRange()">
             <option value="">不限时间</option>
@@ -293,6 +306,8 @@
             <option value="approved">已勾选</option>
             <option value="sent">已发送</option>
             <option value="failed">发送失败</option>
+            <option value="sending">发送中</option>
+            <option value="send_unknown">发送结果待核对</option>
             <option value="all">全部</option>
           </select>
           <span class="review-summary" id="review-summary">共 0 条，可审核 0 条，已勾选 0 条</span>
@@ -469,7 +484,7 @@
           <div class="form-row">
             <div class="form-group">
               <label class="form-label">最新评论扫描上限</label>
-              <input class="form-input" type="number" id="cfg-reply-max_process" value="10" min="1" max="1000">
+              <input class="form-input" type="number" id="cfg-reply-max_process" value="10" min="1" max="50000">
               <div class="form-hint">按时间从新到旧读取，例如填 100 或 200；这些评论再交给豆包判断。</div>
             </div>
             <div class="form-group">
@@ -1169,6 +1184,8 @@ function reviewStatusLabel(item) {
     approved: '已勾选',
     skipped: '豆包建议跳过',
     regenerating: '豆包重写中',
+    sending: '发送中',
+    send_unknown: '发送结果待核对',
     sent: '已发送',
     failed: '发送失败',
   };
@@ -1177,8 +1194,8 @@ function reviewStatusLabel(item) {
 
 function reviewStatusBadge(item) {
   const cls = item.status === 'sent' ? 'badge-green'
-    : item.status === 'failed' ? 'badge-red'
-    : item.status === 'approved' ? 'badge-blue'
+    : ['failed', 'send_unknown'].includes(item.status) ? 'badge-red'
+    : ['approved', 'sending'].includes(item.status) ? 'badge-blue'
     : '';
   return `<span class="badge ${cls}">${escHtml(reviewStatusLabel(item))}</span>`;
 }
@@ -1190,11 +1207,23 @@ function loadReviewDrafts(retryOnNetworkError = true) {
       return;
     }
     const items = d.drafts || [];
-    const replyable = items.filter(item => item.should_reply && item.status !== 'sent').length;
+    const replyable = items.filter(item =>
+      item.should_reply && ['pending', 'approved', 'failed'].includes(item.status)
+    ).length;
     const approved = items.filter(item => item.approved && item.status === 'approved').length;
+    const activeOperations = (d.operations && d.operations.active) || {};
+    const isGenerating = Number(activeOperations.generating || 0) > 0;
+    const isSending = Number(activeOperations.sending || 0) > 0;
     document.getElementById('review-summary').textContent =
-      `共 ${items.length} 条，可审核 ${replyable} 条，已勾选 ${approved} 条`;
-    document.getElementById('btn-review-send').disabled = approved === 0;
+      `共 ${items.length} 条，可审核 ${replyable} 条，已勾选 ${approved} 条`
+      + (isSending ? '，正在串行发送' : '')
+      + (isGenerating ? '，正在生成草稿' : '');
+    const sendButton = document.getElementById('btn-review-send');
+    sendButton.disabled = approved === 0 || isSending;
+    sendButton.textContent = isSending ? '正在串行发送...' : '发送已勾选';
+    const generateButton = document.getElementById('btn-review-generate');
+    generateButton.disabled = isGenerating;
+    generateButton.textContent = isGenerating ? '豆包生成中...' : '生成最近评论草稿';
 
     const selectedStatus = document.getElementById('review-status-filter').value;
     const visibleItems = selectedStatus === 'all'
@@ -1207,8 +1236,9 @@ function loadReviewDrafts(retryOnNetworkError = true) {
       return;
     }
     tbody.innerHTML = visibleItems.map(item => {
-      const canApprove = item.should_reply && !['sent', 'skipped', 'regenerating'].includes(item.status);
-      const canRegenerate = item.status !== 'sent' && item.status !== 'regenerating';
+      const canApprove = item.should_reply
+        && !['sent', 'skipped', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
+      const canRegenerate = !['sent', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
       const parent = item.parent_comment
         ? `<div class="review-parent">上级评论 · ${escHtml(item.parent_author || '')}<br>${escHtml(item.parent_comment)}</div>`
         : '';
@@ -1280,7 +1310,19 @@ function restoreReviewPreferences(defaultLimit, defaultSince) {
   const savedSince = localStorage.getItem('bilibot.review.since');
   const timeRange = document.getElementById('review-time-range');
   const sinceInput = document.getElementById('review-since');
-  document.getElementById('review-limit').value = savedLimit || defaultLimit || 20;
+  const limitSelect = document.getElementById('review-limit');
+  const preferredLimit = String(
+    Math.max(1, Math.min(50000, Number(savedLimit || defaultLimit || 20) || 20))
+  );
+  if (![...limitSelect.options].some(option => option.value === preferredLimit)) {
+    const option = document.createElement('option');
+    option.value = preferredLimit;
+    option.textContent = `最近 ${preferredLimit} 条（上次设置）`;
+    limitSelect.appendChild(option);
+  }
+  limitSelect.value = [...limitSelect.options].some(option => option.value === preferredLimit)
+    ? preferredLimit
+    : '20';
   timeRange.value = savedRange !== null ? savedRange : (defaultSince ? 'custom' : '');
   sinceInput.value = savedSince !== null ? savedSince : (defaultSince || '');
   sinceInput.style.display = timeRange.value === 'custom' ? '' : 'none';
@@ -1317,8 +1359,7 @@ function selectedReviewSince() {
 
 function generateReviewDrafts() {
   const button = document.getElementById('btn-review-generate');
-  const limit = Math.max(1, Math.min(1000, Number(document.getElementById('review-limit').value) || 20));
-  document.getElementById('review-limit').value = limit;
+  const limit = Math.max(1, Math.min(50000, Number(document.getElementById('review-limit').value) || 20));
   const reviewSince = selectedReviewSince();
   saveReviewPreferences();
   button.disabled = true;
@@ -1335,8 +1376,7 @@ function generateReviewDrafts() {
       showToast(d.message || '生成失败', 'error');
     }
   }).catch(e => showToast(`生成失败：${e}`, 'error')).finally(() => {
-    button.disabled = false;
-    button.textContent = '生成最近评论草稿';
+    loadReviewDrafts();
   });
 }
 
@@ -1398,7 +1438,11 @@ function sendApprovedDrafts() {
       body: JSON.stringify({comment_ids: approved.map(item => String(item.comment_id))}),
     }).then(r => r.json()).then(result => {
       if (result.ok) {
-        showToast(`已发送 ${result.sent} 条，失败 ${result.failed} 条`, result.failed ? 'error' : 'success');
+        const unknown = Number(result.unknown || 0);
+        showToast(
+          `已发送 ${result.sent} 条，失败 ${result.failed} 条，待核对 ${unknown} 条`,
+          result.failed || unknown ? 'error' : 'success'
+        );
       } else {
         showToast(result.message || '发送失败', 'error');
       }
@@ -1517,7 +1561,7 @@ function escHtml(str) {
 // ── 初始化 ──
 (function init() {
   checkAuthGate();
-  document.getElementById('review-limit').addEventListener('input', saveReviewPreferences);
+  document.getElementById('review-limit').addEventListener('change', saveReviewPreferences);
   document.getElementById('review-since').addEventListener('change', saveReviewPreferences);
   loadConfig();
   fetch('/api/bot/status').then(r=>r.json()).then(d => updateStats(d));

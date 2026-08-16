@@ -9,7 +9,12 @@ import unittest
 from unittest.mock import Mock, patch
 
 import bot as bot_module
-from bot import BiliCommentBot, DEFAULT_CONFIG
+from bot import (
+    BiliCommentBot,
+    DEFAULT_CONFIG,
+    ReplyAttemptResult,
+    ReviewOperationBusyError,
+)
 
 
 class ReviewWorkflowTests(unittest.TestCase):
@@ -28,6 +33,7 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.bot.stats = {"total_replied": 0}
         self.bot.socketio = None
         self.bot.save_history = Mock()
+        self.bot._flush_history = Mock()
         self.bot.reply_comment = Mock(return_value=True)
         self.bot._wait_for_ark_slot = Mock()
 
@@ -369,12 +375,21 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertIn("豆包生成进度：已处理", log_text)
         self.assertIn("豆包生成完成：新增2条草稿", log_text)
 
+    def test_review_read_limit_is_capped_at_fifty_thousand(self):
+        self.bot.auto_refresh_cookie = False
+        self.bot._collect_review_items = Mock(return_value=[])
+
+        result = self.bot.generate_review_drafts(limit=99999)
+
+        self.assertEqual(result, {"generated": 0, "replyable": 0, "skipped": 0})
+        self.assertEqual(self.bot._collect_review_items.call_args.args[0], 50000)
+
     def test_empty_requested_list_sends_nothing(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
 
         result = self.bot.send_approved_drafts(comment_ids=[])
 
-        self.assertEqual(result, {"sent": 0, "failed": 0})
+        self.assertEqual(result, {"sent": 0, "failed": 0, "unknown": 0})
         self.bot.reply_comment.assert_not_called()
 
     def test_only_explicitly_approved_requested_draft_is_sent(self):
@@ -384,7 +399,7 @@ class ReviewWorkflowTests(unittest.TestCase):
 
         result = self.bot.send_approved_drafts(comment_ids=["1", "2"])
 
-        self.assertEqual(result, {"sent": 1, "failed": 0})
+        self.assertEqual(result, {"sent": 1, "failed": 0, "unknown": 0})
         self.bot.reply_comment.assert_called_once_with(
             "BV1test",
             "1",
@@ -396,6 +411,109 @@ class ReviewWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(self.bot._review_drafts["1"]["status"], "sent")
         self.assertEqual(self.bot._review_drafts["3"]["status"], "approved")
+
+    def test_send_marks_draft_sending_on_disk_before_bilibili_request(self):
+        self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
+        observed = {}
+
+        def fake_reply(*args, **kwargs):
+            with open(self.drafts_file, "r", encoding="utf-8") as handle:
+                saved = json.load(handle)[0]
+            observed["status"] = saved["status"]
+            observed["approved"] = saved["approved"]
+            return ReplyAttemptResult(True)
+
+        self.bot.reply_comment = fake_reply
+        result = self.bot.send_approved_drafts(comment_ids=["1"])
+
+        self.assertEqual(observed, {"status": "sending", "approved": False})
+        self.assertEqual(result, {"sent": 1, "failed": 0, "unknown": 0})
+        self.assertEqual(self.bot._review_drafts["1"]["status"], "sent")
+
+    def test_uncertain_send_is_never_automatically_reapproved(self):
+        self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
+        self.bot.reply_comment = Mock(return_value=ReplyAttemptResult(
+            False,
+            True,
+            "请求没有返回",
+        ))
+
+        result = self.bot.send_approved_drafts(comment_ids=["1"])
+
+        draft = self.bot._review_drafts["1"]
+        self.assertEqual(result, {"sent": 0, "failed": 0, "unknown": 1})
+        self.assertEqual(draft["status"], "send_unknown")
+        self.assertFalse(draft["approved"])
+        with self.assertRaisesRegex(ValueError, "待核对"):
+            self.bot.set_review_approval("1", True)
+
+    def test_second_send_request_is_rejected_while_first_is_active(self):
+        self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
+        entered = threading.Event()
+        release = threading.Event()
+        result_holder = {}
+        reply_calls = []
+
+        def blocking_reply(*args, **kwargs):
+            reply_calls.append(args[1])
+            entered.set()
+            release.wait(timeout=2)
+            return ReplyAttemptResult(True)
+
+        self.bot.reply_comment = blocking_reply
+
+        def run_send():
+            result_holder["result"] = self.bot.send_approved_drafts(comment_ids=["1"])
+
+        thread = threading.Thread(target=run_send)
+        thread.start()
+        self.assertTrue(entered.wait(timeout=1))
+        with self.assertRaisesRegex(ReviewOperationBusyError, "已有发送任务"):
+            self.bot.send_approved_drafts(comment_ids=["1"])
+        release.set()
+        thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            result_holder["result"],
+            {"sent": 1, "failed": 0, "unknown": 0},
+        )
+        self.assertEqual(reply_calls, ["1"])
+
+    def test_load_recovers_interrupted_sending_and_regeneration(self):
+        sending = self._draft("1", approved=False, status="sending")
+        regenerating = self._draft("2", approved=False, status="regenerating")
+        with open(self.drafts_file, "w", encoding="utf-8") as handle:
+            json.dump([sending, regenerating], handle, ensure_ascii=False)
+
+        self.bot._review_drafts = {}
+        self.bot.load_review_drafts()
+
+        self.assertEqual(self.bot._review_drafts["1"]["status"], "send_unknown")
+        self.assertFalse(self.bot._review_drafts["1"]["approved"])
+        self.assertEqual(self.bot._review_drafts["2"]["status"], "pending")
+        self.assertFalse(self.bot._review_drafts["2"]["approved"])
+
+    def test_config_change_is_deferred_until_active_operation_finishes(self):
+        old_config = copy.deepcopy(self.bot.config)
+        new_config = copy.deepcopy(old_config)
+        new_config["ark"]["system_prompt"] = "新提示词"
+
+        def apply_config(cfg):
+            self.bot.config = copy.deepcopy(cfg)
+
+        with patch.object(self.bot, "_apply_config", side_effect=apply_config) as apply:
+            with self.bot._review_operation("generating"):
+                applied = self.bot.reload_config(new_config)
+                self.assertFalse(applied)
+                self.assertEqual(
+                    self.bot.config["ark"]["system_prompt"],
+                    old_config["ark"]["system_prompt"],
+                )
+                apply.assert_not_called()
+
+            apply.assert_called_once()
+            self.assertEqual(self.bot.config["ark"]["system_prompt"], "新提示词")
 
     def test_full_review_flow_does_not_regenerate_existing_drafts(self):
         self.bot.config["reply"]["reply_delay"] = 0
@@ -463,7 +581,7 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(second_items, [])
         self.assertEqual(self.bot.generate_reply_decisions_resilient.call_count, 1)
         self.assertEqual(approved["reply"], "豆包候选回复")
-        self.assertEqual(sent, {"sent": 1, "failed": 0})
+        self.assertEqual(sent, {"sent": 1, "failed": 0, "unknown": 0})
         self.bot.reply_comment.assert_called_once_with(
             "BV501",
             "501",

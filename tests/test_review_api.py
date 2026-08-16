@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import server
+from bot import ReviewOperationBusyError
 
 
 class ReviewApiTests(unittest.TestCase):
@@ -77,6 +78,29 @@ class ReviewApiTests(unittest.TestCase):
             limit=200,
             review_since="2026-08-10T00:00",
         )
+
+    def test_duplicate_generate_returns_conflict(self):
+        self.fake_bot.generate_review_drafts.side_effect = ReviewOperationBusyError(
+            "已有生成任务正在执行"
+        )
+
+        response = self.client.post("/api/review/generate", json={"limit": 200})
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("已有生成任务", response.get_json()["message"])
+
+    def test_duplicate_send_returns_conflict(self):
+        self.fake_bot.send_approved_drafts.side_effect = ReviewOperationBusyError(
+            "已有发送任务正在执行"
+        )
+
+        response = self.client.post(
+            "/api/review/send",
+            json={"comment_ids": ["1"]},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("已有发送任务", response.get_json()["message"])
 
 
 if __name__ == "__main__":
