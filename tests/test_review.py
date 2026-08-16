@@ -394,6 +394,51 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(result, {"generated": 0, "replyable": 0, "skipped": 0})
         self.assertEqual(self.bot._collect_review_items.call_args.args[0], 10)
 
+    def test_instance_data_directories_isolate_drafts_and_history(self):
+        account_a_dir = os.path.join(self.temp_dir.name, "account-a")
+        account_b_dir = os.path.join(self.temp_dir.name, "account-b")
+        logger = logging.getLogger("account-isolation-tests")
+        config = copy.deepcopy(DEFAULT_CONFIG)
+
+        account_a = BiliCommentBot(
+            copy.deepcopy(config),
+            logger,
+            data_dir=account_a_dir,
+            account_id="account-a",
+        )
+        account_b = BiliCommentBot(
+            copy.deepcopy(config),
+            logger,
+            data_dir=account_b_dir,
+            account_id="account-b",
+        )
+        account_a._review_drafts["a"] = self._draft("a")
+        account_a._save_review_drafts()
+        account_a._history_buffer = [{"comment_id": "history-a"}]
+        account_a._history_dirty = True
+        account_a._flush_history()
+
+        reloaded_a = BiliCommentBot(
+            copy.deepcopy(config),
+            logger,
+            data_dir=account_a_dir,
+            account_id="account-a",
+        )
+        reloaded_b = BiliCommentBot(
+            copy.deepcopy(config),
+            logger,
+            data_dir=account_b_dir,
+            account_id="account-b",
+        )
+
+        self.assertEqual(
+            [draft["comment_id"] for draft in reloaded_a.get_review_drafts()],
+            ["a"],
+        )
+        self.assertEqual(reloaded_b.get_review_drafts(), [])
+        self.assertEqual(reloaded_a.get_history(), [{"comment_id": "history-a"}])
+        self.assertEqual(reloaded_b.get_history(), [])
+
     def test_empty_requested_list_sends_nothing(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
 

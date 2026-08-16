@@ -343,11 +343,39 @@ class BiliCommentBot:
     _BV_BASE = 58
     _BV_TABLE = "FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf"
 
-    def __init__(self, config: dict, logger: logging.Logger, socketio=None, on_config_changed=None):
+    def __init__(
+        self,
+        config: dict,
+        logger: logging.Logger,
+        socketio=None,
+        on_config_changed=None,
+        data_dir: str = None,
+        account_id: str = None,
+    ):
         self.config = config
         self.logger = logger
         self.socketio = socketio  # 可选，用于推送到前端
         self.on_config_changed = on_config_changed  # 配置变更回调，用于持久化
+        self.account_id = str(account_id or "")
+        self.data_dir = DATA_DIR if data_dir is None else os.path.abspath(data_dir)
+        if self.data_dir:
+            os.makedirs(self.data_dir, exist_ok=True)
+        self.config_file = (
+            os.path.join(self.data_dir, "config.toml") if self.data_dir else CONFIG_FILE
+        )
+        self.history_file = (
+            os.path.join(self.data_dir, "history.json") if self.data_dir else HISTORY_FILE
+        )
+        self.cookie_file = (
+            os.path.join(self.data_dir, "bilibili_cookie.json")
+            if self.data_dir
+            else COOKIE_FILE
+        )
+        self.review_drafts_file = (
+            os.path.join(self.data_dir, "review_drafts.json")
+            if self.data_dir
+            else REVIEW_DRAFTS_FILE
+        )
         self._ark_pacer_lock = threading.Lock()
         self._ark_last_started_at = 0.0
         self._review_operation_lock = threading.RLock()
@@ -414,8 +442,8 @@ class BiliCommentBot:
         self.cached_videos: List[dict] = []
         self.last_video_fetch_time = 0
         cache_file_path = vc.get("cache_file", "video_cache.json")
-        if DATA_DIR and not os.path.isabs(cache_file_path):
-            cache_file_path = os.path.join(DATA_DIR, cache_file_path)
+        if self.data_dir and not os.path.isabs(cache_file_path):
+            cache_file_path = os.path.join(self.data_dir, cache_file_path)
         self.video_cache_file = cache_file_path
         self.video_cache_expire_time = vc.get("expire_time", 43200)
         self.load_video_cache()
@@ -447,9 +475,9 @@ class BiliCommentBot:
         if cookie_str:
             self.cookie_manager = BilibiliCookieManager(cookie_str, refresh_token, logger=self.logger)
             self.session.cookies.update(self.cookie_manager.session.cookies)
-        elif os.path.exists(COOKIE_FILE):
+        elif os.path.exists(self.cookie_file):
             self.cookie_manager = BilibiliCookieManager(logger=self.logger)
-            if self.cookie_manager.load_from_file(COOKIE_FILE):
+            if self.cookie_manager.load_from_file(self.cookie_file):
                 self.session.cookies.update(self.cookie_manager.session.cookies)
         if self.cookie_manager:
             self.csrf_token = self.cookie_manager._get_csrf_from_cookie()
@@ -599,7 +627,7 @@ class BiliCommentBot:
         self._flush_history()
         if self.cookie_manager:
             try:
-                self.cookie_manager.save_to_file(COOKIE_FILE)
+                self.cookie_manager.save_to_file(self.cookie_file)
             except Exception:
                 pass
         return True
@@ -631,7 +659,7 @@ class BiliCommentBot:
         self._flush_history()
         if self.cookie_manager:
             try:
-                self.cookie_manager.save_to_file(COOKIE_FILE)
+                self.cookie_manager.save_to_file(self.cookie_file)
             except Exception:
                 pass
 
@@ -813,8 +841,9 @@ class BiliCommentBot:
     # ── 历史记录 ──
     def load_history(self):
         try:
-            if os.path.exists(HISTORY_FILE):
-                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            history_file = getattr(self, "history_file", HISTORY_FILE)
+            if os.path.exists(history_file):
+                with open(history_file, "r", encoding="utf-8") as f:
                     history = json.load(f)
                 self.processed_comments = set(item.get("comment_id") for item in history)
                 self._history_buffer = history
@@ -851,8 +880,14 @@ class BiliCommentBot:
         if not self._history_dirty:
             return
         try:
-            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            history_file = getattr(self, "history_file", HISTORY_FILE)
+            directory = os.path.dirname(history_file)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            temp_file = f"{history_file}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(self._history_buffer, f, ensure_ascii=False, indent=2)
+            os.replace(temp_file, history_file)
             self._history_dirty = False
         except Exception as e:
             self.logger.error(f"刷出历史记录失败: {e}")
@@ -866,8 +901,11 @@ class BiliCommentBot:
         try:
             recovered_sending = 0
             recovered_regenerating = 0
-            if os.path.exists(REVIEW_DRAFTS_FILE):
-                with open(REVIEW_DRAFTS_FILE, "r", encoding="utf-8") as f:
+            review_drafts_file = getattr(
+                self, "review_drafts_file", REVIEW_DRAFTS_FILE
+            )
+            if os.path.exists(review_drafts_file):
+                with open(review_drafts_file, "r", encoding="utf-8") as f:
                     items = json.load(f)
                 if isinstance(items, list):
                     self._review_drafts = {
@@ -909,10 +947,13 @@ class BiliCommentBot:
             self._review_drafts = {}
 
     def _save_review_drafts(self):
-        directory = os.path.dirname(REVIEW_DRAFTS_FILE)
+        review_drafts_file = getattr(
+            self, "review_drafts_file", REVIEW_DRAFTS_FILE
+        )
+        directory = os.path.dirname(review_drafts_file)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        temp_file = f"{REVIEW_DRAFTS_FILE}.tmp"
+        temp_file = f"{review_drafts_file}.tmp"
         items = sorted(
             self._review_drafts.values(),
             key=lambda item: item.get("comment_time", 0),
@@ -920,7 +961,7 @@ class BiliCommentBot:
         )
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=2)
-        os.replace(temp_file, REVIEW_DRAFTS_FILE)
+        os.replace(temp_file, review_drafts_file)
 
     def get_review_drafts(self) -> list:
         with self._review_lock:
