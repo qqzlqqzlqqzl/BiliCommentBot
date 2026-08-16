@@ -99,6 +99,16 @@ try {
     if ($page.Content -notmatch '<option value="50000">') {
         throw "页面缺少 50000 档位"
     }
+    if ($page.Content -notmatch '<option value="500" selected>最近 500 条（默认）</option>') {
+        throw "页面默认读取数量不是 500"
+    }
+    if (
+        $page.Content -match 'id="cfg-bilibili-uid"' -or
+        $page.Content -match 'data-tab="tab-auth"' -or
+        $page.Content -match 'id="cfg-auth-enabled"'
+    ) {
+        throw "页面仍展示手填 UID 或未经验证的安全功能"
+    }
     $socketClient = Invoke-WebRequest `
         -Uri "$baseUrl/static/socket.io.min.js" `
         -TimeoutSec 10
@@ -111,6 +121,22 @@ try {
 
     $accounts = Invoke-RestMethod -Uri "$baseUrl/api/accounts" -TimeoutSec 10
     $firstId = [string]$accounts.current_account_id
+    $defaultConfig = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
+    if (
+        [int]$defaultConfig.config.bilibili.check_interval -ne 600 -or
+        [double]$defaultConfig.config.rate_limit.min_request_interval -ne 10 -or
+        [int]$defaultConfig.config.rate_limit.max_retries -ne 3 -or
+        [int]$defaultConfig.config.rate_limit.retry_delay -ne 20 -or
+        [int]$defaultConfig.config.reply.max_process -ne 500
+    ) {
+        throw "发布 EXE 的默认参数未恢复为 500/600/10/3/20"
+    }
+    if (
+        [string]$defaultConfig.config.ark.system_prompt -notmatch "不要显得太过幼稚" -or
+        [string]$defaultConfig.config.ark.system_prompt -notmatch "不要一直哈哈哈"
+    ) {
+        throw "发布 EXE 的默认豆包提示词缺少已确认约束"
+    }
     $saved = Post-Json "$baseUrl/api/config" @{
         bilibili = @{
             uid = "smoke-account-1"
