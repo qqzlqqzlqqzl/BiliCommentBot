@@ -197,6 +197,11 @@ class AccountManager:
                 self._bots[account_id] = bot
             return bot
 
+    def get_loaded_bot(self, account_id: str):
+        account_id = self.resolve_account_id(account_id)
+        with self._lock:
+            return self._bots.get(account_id)
+
     def shutdown_all(self):
         with self._lock:
             bots = list(self._bots.values())

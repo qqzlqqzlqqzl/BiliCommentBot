@@ -375,14 +375,26 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertIn("豆包生成进度：已处理", log_text)
         self.assertIn("豆包生成完成：新增2条草稿", log_text)
 
-    def test_review_read_limit_is_capped_at_one_hundred(self):
+    def test_review_read_limit_uses_temporary_debug_cap(self):
         self.bot.auto_refresh_cookie = False
         self.bot._collect_review_items = Mock(return_value=[])
 
-        result = self.bot.generate_review_drafts(limit=99999)
+        with patch.dict(os.environ, {"BILI_REVIEW_HARD_LIMIT": "110"}):
+            result = self.bot.generate_review_drafts(limit=99999)
 
         self.assertEqual(result, {"generated": 0, "replyable": 0, "skipped": 0})
-        self.assertEqual(self.bot._collect_review_items.call_args.args[0], 100)
+        self.assertEqual(self.bot._collect_review_items.call_args.args[0], 110)
+
+    def test_review_read_limit_keeps_full_product_range(self):
+        self.bot.auto_refresh_cookie = False
+        self.bot._collect_review_items = Mock(return_value=[])
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BILI_REVIEW_HARD_LIMIT", None)
+            result = self.bot.generate_review_drafts(limit=50000)
+
+        self.assertEqual(result, {"generated": 0, "replyable": 0, "skipped": 0})
+        self.assertEqual(self.bot._collect_review_items.call_args.args[0], 50000)
 
     def test_review_read_limit_defaults_to_ten(self):
         self.bot.auto_refresh_cookie = False

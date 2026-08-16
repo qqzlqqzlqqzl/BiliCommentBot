@@ -34,7 +34,17 @@ VIDEO_CACHE_FILE = os.path.join(DATA_DIR, "video_cache.json") if DATA_DIR else "
 REVIEW_DRAFTS_FILE = os.path.join(DATA_DIR, "review_drafts.json") if DATA_DIR else "review_drafts.json"
 
 REVIEW_READ_DEFAULT = 10
-REVIEW_READ_MAX = 100
+REVIEW_READ_MAX = 50000
+
+
+def get_review_read_max() -> int:
+    """产品默认保留完整范围；调试时可用环境变量临时收紧。"""
+    raw_value = os.environ.get("BILI_REVIEW_HARD_LIMIT", str(REVIEW_READ_MAX))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = REVIEW_READ_MAX
+    return max(1, min(value, REVIEW_READ_MAX))
 
 
 def normalize_review_read_limit(value, default: int = REVIEW_READ_DEFAULT) -> int:
@@ -43,7 +53,7 @@ def normalize_review_read_limit(value, default: int = REVIEW_READ_DEFAULT) -> in
         limit = int(value)
     except (TypeError, ValueError):
         limit = default
-    return max(1, min(limit, REVIEW_READ_MAX))
+    return max(1, min(limit, get_review_read_max()))
 
 
 # ─────────────────────────────────────────────
@@ -464,12 +474,18 @@ class BiliCommentBot:
         """安全推送事件到前端（SocketIO 可选）"""
         if self.socketio:
             try:
-                self.socketio.emit(event, data)
+                payload = dict(data)
+                if self.account_id:
+                    payload["account_id"] = self.account_id
+                self.socketio.emit(event, payload)
             except Exception:
                 pass
 
     # ── Cookie 初始化 ──
     def _init_cookie(self):
+        self.cookie_manager = None
+        self.csrf_token = ""
+        self.session.cookies.clear()
         cookie_str = self.config["bilibili"].get("cookie", "")
         refresh_token = self.config["bilibili"].get("refresh_token", "")
         if cookie_str:

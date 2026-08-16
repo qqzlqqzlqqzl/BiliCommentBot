@@ -93,6 +93,38 @@ class ServerAccountApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    def test_qr_cookie_is_saved_only_to_target_account(self):
+        first_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+        second_id = self.client.post(
+            "/api/accounts",
+            json={"name": "第二个账号"},
+        ).get_json()["account"]["id"]
+
+        server._persist_qr_cookie(
+            second_id,
+            "SESSDATA=second; bili_jct=csrf-second",
+        )
+
+        self.assertEqual(
+            server.load_config(first_id)["bilibili"]["cookie"],
+            "",
+        )
+        self.assertEqual(
+            server.load_config(second_id)["bilibili"]["cookie"],
+            "SESSDATA=second; bili_jct=csrf-second",
+        )
+
+    def test_rendered_product_page_uses_debug_cap_without_removing_full_options(self):
+        with patch.dict(
+            os.environ,
+            {"BILI_REVIEW_HARD_LIMIT": "110"},
+            clear=False,
+        ):
+            html = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn("const REVIEW_HARD_LIMIT = Number(110)", html)
+        self.assertIn('<option value="50000">', html)
+
 
 if __name__ == "__main__":
     unittest.main()

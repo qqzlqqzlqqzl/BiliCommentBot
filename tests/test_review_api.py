@@ -88,12 +88,13 @@ class ReviewApiTests(unittest.TestCase):
             review_since=None,
         )
 
-    def test_generate_caps_requested_count_at_one_hundred(self):
-        response = self.client.post("/api/review/generate", json={"limit": 50000})
+    def test_generate_respects_temporary_debug_cap(self):
+        with patch.dict("os.environ", {"BILI_REVIEW_HARD_LIMIT": "110"}):
+            response = self.client.post("/api/review/generate", json={"limit": 50000})
 
         self.assertEqual(response.status_code, 200)
         self.fake_bot.generate_review_drafts.assert_called_once_with(
-            limit=100,
+            limit=110,
             review_since=None,
         )
 

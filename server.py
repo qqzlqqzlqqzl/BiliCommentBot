@@ -31,6 +31,7 @@ from bot import (
     BiliCommentBot,
     DEFAULT_CONFIG,
     REVIEW_READ_DEFAULT,
+    get_review_read_max,
     ReviewOperationBusyError,
     normalize_review_read_limit,
     CONFIG_FILE,
@@ -279,9 +280,7 @@ BILI_HEADERS = {
     "Referer": "https://www.bilibili.com",
 }
 
-_qr_session: Optional[requests.Session] = None
-_qr_key: Optional[str] = None
-_qr_thread: Optional[threading.Thread] = None
+_qr_states = {}
 
 
 def _gen_qr_image_base64(url: str) -> str:
@@ -296,8 +295,34 @@ def _gen_qr_image_base64(url: str) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _poll_qr_login(qr_key: str, session: requests.Session):
-    global _qr_session, _qr_key
+def _qr_account_id() -> str:
+    return (
+        get_account_manager().current_account_id()
+        if is_product_mode()
+        else "legacy"
+    )
+
+
+def _emit_qr(event: str, account_id: str, payload: dict):
+    socketio.emit(event, {"account_id": account_id, **payload})
+
+
+def _persist_qr_cookie(account_id: str, cookie_str: str):
+    target_account_id = None if account_id == "legacy" else account_id
+    cfg = load_config(target_account_id)
+    cfg.setdefault("bilibili", {})["cookie"] = cookie_str
+    if not save_config(cfg, target_account_id):
+        raise RuntimeError("Cookie 保存失败")
+    if is_product_mode():
+        manager = get_account_manager()
+        bot = manager.get_loaded_bot(account_id)
+        if bot is not None:
+            bot.reload_config(cfg)
+    elif _bot is not None:
+        _bot.reload_config(cfg)
+
+
+def _poll_qr_login(account_id: str, qr_key: str, session: requests.Session):
     params = {"qrcode_key": qr_key}
     timeout = 180
     start = time.time()
@@ -310,7 +335,11 @@ def _poll_qr_login(qr_key: str, session: requests.Session):
             if code != last_code:
                 last_code = code
                 msg_map = {86101: "等待扫码...", 86090: "已扫码，请在手机确认", 86038: "二维码已失效", 0: "登录成功！"}
-                socketio.emit("qr_status", {"code": code, "message": msg_map.get(code, str(code))})
+                _emit_qr(
+                    "qr_status",
+                    account_id,
+                    {"code": code, "message": msg_map.get(code, str(code))},
+                )
             if code == 0:
                 cookies = dict(session.cookies)
                 if data.get("url"):
@@ -319,14 +348,27 @@ def _poll_qr_login(qr_key: str, session: requests.Session):
                         if k not in cookies:
                             cookies[k] = v[0]
                 cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
-                socketio.emit("qr_cookie", {"cookie": cookie_str, "cookies": cookies})
+                _persist_qr_cookie(account_id, cookie_str)
+                _emit_qr(
+                    "qr_cookie",
+                    account_id,
+                    {"saved": True},
+                )
                 return
             if code == 86038:
                 return
         except Exception as e:
-            socketio.emit("qr_status", {"code": -1, "message": f"请求错误: {e}"})
+            _emit_qr(
+                "qr_status",
+                account_id,
+                {"code": -1, "message": f"请求错误: {e}"},
+            )
         time.sleep(1.5)
-    socketio.emit("qr_status", {"code": -2, "message": "登录超时"})
+    _emit_qr(
+        "qr_status",
+        account_id,
+        {"code": -2, "message": "登录超时"},
+    )
 
 
 # ─────────────────────────────────────────────
@@ -352,6 +394,7 @@ def index():
         instance_port=get_server_port(),
         instance_uid=str(cfg.get("bilibili", {}).get("uid", "") or "未配置"),
         product_mode=is_product_mode(),
+        review_hard_limit=get_review_read_max(),
     )
 
 
@@ -600,19 +643,35 @@ def api_logs():
 
 @app.route("/api/qr/generate", methods=["POST"])
 def api_qr_generate():
-    global _qr_session, _qr_key, _qr_thread
     try:
-        _qr_session = requests.Session()
-        resp = _qr_session.get(BILI_QR_GENERATE, headers=BILI_HEADERS, timeout=10)
+        account_id = _qr_account_id()
+        previous = _qr_states.get(account_id)
+        if previous and previous["thread"].is_alive():
+            return jsonify({"ok": False, "message": "该账号已有二维码登录正在进行"}), 409
+        session = requests.Session()
+        resp = session.get(BILI_QR_GENERATE, headers=BILI_HEADERS, timeout=10)
         data = resp.json()
         if data["code"] != 0:
             return jsonify({"ok": False, "message": "获取二维码失败"})
         qr_url = data["data"]["url"]
-        _qr_key = data["data"]["qrcode_key"]
+        qr_key = data["data"]["qrcode_key"]
         qr_b64 = _gen_qr_image_base64(qr_url)
-        _qr_thread = threading.Thread(target=_poll_qr_login, args=(_qr_key, _qr_session), daemon=True)
-        _qr_thread.start()
-        return jsonify({"ok": True, "qr_image": qr_b64})
+        thread = threading.Thread(
+            target=_poll_qr_login,
+            args=(account_id, qr_key, session),
+            daemon=True,
+        )
+        _qr_states[account_id] = {
+            "session": session,
+            "key": qr_key,
+            "thread": thread,
+        }
+        thread.start()
+        return jsonify({
+            "ok": True,
+            "account_id": account_id,
+            "qr_image": qr_b64,
+        })
     except Exception as e:
         return jsonify({"ok": False, "message": str(e)})
 

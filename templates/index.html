@@ -3,10 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{{ instance_name }} · 端口 {{ instance_port }} · UID {{ instance_uid }} - B站评论审核助手</title>
+<title>{{ instance_name }} · B站评论审核助手</title>
 <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
 <style>
-  :root {
+  :root, html[data-theme="dark"] {
     --bg: #0f1117;
     --surface: #1a1d27;
     --surface2: #22263a;
@@ -19,6 +19,21 @@
     --text: #e8eaf6;
     --text2: #8b92b8;
     --radius: 10px;
+    color-scheme: dark;
+  }
+  html[data-theme="light"] {
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --surface2: #eef1f5;
+    --border: #d8dde7;
+    --accent: #e95c88;
+    --accent2: #1689be;
+    --green: #168a46;
+    --yellow: #a87000;
+    --red: #d53d3d;
+    --text: #20232d;
+    --text2: #626b7c;
+    color-scheme: light;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; }
@@ -43,6 +58,10 @@
   .nav-list li a:hover { background: var(--surface2); color: var(--text); }
   .nav-list li a.active { background: var(--surface2); color: var(--accent); border-left-color: var(--accent); }
   .nav-list li a .icon { font-size: 16px; width: 20px; text-align: center; }
+  .sidebar-tools { padding:16px 14px 0; border-top:1px solid var(--border); display:grid; gap:8px; }
+  .sidebar-tools .form-select { font-size:12px; padding:7px 8px; }
+  .sidebar-tool-row { display:flex; gap:6px; }
+  .sidebar-tool-row .btn { padding:7px 9px; font-size:12px; flex:1; justify-content:center; }
   .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); display: inline-block; margin-left: auto; }
   .status-dot.running { background: var(--green); animation: pulse 2s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
@@ -204,7 +223,7 @@
   <aside class="sidebar">
     <div class="sidebar-logo">
       <div class="logo-title">🤖 BiliBot</div>
-      <div class="logo-sub">{{ instance_name }} · 端口 {{ instance_port }}</div>
+      <div class="logo-sub" id="sidebar-account-name">{{ instance_name }}</div>
       <div class="logo-sub">UID {{ instance_uid }}</div>
       <div class="logo-sub">B站评论人工审核回复</div>
     </div>
@@ -216,6 +235,19 @@
       <li><a href="#" data-page="history"><span class="icon">📝</span><span>历史记录</span></a></li>
       <li><a href="#" data-page="logs"><span class="icon">📋</span><span>实时日志</span></a></li>
     </ul>
+    <div class="sidebar-tools">
+      <label class="form-label" for="account-select" style="margin:0">当前账号</label>
+      <select class="form-select" id="account-select" onchange="selectAccount(this.value)">
+        <option value="">加载中...</option>
+      </select>
+      <button class="btn btn-secondary" id="btn-add-account" onclick="createAccount()" style="display:none">＋ 添加账号</button>
+      <label class="form-label" for="theme-select" style="margin:4px 0 0">界面主题</label>
+      <select class="form-select" id="theme-select" onchange="setThemePreference(this.value)">
+        <option value="system">跟随系统</option>
+        <option value="light">日间</option>
+        <option value="dark">夜间</option>
+      </select>
+    </div>
   </aside>
 
   <!-- Main -->
@@ -278,8 +310,16 @@
             <option value="20">最近 20 条</option>
             <option value="50">最近 50 条</option>
             <option value="100">最近 100 条</option>
+            <option value="200">最近 200 条</option>
+            <option value="300">最近 300 条</option>
+            <option value="500">最近 500 条</option>
+            <option value="1000">最近 1000 条</option>
+            <option value="2000">最近 2000 条</option>
+            <option value="5000">最近 5000 条</option>
+            <option value="10000">最近 10000 条</option>
+            <option value="50000">尽可能读取（最多 50000 条）</option>
           </select>
-          <span class="form-hint" style="margin:0">读取后会交给豆包判断，会消耗 Token；单次最多 100 条。</span>
+          <span class="form-hint" style="margin:0">默认 10 条；读取后会交给豆包判断并消耗 Token。</span>
           <label class="form-label" for="review-time-range" style="margin:0">时间范围</label>
           <select class="form-select" id="review-time-range" style="width:140px" onchange="updateReviewTimeRange()">
             <option value="">不限时间</option>
@@ -288,7 +328,7 @@
             <option value="7d">最近7天</option>
             <option value="custom">自定义时间</option>
           </select>
-          <input class="form-input" id="review-since" type="datetime-local" style="width:200px;color-scheme:dark;display:none" aria-label="自定义起始时间">
+          <input class="form-input" id="review-since" type="datetime-local" style="width:200px;display:none" aria-label="自定义起始时间">
           <button class="btn btn-primary" id="btn-review-generate" onclick="generateReviewDrafts()">生成最近评论草稿</button>
           <button class="btn btn-secondary" onclick="loadReviewDrafts()">刷新列表</button>
           <button class="btn btn-success" id="btn-review-send" onclick="sendApprovedDrafts()">发送已勾选</button>
@@ -482,8 +522,16 @@
                 <option value="20">20 条</option>
                 <option value="50">50 条</option>
                 <option value="100">100 条</option>
+                <option value="200">200 条</option>
+                <option value="300">300 条</option>
+                <option value="500">500 条</option>
+                <option value="1000">1000 条</option>
+                <option value="2000">2000 条</option>
+                <option value="5000">5000 条</option>
+                <option value="10000">10000 条</option>
+                <option value="50000">50000 条</option>
               </select>
-              <div class="form-hint">按时间从新到旧读取并交给豆包判断。为控制 Token 消耗，单次最多 100 条。</div>
+              <div class="form-hint">按时间从新到旧读取并交给豆包判断。数量越大，豆包 Token 消耗越高。</div>
             </div>
             <div class="form-group">
               <label class="form-label">只读取此时间之后的评论（可选）</label>
@@ -773,20 +821,98 @@ let historyPage = 1;
 let allLogs = [];
 let configData = {};
 let reviewPreferencesLoaded = false;
+let currentAccountId = '';
+let qrAccountId = '';
+
+function applyTheme(preference) {
+  const resolved = preference === 'system'
+    ? (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+    : preference;
+  document.documentElement.dataset.theme = resolved;
+}
+
+function setThemePreference(preference) {
+  localStorage.setItem('bilibot.theme', preference);
+  applyTheme(preference);
+}
+
+function initTheme() {
+  const preference = localStorage.getItem('bilibot.theme') || 'system';
+  document.getElementById('theme-select').value = preference;
+  applyTheme(preference);
+  window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+    if ((localStorage.getItem('bilibot.theme') || 'system') === 'system') {
+      applyTheme('system');
+    }
+  });
+}
+
+function loadAccounts() {
+  return fetch('/api/accounts').then(r => r.json()).then(d => {
+    if (!d.ok) throw new Error(d.message || '账号列表读取失败');
+    currentAccountId = String(d.current_account_id || '');
+    const select = document.getElementById('account-select');
+    select.innerHTML = (d.accounts || []).map(account =>
+      `<option value="${escHtml(account.id)}">${escHtml(account.name)}${account.running ? ' · 监控中' : ''}</option>`
+    ).join('');
+    select.value = currentAccountId;
+    const current = (d.accounts || []).find(account => String(account.id) === currentAccountId);
+    if (current) document.getElementById('sidebar-account-name').textContent = current.name;
+    document.getElementById('btn-add-account').style.display = d.product_mode ? '' : 'none';
+    return d;
+  });
+}
+
+function selectAccount(accountId) {
+  if (!accountId || accountId === currentAccountId) return;
+  fetch('/api/accounts/select', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({account_id: accountId}),
+  }).then(async response => {
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.message || '切换账号失败');
+    location.reload();
+  }).catch(error => {
+    showToast(error.message, 'error');
+    document.getElementById('account-select').value = currentAccountId;
+  });
+}
+
+function createAccount() {
+  const name = prompt('新账号名称：');
+  if (name === null) return;
+  fetch('/api/accounts', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({name}),
+  }).then(async response => {
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.message || '添加账号失败');
+    location.reload();
+  }).catch(error => showToast(error.message, 'error'));
+}
 
 // ── Socket 事件 ──
+function eventForCurrentAccount(data) {
+  return !data || !data.account_id || data.account_id === currentAccountId;
+}
+
 socket.on('connect', () => { console.log('WS connected'); });
-socket.on('bot_status', d => updateBotStatus(d.running));
-socket.on('stats', d => updateStats(d));
-socket.on('log', entry => appendLog(entry));
+socket.on('bot_status', d => { if (eventForCurrentAccount(d)) updateBotStatus(d.running); });
+socket.on('stats', d => { if (eventForCurrentAccount(d)) updateStats(d); });
+socket.on('log', entry => { if (eventForCurrentAccount(entry)) appendLog(entry); });
 socket.on('log_history', d => { allLogs = d.logs; renderLogs(); });
 socket.on('new_history', item => {
+  if (!eventForCurrentAccount(item)) return;
   if (currentPage === 'history') loadHistory(historyPage);
 });
-socket.on('review_updated', () => {
+socket.on('review_updated', data => {
+  if (!eventForCurrentAccount(data)) return;
   if (currentPage === 'review') loadReviewDrafts();
 });
 socket.on('qr_status', d => {
+  if (d.account_id && d.account_id !== currentAccountId) return;
   const el = document.getElementById('qr-status');
   if (el) {
     el.textContent = d.message;
@@ -797,21 +923,14 @@ socket.on('qr_status', d => {
   }
 });
 socket.on('qr_cookie', d => {
+  if (d.account_id && d.account_id !== currentAccountId) return;
   showToast('登录成功，正在保存配置...', 'success');
-  // 自动保存cookie到配置
-  fetch('/api/config', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ bilibili: { cookie: d.cookie } })
-  }).then(r => r.json()).then(r => {
-    if (r.ok) {
-      showToast('Cookie 已保存到配置', 'success');
-      loadConfig();
-    }
-  });
+  showToast('Cookie 已保存到当前账号', 'success');
+  loadConfig();
   document.getElementById('btn-gen-qr').disabled = false;
 });
 socket.on('video_list', d => {
+  if (!eventForCurrentAccount(d)) return;
   document.getElementById('stat-videos').textContent = d.count;
 });
 
@@ -1302,13 +1421,14 @@ function saveReviewPreferences() {
   localStorage.setItem('bilibot.review.since', document.getElementById('review-since').value);
 }
 
-const REVIEW_LIMIT_OPTIONS = [10, 20, 50, 100];
+const REVIEW_LIMIT_OPTIONS = [10, 20, 50, 100, 200, 300, 500, 1000, 2000, 5000, 10000, 50000];
+const REVIEW_HARD_LIMIT = Number({{ review_hard_limit|tojson }}) || 50000;
 
 function normalizeReviewLimit(value, fallback = 10) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
-  if (parsed >= 100) return 100;
-  const allowed = REVIEW_LIMIT_OPTIONS.filter(option => option <= parsed);
+  const bounded = Math.min(parsed, REVIEW_HARD_LIMIT);
+  const allowed = REVIEW_LIMIT_OPTIONS.filter(option => option <= bounded);
   return allowed.length ? allowed[allowed.length - 1] : 10;
 }
 
@@ -1460,6 +1580,7 @@ function generateQR() {
   container.innerHTML = '<span style="color:var(--text2)">生成中...</span>';
   fetch('/api/qr/generate', {method:'POST'}).then(r=>r.json()).then(d=>{
     if (d.ok) {
+      qrAccountId = String(d.account_id || currentAccountId);
       container.innerHTML = `
         <div class="qr-box">
           <img src="data:image/png;base64,${d.qr_image}" alt="二维码">
@@ -1558,11 +1679,14 @@ function escHtml(str) {
 
 // ── 初始化 ──
 (function init() {
+  initTheme();
   checkAuthGate();
   document.getElementById('review-limit').addEventListener('change', saveReviewPreferences);
   document.getElementById('review-since').addEventListener('change', saveReviewPreferences);
-  loadConfig();
-  fetch('/api/bot/status').then(r=>r.json()).then(d => updateStats(d));
+  loadAccounts().then(() => {
+    loadConfig();
+    fetch('/api/bot/status').then(r=>r.json()).then(d => updateStats(d));
+  }).catch(error => showToast(error.message, 'error'));
 })();
 </script>
 </body>
