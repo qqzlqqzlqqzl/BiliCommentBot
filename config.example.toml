@@ -14,8 +14,8 @@ check_interval = 60
 auto_refresh_cookie = true
 # Cookie刷新检查间隔（分钟）
 cookie_refresh_interval = 30
-# 获取评论的最大页数
-max_comment_pages = 2
+# 仅处理指定单个 BV 时，每个视频读取评论的最大页数
+max_comment_pages = 10
 # 获取视频的最大页数
 max_video_pages = 10
 
@@ -60,6 +60,8 @@ prefix = "🤖 "
 only_new = true
 # 每次最多处理的评论数
 max_process = 10
+# 可选：只读取此时间之后的评论，留空表示仅按条数限制
+review_since = ""
 # 每批交给豆包判断的评论数。为保证 JSON 稳定，程序实际最多按 4 条串行处理。
 review_batch_size = 4
 # 回复延迟（秒，避免频繁操作）

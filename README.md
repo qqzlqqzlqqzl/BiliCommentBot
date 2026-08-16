@@ -70,7 +70,7 @@ python main.py
 
 ```toml
 [bilibili]
-max_comment_pages = 2
+max_comment_pages = 10
 max_video_pages = 10
 
 [ark]
@@ -82,13 +82,19 @@ system_prompt = "你是B站UP主的评论回复助手。只回复语境清楚、
 
 [reply]
 enabled = true
-max_process = 10
-review_batch_size = 8
+max_process = 100
+review_since = "" # 例如 2026-08-10T00:00；留空表示只按条数限制
+review_batch_size = 4
 reply_delay = 2
 chained_reply_enabled = true
 ```
 
 `reply.enabled` 的含义是“启用自动生成审核草稿”，不是自动发送。
+
+正常审核从创作中心“评论管理”的账号评论流读取，按评论时间从新到旧跨视频排列。
+`max_process` 是最新评论扫描上限，支持 100、200 等数量；`review_since` 是可选的
+起始时间。两者同时设置时，先碰到哪个边界就停止。已有审核草稿、已经发送、
+UP 已回复及账号自己的评论不会再次交给豆包，除非手动点击单条“重新生成”。
 
 ## 数据文件
 
@@ -111,7 +117,8 @@ python -m unittest discover -s tests -v
 
 ## 当前限制
 
-评论抓取沿用原项目的路径：先取账号视频列表，再逐个视频抓最近评论页。它不等同于创作中心“全账号最近回复流”的排序。测试两页后需要核对实际顺序；如果与创作中心差异明显，下一步应改用账号聚合回复流接口。
+正常审核只读取视频评论（创作中心“全部视频评论”，`type=1`）。配置“仅处理指定
+BV”时，仍保留原项目的单视频评论抓取路径。
 
 ## 许可证
 

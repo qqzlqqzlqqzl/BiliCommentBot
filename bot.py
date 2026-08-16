@@ -43,7 +43,7 @@ DEFAULT_CONFIG = {
         "check_interval": 60,
         "auto_refresh_cookie": True,
         "cookie_refresh_interval": 30,
-        "max_comment_pages": 2,
+        "max_comment_pages": 10,
         "max_video_pages": 10,
     },
     "rate_limit": {
@@ -71,6 +71,7 @@ DEFAULT_CONFIG = {
         "prefix": "",
         "only_new": True,
         "max_process": 10,
+        "review_since": "",
         "reply_delay": 2,
         "like_enabled": False,
         "context_comments_count": 0,
@@ -1095,6 +1096,128 @@ class BiliCommentBot:
 
         return all_replies
 
+    @staticmethod
+    def _creator_reply_to_comment(reply: dict) -> Comment:
+        root_id = str(reply.get("root") or "") or None
+        parent_id = str(reply.get("parent") or "") or None
+        member = reply.get("member") or {}
+        content = reply.get("content") or {}
+        return Comment(
+            comment_id=str(reply.get("rpid") or ""),
+            content=str(content.get("message") or ""),
+            user=str(member.get("uname") or ""),
+            uid=str(member.get("mid") or reply.get("mid") or ""),
+            time=int(reply.get("ctime") or 0),
+            replied=bool((reply.get("up_action") or {}).get("reply")),
+            parent_id=parent_id,
+            root_id=root_id,
+            depth=1 if root_id else 0,
+        )
+
+    def get_creator_comment_feed(self, limit: int, since_timestamp: int = None) -> List[dict]:
+        """读取创作中心“评论管理”的账号最新评论流。"""
+        url = "https://api.bilibili.com/x/v2/reply/up/fulllist"
+        page_size = 10
+        max_pages = max(1, (limit + page_size - 1) // page_size)
+        all_items = []
+        seen_ids = set()
+        reached_since = False
+
+        for pn in range(1, max_pages + 1):
+            params = {
+                "order": 1,
+                "filter": -1,
+                "is_hidden": 0,
+                "type": 1,
+                "pn": pn,
+                "ps": page_size,
+                "charge_plus_filter": False,
+            }
+            response = self.make_request_with_retry(
+                "GET",
+                url,
+                params=params,
+                use_cache=False,
+                headers={"Referer": "https://member.bilibili.com/platform/comment/article"},
+            )
+            if not response:
+                if pn == 1:
+                    raise RuntimeError("创作中心评论列表请求无响应")
+                break
+
+            payload = response.json()
+            if payload.get("code") != 0:
+                message = payload.get("message", "未知错误")
+                if pn == 1:
+                    raise RuntimeError(f"创作中心评论列表获取失败: {message}")
+                self.logger.warning("创作中心评论第%s页获取失败: %s", pn, message)
+                break
+
+            data = payload.get("data") or {}
+            replies = data.get("list") or []
+            if not replies:
+                break
+
+            for reply in replies:
+                comment = self._creator_reply_to_comment(reply)
+                if since_timestamp is not None and comment.time < since_timestamp:
+                    reached_since = True
+                    break
+                if not comment.comment_id or comment.comment_id in seen_ids:
+                    continue
+                seen_ids.add(comment.comment_id)
+
+                parent_data = reply.get("parent_info") or {}
+                if not parent_data and comment.parent_id:
+                    root_data = reply.get("root_info") or {}
+                    if str(root_data.get("rpid") or "") == comment.parent_id:
+                        parent_data = root_data
+                parent_comment = (
+                    self._creator_reply_to_comment(parent_data)
+                    if parent_data and parent_data.get("rpid")
+                    else None
+                )
+
+                all_items.append({
+                    "bvid": str(reply.get("bvid") or ""),
+                    "oid": str(reply.get("oid") or ""),
+                    "comment_type": int(reply.get("type") or 1),
+                    "video_title": str(reply.get("title") or ""),
+                    "video_desc": "",
+                    "comment": comment,
+                    "parent_comment": parent_comment,
+                })
+                if len(all_items) >= limit:
+                    break
+
+            page = data.get("page") or {}
+            total = int(page.get("total") or 0)
+            self.logger.info(
+                "创作中心最新评论第%s页获取到%s条，累计%s条",
+                pn,
+                len(replies),
+                len(all_items),
+            )
+            if (
+                reached_since
+                or len(all_items) >= limit
+                or len(replies) < page_size
+                or (total and pn * page_size >= total)
+            ):
+                break
+
+        return all_items
+
+    @staticmethod
+    def _parse_review_since(value: str) -> Optional[int]:
+        value = str(value or "").strip()
+        if not value:
+            return None
+        try:
+            return int(datetime.fromisoformat(value.replace("T", " ")).timestamp())
+        except (ValueError, OSError, OverflowError) as exc:
+            raise ValueError("起始时间格式无效，请使用 YYYY-MM-DD HH:MM") from exc
+
     # ── 豆包回复生成 ──
     def _ark_output_text(self, payload: dict) -> str:
         parts = []
@@ -1486,15 +1609,8 @@ class BiliCommentBot:
         self.last_cookie_refresh_time = current_time
 
     # ── 人工审核处理循环 ──
-    def _collect_review_items(self, limit: int) -> List[dict]:
+    def _collect_review_items(self, limit: int, review_since: str = None) -> List[dict]:
         only_bvid = self.config["reply"].get("only_bvid", "").strip()
-        if only_bvid:
-            videos = [{"bvid": only_bvid, "title": f"指定视频({only_bvid})", "desc": ""}]
-        else:
-            videos = self.get_video_list()
-        if not videos:
-            raise RuntimeError("未获取到视频列表")
-
         context_count = self.config["reply"].get("context_comments_count", 0)
         my_uid = self.config["bilibili"].get("uid", "")
         items = []
@@ -1502,6 +1618,35 @@ class BiliCommentBot:
         with self._review_lock:
             existing_ids = set(self._review_drafts)
 
+        if not only_bvid:
+            since_timestamp = self._parse_review_since(
+                self.config["reply"].get("review_since", "")
+                if review_since is None
+                else review_since
+            )
+            feed_items = self.get_creator_comment_feed(limit, since_timestamp)
+            for feed_item in feed_items:
+                if len(items) >= limit:
+                    break
+                comment = feed_item["comment"]
+                if comment.comment_id in self.processed_comments or comment.comment_id in existing_ids:
+                    continue
+                if comment.replied:
+                    continue
+                if my_uid and comment.uid == my_uid:
+                    continue
+                passed, _ = self._check_filters(comment)
+                if not passed:
+                    continue
+
+                parent_comment = feed_item.get("parent_comment")
+                context = [parent_comment] if parent_comment else []
+                feed_item["context"] = context
+                feed_item["is_follow_up"] = comment.depth > 0
+                items.append(feed_item)
+            return items
+
+        videos = [{"bvid": only_bvid, "title": f"指定视频({only_bvid})", "desc": ""}]
         for video in videos:
             if len(items) >= limit:
                 break
@@ -1544,12 +1689,12 @@ class BiliCommentBot:
                 })
         return items
 
-    def generate_review_drafts(self, limit: int = None) -> dict:
+    def generate_review_drafts(self, limit: int = None, review_since: str = None) -> dict:
         if self.auto_refresh_cookie:
             self.refresh_cookie_if_needed()
         limit = int(limit or self.config["reply"].get("max_process", 10))
-        limit = max(1, min(limit, 100))
-        items = self._collect_review_items(limit)
+        limit = max(1, min(limit, 1000))
+        items = self._collect_review_items(limit, review_since=review_since)
         return self._generate_review_drafts(items)
 
     def _generate_review_drafts(self, items: List[dict]) -> dict:

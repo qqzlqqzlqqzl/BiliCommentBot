@@ -20,6 +20,11 @@ class ReviewApiTests(unittest.TestCase):
             "status": "pending",
             "reply": "新回复",
         }
+        self.fake_bot.generate_review_drafts.return_value = {
+            "generated": 2,
+            "replyable": 1,
+            "skipped": 1,
+        }
         self.bot_patch = patch.object(server, "get_bot", return_value=self.fake_bot)
         self.bot_patch.start()
 
@@ -60,6 +65,18 @@ class ReviewApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.fake_bot.regenerate_review_draft.assert_called_once_with("1")
+
+    def test_generate_passes_count_and_time_boundaries(self):
+        response = self.client.post(
+            "/api/review/generate",
+            json={"limit": 200, "review_since": "2026-08-10T00:00"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.fake_bot.generate_review_drafts.assert_called_once_with(
+            limit=200,
+            review_since="2026-08-10T00:00",
+        )
 
 
 if __name__ == "__main__":

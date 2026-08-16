@@ -353,8 +353,12 @@ def api_review_drafts():
 def api_review_generate():
     data = request.get_json(silent=True) or {}
     limit = data.get("limit", 20)
+    review_since = data.get("review_since") if "review_since" in data else None
     try:
-        result = get_bot().generate_review_drafts(limit=limit)
+        result = get_bot().generate_review_drafts(
+            limit=limit,
+            review_since=review_since,
+        )
         return jsonify({"ok": True, **result})
     except Exception as e:
         get_bot().logger.exception("生成审核草稿失败")

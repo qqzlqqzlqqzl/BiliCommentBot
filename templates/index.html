@@ -271,7 +271,9 @@
         </div>
         <div class="review-toolbar">
           <label class="form-label" for="review-limit" style="margin:0">本次读取</label>
-          <input class="form-input" id="review-limit" type="number" min="1" max="100" value="20" style="width:90px">
+          <input class="form-input" id="review-limit" type="number" min="1" max="1000" value="20" style="width:90px">
+          <label class="form-label" for="review-since" style="margin:0">起始时间</label>
+          <input class="form-input" id="review-since" type="datetime-local" style="width:200px">
           <button class="btn btn-primary" id="btn-review-generate" onclick="generateReviewDrafts()">生成最近评论草稿</button>
           <button class="btn btn-secondary" onclick="loadReviewDrafts()">刷新列表</button>
           <button class="btn btn-success" id="btn-review-send" onclick="sendApprovedDrafts()">发送已勾选</button>
@@ -345,13 +347,14 @@
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label class="form-label">每个视频的评论页数</label>
-              <input class="form-input" type="number" id="cfg-bilibili-max_comment_pages" value="2">
-              <div class="form-hint">每个视频最多读取多少页主评论，并按配置展开楼中楼。</div>
+              <label class="form-label">指定单个 BV 时的评论页数</label>
+              <input class="form-input" type="number" id="cfg-bilibili-max_comment_pages" value="10">
+              <div class="form-hint">正常审核使用创作中心最新评论流；这里只限制“仅处理指定 BV”时读取多少页。</div>
             </div>
             <div class="form-group">
               <label class="form-label">视频列表页数</label>
               <input class="form-input" type="number" id="cfg-bilibili-max_video_pages" value="10">
+              <div class="form-hint">保留给基座其他功能；生成审核草稿时不再扫描视频列表。</div>
             </div>
           </div>
           <div class="form-group">
@@ -427,13 +430,19 @@
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label class="form-label">每次最多处理评论数</label>
-              <input class="form-input" type="number" id="cfg-reply-max_process" value="10">
+              <label class="form-label">最新评论扫描上限</label>
+              <input class="form-input" type="number" id="cfg-reply-max_process" value="10" min="1" max="1000">
+              <div class="form-hint">按时间从新到旧读取，例如填 100 或 200；这些评论再交给豆包判断。</div>
             </div>
             <div class="form-group">
-              <label class="form-label">回复延迟（秒）</label>
-              <input class="form-input" type="number" id="cfg-reply-reply_delay" value="2">
+              <label class="form-label">只读取此时间之后的评论（可选）</label>
+              <input class="form-input" type="datetime-local" id="cfg-reply-review_since">
+              <div class="form-hint">留空表示只按条数限制；条数和时间同时设置时，先碰到哪个边界就停止。</div>
             </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">回复延迟（秒）</label>
+            <input class="form-input" type="number" id="cfg-reply-reply_delay" value="2">
           </div>
           <div class="form-group">
             <label class="form-label">上下文评论数（0=不使用上下文）</label>
@@ -960,6 +969,9 @@ function loadConfig() {
     set('cfg-reply-like_user_video_enabled', r.like_user_video_enabled);
     set('cfg-reply-like_user_video_only_followers', r.like_user_video_only_followers);
     set('cfg-reply-max_process', r.max_process);
+    set('cfg-reply-review_since', r.review_since);
+    set('review-limit', r.max_process);
+    set('review-since', r.review_since);
     set('cfg-reply-reply_delay', r.reply_delay);
     set('cfg-reply-context_comments_count', r.context_comments_count);
     set('cfg-reply-chained_reply_enabled', r.chained_reply_enabled);
@@ -1043,6 +1055,7 @@ function saveConfig() {
       like_user_video_enabled: get('cfg-reply-like_user_video_enabled'),
       like_user_video_only_followers: get('cfg-reply-like_user_video_only_followers'),
       max_process: get('cfg-reply-max_process'),
+      review_since: get('cfg-reply-review_since'),
       reply_delay: get('cfg-reply-reply_delay'),
       context_comments_count: get('cfg-reply-context_comments_count'),
       chained_reply_enabled: get('cfg-reply-chained_reply_enabled'),
@@ -1192,13 +1205,14 @@ function loadReviewDrafts(retryOnNetworkError = true) {
 
 function generateReviewDrafts() {
   const button = document.getElementById('btn-review-generate');
-  const limit = Math.max(1, Math.min(100, Number(document.getElementById('review-limit').value) || 20));
+  const limit = Math.max(1, Math.min(1000, Number(document.getElementById('review-limit').value) || 20));
+  const reviewSince = document.getElementById('review-since').value || '';
   button.disabled = true;
   button.textContent = '豆包生成中...';
   fetch('/api/review/generate', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({limit}),
+    body: JSON.stringify({limit, review_since: reviewSince}),
   }).then(r => r.json()).then(d => {
     if (d.ok) {
       showToast(`生成 ${d.generated} 条：可回复 ${d.replyable} 条，跳过 ${d.skipped} 条`, 'success');
