@@ -105,9 +105,10 @@ try {
     if (
         $page.Content -notmatch '连续 3 页没有新增待生成评论' -or
         $page.Content -notmatch 'review_time_range: reviewTimeRange' -or
+        $page.Content -notmatch '\.\.\.reviewPreferencesPayload\(\)' -or
         $page.Content -notmatch '/api/review/preferences'
     ) {
-        throw "页面缺少三页停止或后台时间范围持久化逻辑"
+        throw "页面缺少三页停止、时间范围持久化或发送门禁参数"
     }
     if (
         $page.Content -notmatch 'id="btn-review-select-all"' -or
@@ -164,6 +165,22 @@ try {
         [string]$preferenceConfig.config.reply.review_since -ne ""
     ) {
         throw "审核读取数量或24小时时间范围没有按账号持久化"
+    }
+    try {
+        Post-Json "$baseUrl/api/review/send" @{
+            comment_ids = @("smoke-not-sent")
+            review_time_range = "invalid-range"
+            review_since = ""
+        }
+        throw "发送接口接受了无效时间范围"
+    }
+    catch {
+        if (
+            -not $_.Exception.Response -or
+            [int]$_.Exception.Response.StatusCode -ne 400
+        ) {
+            throw
+        }
     }
     if (
         [string]$defaultConfig.config.ark.system_prompt -notmatch "默认不要使用" -or
@@ -291,6 +308,7 @@ try {
         ReleaseHardLimit = 50000
         ReviewPreferenceLimit = $preferenceConfig.config.reply.max_process
         ReviewPreferenceRange = $preferenceConfig.config.reply.review_time_range
+        SendRangeGate = $true
         MonitorPreferencePersisted = $true
         AccountCount = $manifest.accounts.Count
         LocalSocketClient = $true
