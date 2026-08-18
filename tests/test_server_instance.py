@@ -31,6 +31,28 @@ class ServerInstanceTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["product"], "BiliCommentReviewer")
 
+    def test_product_monitor_restart_state_comes_from_account_config(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(
+                server.should_auto_start_monitor({
+                    "bilibili": {"auto_start_monitor": True}
+                })
+            )
+            self.assertFalse(
+                server.should_auto_start_monitor({
+                    "bilibili": {"auto_start_monitor": False}
+                })
+            )
+
+    def test_source_launcher_can_explicitly_override_monitor_restart_state(self):
+        config = {"bilibili": {"auto_start_monitor": True}}
+        with patch.dict(
+            os.environ,
+            {"BILI_AUTO_START_MONITOR": "0"},
+            clear=True,
+        ):
+            self.assertFalse(server.should_auto_start_monitor(config))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -148,7 +148,7 @@ def configure_environment(root: Path, port: int):
     os.environ["BILI_PRODUCT_DATA_DIR"] = str(root)
     os.environ["BILI_PORT"] = str(port)
     os.environ["BILI_HOST"] = "127.0.0.1"
-    os.environ["BILI_AUTO_START_MONITOR"] = "0"
+    os.environ.pop("BILI_AUTO_START_MONITOR", None)
     os.environ["BILI_OPEN_BROWSER"] = "0"
     os.environ["PYTHONUTF8"] = "1"
     os.environ.pop("BILI_REVIEW_HARD_LIMIT", None)

@@ -2,6 +2,7 @@ import copy
 import json
 import logging
 import os
+import random
 import tempfile
 import threading
 import time
@@ -59,6 +60,47 @@ class ReviewWorkflowTests(unittest.TestCase):
             "approved": approved,
             "status": status,
         }
+
+    @staticmethod
+    def _creator_row(
+        comment_id,
+        *,
+        uid="100",
+        message="观众评论",
+        ctime=None,
+        parent=0,
+        root=0,
+        replied=False,
+    ):
+        numeric_id = int(comment_id)
+        return {
+            "rpid": numeric_id,
+            "oid": numeric_id + 1000,
+            "type": 1,
+            "root": root,
+            "parent": parent,
+            "bvid": f"BV{numeric_id}",
+            "title": f"视频{numeric_id}",
+            "ctime": int(ctime if ctime is not None else numeric_id),
+            "member": {"mid": int(uid), "uname": f"用户{uid}"},
+            "content": {"message": message},
+            "up_action": {"reply": replied},
+        }
+
+    @staticmethod
+    def _creator_page(rows, *, page_number=1, total=10000):
+        return bot_module.CachedResponse({
+            "code": 0,
+            "message": "OK",
+            "data": {
+                "page": {
+                    "num": page_number,
+                    "size": 10,
+                    "total": total,
+                },
+                "list": rows,
+            },
+        })
 
     def test_parses_ark_output_text_and_fenced_json(self):
         payload = {
@@ -903,6 +945,183 @@ class ReviewWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(items[0]["parent_comment"].uid, "999")
 
+    def test_creator_feed_stops_after_three_pages_without_new_candidates(self):
+        pages = []
+        known_ids = set()
+        for page_number in range(1, 6):
+            rows = []
+            for offset in range(10):
+                comment_id = page_number * 100 + offset
+                known_ids.add(str(comment_id))
+                rows.append(self._creator_row(comment_id))
+            pages.append(self._creator_page(rows, page_number=page_number))
+        self.bot.make_request_with_retry = Mock(side_effect=pages)
+
+        items = self.bot.get_creator_comment_feed(
+            limit=500,
+            skip_comment_ids=known_ids,
+        )
+
+        self.assertEqual(items, [])
+        self.assertEqual(self.bot.make_request_with_retry.call_count, 3)
+
+    def test_creator_feed_new_candidate_resets_empty_page_counter(self):
+        pages = []
+        known_ids = set()
+        expected_new_id = "305"
+        for page_number in range(1, 8):
+            rows = []
+            for offset in range(10):
+                comment_id = page_number * 100 + offset
+                if str(comment_id) != expected_new_id:
+                    known_ids.add(str(comment_id))
+                rows.append(self._creator_row(comment_id))
+            pages.append(self._creator_page(rows, page_number=page_number))
+        self.bot.make_request_with_retry = Mock(side_effect=pages)
+
+        items = self.bot.get_creator_comment_feed(
+            limit=500,
+            skip_comment_ids=known_ids,
+        )
+
+        self.assertEqual(
+            [item["comment"].comment_id for item in items],
+            [expected_new_id],
+        )
+        self.assertEqual(self.bot.make_request_with_retry.call_count, 6)
+
+    def test_creator_feed_filtered_rows_do_not_reset_empty_page_counter(self):
+        pages = []
+        for page_number in range(1, 6):
+            rows = [
+                self._creator_row(page_number * 100 + offset, message="过滤")
+                for offset in range(10)
+            ]
+            pages.append(self._creator_page(rows, page_number=page_number))
+        self.bot.make_request_with_retry = Mock(side_effect=pages)
+
+        items = self.bot.get_creator_comment_feed(
+            limit=500,
+            candidate_filter=lambda comment: comment.content != "过滤",
+        )
+
+        self.assertEqual(items, [])
+        self.assertEqual(self.bot.make_request_with_retry.call_count, 3)
+
+    def test_creator_feed_raw_limit_is_a_hard_scan_boundary(self):
+        pages = []
+        for page_number in range(1, 6):
+            rows = [
+                self._creator_row(page_number * 100 + offset)
+                for offset in range(10)
+            ]
+            pages.append(self._creator_page(rows, page_number=page_number))
+        self.bot.make_request_with_retry = Mock(side_effect=pages)
+
+        items = self.bot.get_creator_comment_feed(limit=25)
+
+        self.assertEqual(len(items), 25)
+        self.assertEqual(self.bot.make_request_with_retry.call_count, 3)
+
+    def test_creator_feed_aborts_instead_of_generating_from_partial_scan(self):
+        first_page = self._creator_page(
+            [self._creator_row(100 + offset) for offset in range(10)],
+            page_number=1,
+        )
+        self.bot.make_request_with_retry = Mock(
+            side_effect=[first_page, None]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "扫描中断"):
+            self.bot.get_creator_comment_feed(limit=500)
+
+        self.assertEqual(self.bot.make_request_with_retry.call_count, 2)
+
+    def test_creator_feed_later_own_reply_removes_provisional_candidate(self):
+        target_id = "100"
+        page_one = [
+            self._creator_row(target_id, uid="42"),
+            *[
+                self._creator_row(110 + offset, uid="999")
+                for offset in range(9)
+            ],
+        ]
+        page_two = [
+            self._creator_row(200, uid="999", parent=int(target_id), root=int(target_id)),
+            *[
+                self._creator_row(210 + offset, uid="999")
+                for offset in range(9)
+            ],
+        ]
+        pages = [
+            self._creator_page(page_one, page_number=1),
+            self._creator_page(page_two, page_number=2),
+            self._creator_page(
+                [self._creator_row(300 + offset, uid="999") for offset in range(10)],
+                page_number=3,
+            ),
+            self._creator_page(
+                [self._creator_row(400 + offset, uid="999") for offset in range(10)],
+                page_number=4,
+            ),
+        ]
+        self.bot.make_request_with_retry = Mock(side_effect=pages)
+
+        items = self.bot.get_creator_comment_feed(limit=500, my_uid="999")
+
+        self.assertEqual(items, [])
+        self.assertEqual(self.bot.make_request_with_retry.call_count, 4)
+
+    def test_creator_feed_random_page_sequences_preserve_stop_invariants(self):
+        for seed in range(20):
+            rng = random.Random(seed)
+            page_has_new = [rng.random() < 0.45 for _ in range(20)]
+            expected_pages = 20
+            empty_streak = 0
+            for index, has_new in enumerate(page_has_new, start=1):
+                empty_streak = 0 if has_new else empty_streak + 1
+                if empty_streak == 3:
+                    expected_pages = index
+                    break
+
+            pages = []
+            known_ids = set()
+            expected_ids = []
+            for page_number, has_new in enumerate(page_has_new, start=1):
+                rows = []
+                new_offset = rng.randrange(10) if has_new else -1
+                for offset in range(10):
+                    comment_id = seed * 10000 + page_number * 100 + offset
+                    rows.append(self._creator_row(comment_id))
+                    if offset == new_offset:
+                        expected_ids.append(str(comment_id))
+                    else:
+                        known_ids.add(str(comment_id))
+                pages.append(
+                    self._creator_page(
+                        rows,
+                        page_number=page_number,
+                        total=len(page_has_new) * 10,
+                    )
+                )
+
+            self.bot.make_request_with_retry = Mock(side_effect=pages)
+            items = self.bot.get_creator_comment_feed(
+                limit=500,
+                skip_comment_ids=known_ids,
+            )
+
+            self.assertEqual(
+                self.bot.make_request_with_retry.call_count,
+                expected_pages,
+                msg=f"seed={seed}",
+            )
+            self.assertEqual(
+                [item["comment"].comment_id for item in items],
+                expected_ids[:sum(page_has_new[:expected_pages])],
+                msg=f"seed={seed}",
+            )
+
     def test_collect_review_items_uses_creator_timeline_and_skips_replied(self):
         self.bot.config["reply"]["only_bvid"] = ""
         self.bot.config["reply"]["review_since"] = "2026-08-10 00:00"
@@ -977,6 +1196,44 @@ class ReviewWorkflowTests(unittest.TestCase):
             "202",
             self.bot.get_creator_comment_feed.call_args.kwargs["skip_comment_ids"],
         )
+
+    def test_collect_review_items_resolves_relative_time_range_at_task_start(self):
+        self.bot.config["reply"]["only_bvid"] = ""
+        self.bot.config["bilibili"]["uid"] = "999"
+        self.bot.get_creator_comment_feed = Mock(return_value=[])
+
+        with patch.object(bot_module.time, "time", return_value=2_000_000):
+            items = self.bot._collect_review_items(
+                limit=100,
+                review_since="",
+                review_time_range="24h",
+            )
+
+        self.assertEqual(items, [])
+        requested_limit, since_timestamp = (
+            self.bot.get_creator_comment_feed.call_args.args
+        )
+        self.assertEqual(requested_limit, 100)
+        self.assertEqual(since_timestamp, 2_000_000 - 24 * 60 * 60)
+
+    def test_collect_review_items_uses_persisted_relative_range_for_monitor(self):
+        self.bot.config["reply"]["only_bvid"] = ""
+        self.bot.config["reply"]["review_time_range"] = "7d"
+        self.bot.config["reply"]["review_since"] = ""
+        self.bot.get_creator_comment_feed = Mock(return_value=[])
+
+        with patch.object(bot_module.time, "time", return_value=3_000_000):
+            self.bot._collect_review_items(limit=50)
+
+        _, since_timestamp = self.bot.get_creator_comment_feed.call_args.args
+        self.assertEqual(since_timestamp, 3_000_000 - 7 * 24 * 60 * 60)
+
+    def test_invalid_relative_time_range_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "时间范围无效"):
+            self.bot._collect_review_items(
+                limit=10,
+                review_time_range="one-day-ish",
+            )
 
     def test_collect_review_items_keeps_original_chain_for_only_bvid(self):
         self.bot.config["reply"]["only_bvid"] = "BV1test"

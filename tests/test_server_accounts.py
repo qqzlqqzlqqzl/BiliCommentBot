@@ -118,6 +118,43 @@ class ServerAccountApiTests(unittest.TestCase):
         self.assertEqual(first_after["bilibili"]["uid"], "111")
         self.assertNotEqual(first_id, second_id)
 
+    def test_review_preferences_are_persisted_per_account(self):
+        first_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+        first_save = self.client.post(
+            "/api/review/preferences",
+            json={
+                "limit": 100,
+                "review_time_range": "24h",
+                "review_since": "",
+            },
+        )
+        second_id = self.client.post(
+            "/api/accounts",
+            json={"name": "第二个账号"},
+        ).get_json()["account"]["id"]
+        second_save = self.client.post(
+            "/api/review/preferences",
+            json={
+                "limit": 200,
+                "review_time_range": "7d",
+                "review_since": "",
+            },
+        )
+
+        first = server.load_config(first_id)["reply"]
+        second = server.load_config(second_id)["reply"]
+
+        self.assertEqual(first_save.status_code, 200)
+        self.assertEqual(second_save.status_code, 200)
+        self.assertEqual(
+            (first["max_process"], first["review_time_range"]),
+            (100, "24h"),
+        )
+        self.assertEqual(
+            (second["max_process"], second["review_time_range"]),
+            (200, "7d"),
+        )
+
     def test_unknown_account_cannot_be_selected(self):
         response = self.client.post(
             "/api/accounts/select",

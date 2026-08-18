@@ -35,6 +35,12 @@ REVIEW_DRAFTS_FILE = os.path.join(DATA_DIR, "review_drafts.json") if DATA_DIR el
 
 REVIEW_READ_DEFAULT = 500
 REVIEW_READ_MAX = 50000
+CREATOR_EMPTY_PAGE_STOP = 3
+REVIEW_TIME_RANGE_SECONDS = {
+    "24h": 24 * 60 * 60,
+    "3d": 3 * 24 * 60 * 60,
+    "7d": 7 * 24 * 60 * 60,
+}
 
 
 def get_review_read_max() -> int:
@@ -65,6 +71,7 @@ DEFAULT_CONFIG = {
         "refresh_token": "",
         "uid": "",
         "check_interval": 600,
+        "auto_start_monitor": False,
         "auto_refresh_cookie": True,
         "cookie_refresh_interval": 30,
         "max_comment_pages": 10,
@@ -101,6 +108,7 @@ DEFAULT_CONFIG = {
         "only_new": True,
         "max_process": 500,
         "review_since": "",
+        "review_time_range": "",
         "reply_delay": 2,
         "like_enabled": False,
         "context_comments_count": 0,
@@ -1458,10 +1466,12 @@ class BiliCommentBot:
         since_timestamp: int = None,
         my_uid: str = "",
         skip_comment_ids=None,
+        candidate_filter=None,
     ) -> List[dict]:
-        """读取创作中心最新评论，并在计数前排除自己的回复和已回复目标。"""
+        """按时间线读取最新评论，并在本地候选连续三页无新增时停止。"""
         url = "https://api.bilibili.com/x/v2/reply/up/fulllist"
         page_size = 10
+        limit = max(1, int(limit))
         my_uid = str(my_uid or "")
         skip_comment_ids = {str(value) for value in (skip_comment_ids or set())}
         eligible_items = {}
@@ -1472,6 +1482,8 @@ class BiliCommentBot:
         self_count = 0
         replied_count = 0
         skipped_known_count = 0
+        filtered_count = 0
+        empty_candidate_pages = 0
         pn = 1
 
         while True:
@@ -1492,32 +1504,45 @@ class BiliCommentBot:
                 headers={"Referer": "https://member.bilibili.com/platform/comment/article"},
             )
             if not response:
-                if pn == 1:
-                    raise RuntimeError("创作中心评论列表请求无响应")
-                break
+                raise RuntimeError(
+                    f"创作中心评论扫描中断：第{pn}页请求无响应"
+                )
 
             payload = response.json()
             if payload.get("code") != 0:
                 message = payload.get("message", "未知错误")
-                if pn == 1:
-                    raise RuntimeError(f"创作中心评论列表获取失败: {message}")
-                self.logger.warning("创作中心评论第%s页获取失败: %s", pn, message)
-                break
+                raise RuntimeError(
+                    f"创作中心评论扫描中断：第{pn}页获取失败: {message}"
+                )
 
             data = payload.get("data") or {}
             replies = data.get("list") or []
             if not replies:
+                self.logger.info(
+                    "创作中心最新评论扫描停止：第%s页为空，列表已结束；"
+                    "累计扫描%s条，待生成%s条",
+                    pn,
+                    scanned_count,
+                    len(eligible_items),
+                )
                 break
 
+            page_start_ids = set(eligible_items)
+            page_scanned_count = 0
+            reached_raw_limit = False
             for reply in replies:
+                if scanned_count >= limit:
+                    reached_raw_limit = True
+                    break
                 comment = self._creator_reply_to_comment(reply)
+                scanned_count += 1
+                page_scanned_count += 1
                 if since_timestamp is not None and comment.time < since_timestamp:
                     reached_since = True
                     break
                 if not comment.comment_id or comment.comment_id in seen_ids:
                     continue
                 seen_ids.add(comment.comment_id)
-                scanned_count += 1
 
                 if my_uid and comment.uid == my_uid:
                     self_count += 1
@@ -1532,6 +1557,9 @@ class BiliCommentBot:
                     continue
                 if comment.comment_id in skip_comment_ids:
                     skipped_known_count += 1
+                    continue
+                if candidate_filter is not None and not candidate_filter(comment):
+                    filtered_count += 1
                     continue
 
                 parent_data = reply.get("parent_info") or {}
@@ -1555,29 +1583,58 @@ class BiliCommentBot:
                     "parent_comment": parent_comment,
                 }
 
+            page_new_count = len(set(eligible_items) - page_start_ids)
+            if page_new_count:
+                empty_candidate_pages = 0
+            else:
+                empty_candidate_pages += 1
+
             page = data.get("page") or {}
             total = int(page.get("total") or 0)
             self.logger.info(
-                "创作中心最新评论第%s页扫描%s条；累计扫描%s条，待生成%s条，"
-                "排除自己的回复%s条、已回复%s条、已有记录%s条",
+                "创作中心最新评论第%s页扫描%s条；本页新增待生成%s条，"
+                "连续无新增%s/%s页；累计扫描%s条，待生成%s条，"
+                "排除自己的回复%s条、已回复%s条、已有记录%s条、过滤%s条",
                 pn,
-                len(replies),
+                page_scanned_count,
+                page_new_count,
+                empty_candidate_pages,
+                CREATOR_EMPTY_PAGE_STOP,
                 scanned_count,
                 len(eligible_items),
                 self_count,
                 replied_count,
                 skipped_known_count,
+                filtered_count,
             )
-            if (
-                reached_since
-                or len(eligible_items) >= limit
-                or len(replies) < page_size
-                or (total and pn * page_size >= total)
-            ):
+
+            stop_reason = ""
+            if reached_since:
+                stop_reason = "已到达所选时间范围"
+            elif reached_raw_limit or scanned_count >= limit:
+                stop_reason = f"已达到本次读取上限 {limit} 条"
+            elif empty_candidate_pages >= CREATOR_EMPTY_PAGE_STOP:
+                stop_reason = (
+                    f"连续{CREATOR_EMPTY_PAGE_STOP}页没有新增待生成评论"
+                )
+            elif len(replies) < page_size:
+                stop_reason = "当前页不足一页，列表已结束"
+            elif total and pn * page_size >= total:
+                stop_reason = "已到达创作中心评论列表末尾"
+
+            if stop_reason:
+                self.logger.info(
+                    "创作中心最新评论扫描停止：%s；共扫描%s页、%s条，"
+                    "最终待生成%s条",
+                    stop_reason,
+                    pn,
+                    scanned_count,
+                    len(eligible_items),
+                )
                 break
             pn += 1
 
-        return list(eligible_items.values())[:limit]
+        return list(eligible_items.values())
 
     @staticmethod
     def _parse_review_since(value: str) -> Optional[int]:
@@ -1588,6 +1645,19 @@ class BiliCommentBot:
             return int(datetime.fromisoformat(value.replace("T", " ")).timestamp())
         except (ValueError, OSError, OverflowError) as exc:
             raise ValueError("起始时间格式无效，请使用 YYYY-MM-DD HH:MM") from exc
+
+    @classmethod
+    def _resolve_review_since(
+        cls,
+        value: str = "",
+        time_range: str = "",
+    ) -> Optional[int]:
+        time_range = str(time_range or "").strip()
+        if time_range in REVIEW_TIME_RANGE_SECONDS:
+            return int(time.time()) - REVIEW_TIME_RANGE_SECONDS[time_range]
+        if time_range not in {"", "custom"}:
+            raise ValueError("时间范围无效")
+        return cls._parse_review_since(value)
 
     # ── 豆包回复生成 ──
     def _ark_output_text(self, payload: dict) -> str:
@@ -2110,6 +2180,7 @@ class BiliCommentBot:
         self,
         limit: int,
         review_since: str = None,
+        review_time_range: str = None,
         config_snapshot: dict = None,
     ) -> List[dict]:
         task_config = config_snapshot or self.config
@@ -2122,16 +2193,46 @@ class BiliCommentBot:
             existing_ids = set(self._review_drafts)
 
         if not only_bvid:
-            since_timestamp = self._parse_review_since(
+            effective_since = (
                 task_config["reply"].get("review_since", "")
                 if review_since is None
                 else review_since
             )
+            effective_time_range = (
+                task_config["reply"].get("review_time_range", "")
+                if review_time_range is None
+                else review_time_range
+            )
+            since_timestamp = self._resolve_review_since(
+                effective_since,
+                effective_time_range,
+            )
+            if since_timestamp is None:
+                self.logger.info(
+                    "开始扫描创作中心最新评论：最多读取%s条，不限时间；"
+                    "连续%s页没有新增待生成评论则停止",
+                    limit,
+                    CREATOR_EMPTY_PAGE_STOP,
+                )
+            else:
+                self.logger.info(
+                    "开始扫描创作中心最新评论：最多读取%s条，时间下限%s；"
+                    "连续%s页没有新增待生成评论则停止",
+                    limit,
+                    datetime.fromtimestamp(since_timestamp).strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    ),
+                    CREATOR_EMPTY_PAGE_STOP,
+                )
             feed_items = self.get_creator_comment_feed(
                 limit,
                 since_timestamp,
                 my_uid=my_uid,
                 skip_comment_ids=self.processed_comments | existing_ids,
+                candidate_filter=lambda comment: self._check_filters(
+                    comment,
+                    task_config,
+                )[0],
             )
             for feed_item in feed_items:
                 if len(items) >= limit:
@@ -2142,9 +2243,6 @@ class BiliCommentBot:
                 if comment.replied:
                     continue
                 if my_uid and comment.uid == my_uid:
-                    continue
-                passed, _ = self._check_filters(comment)
-                if not passed:
                     continue
 
                 parent_comment = feed_item.get("parent_comment")
@@ -2199,7 +2297,12 @@ class BiliCommentBot:
                 })
         return items
 
-    def generate_review_drafts(self, limit: int = None, review_since: str = None) -> dict:
+    def generate_review_drafts(
+        self,
+        limit: int = None,
+        review_since: str = None,
+        review_time_range: str = None,
+    ) -> dict:
         self._ensure_review_operation_state()
         self._ensure_login_identity()
         with self._review_operation(
@@ -2214,6 +2317,7 @@ class BiliCommentBot:
             items = self._collect_review_items(
                 limit,
                 review_since=review_since,
+                review_time_range=review_time_range,
                 config_snapshot=task_config,
             )
             return self._generate_review_drafts(
@@ -2515,10 +2619,11 @@ class BiliCommentBot:
             result["skipped"],
         )
 
-    def _check_filters(self, comment: Comment) -> tuple:
+    def _check_filters(self, comment: Comment, config: dict = None) -> tuple:
         """检查评论是否通过所有过滤器。返回 (通过, 跳过原因)"""
+        task_config = config or self.config
         # ── 长度过滤 ──
-        lf = self.config["reply"].get("length_filter", {})
+        lf = task_config["reply"].get("length_filter", {})
         if lf.get("enabled", False):
             min_len = lf.get("min_length", 0)
             max_len = lf.get("max_length", 500)
@@ -2529,7 +2634,7 @@ class BiliCommentBot:
                 return False, f"评论长度 {content_len} > {max_len}"
 
         # ── 关键词过滤 ──
-        kf = self.config["reply"].get("keyword_filter", {})
+        kf = task_config["reply"].get("keyword_filter", {})
         if kf.get("enabled", False):
             wl_str = kf.get("whitelist", "").strip()
             bl_str = kf.get("blacklist", "").strip()
@@ -2559,7 +2664,7 @@ class BiliCommentBot:
                         return False, "未包含任何白名单关键词"
 
         # ── 用户过滤 ──
-        uf = self.config["reply"].get("user_filter", {})
+        uf = task_config["reply"].get("user_filter", {})
         if uf.get("enabled", False):
             uid = comment.uid
             bl_str = uf.get("blacklist", "").strip()

@@ -31,6 +31,7 @@ from bot import (
     BiliCommentBot,
     DEFAULT_CONFIG,
     REVIEW_READ_DEFAULT,
+    REVIEW_TIME_RANGE_SECONDS,
     get_review_read_max,
     ReviewOperationBusyError,
     normalize_review_read_limit,
@@ -62,6 +63,14 @@ def get_server_port() -> int:
     if not 1 <= port <= 65535:
         raise RuntimeError(f"BILI_PORT 超出范围: {port}")
     return port
+
+
+def should_auto_start_monitor(cfg: dict) -> bool:
+    """环境变量仅用于源码兼容覆盖；产品默认读取当前账号的持久化开关。"""
+    override = os.environ.get("BILI_AUTO_START_MONITOR")
+    if override is not None:
+        return override.strip() == "1"
+    return bool(cfg.get("bilibili", {}).get("auto_start_monitor", False))
 
 
 def get_instance_name() -> str:
@@ -617,17 +626,39 @@ def api_clear_config_secret():
 
 @app.route("/api/bot/start", methods=["POST"])
 def api_bot_start():
+    cfg = load_config()
+    cfg.setdefault("bilibili", {})["auto_start_monitor"] = True
+    if not save_config(cfg):
+        return jsonify({"ok": False, "message": "保存自动监控状态失败"}), 500
     bot = get_bot()
-    result = bot.start()
-    return jsonify({"ok": result, "message": "已启动" if result else "已在运行中"})
+    applied = bot.reload_config(cfg)
+    started = bot.start()
+    return jsonify({
+        "ok": True,
+        "message": (
+            "草稿监控已启动，重启程序后仍会自动恢复"
+            if started
+            else "草稿监控已在运行，重启程序后仍会自动恢复"
+        ),
+        "deferred": not applied,
+    })
 
 
 @app.route("/api/bot/stop", methods=["POST"])
 def api_bot_stop():
+    cfg = load_config()
+    cfg.setdefault("bilibili", {})["auto_start_monitor"] = False
+    if not save_config(cfg):
+        return jsonify({"ok": False, "message": "保存自动监控状态失败"}), 500
     bot = get_bot()
+    applied = bot.reload_config(cfg)
     result = bot.stop()
     if not result:
-        return jsonify({"ok": False, "message": "草稿监控未在运行"})
+        return jsonify({
+            "ok": True,
+            "message": "草稿监控已保持停止，重启程序后不会自动启动",
+            "deferred": not applied,
+        })
     operations = bot.get_review_operation_status()["active"]
     active = [
         {
@@ -643,7 +674,11 @@ def api_bot_stop():
         if active
         else "草稿监控已停止"
     )
-    return jsonify({"ok": True, "message": message})
+    return jsonify({
+        "ok": True,
+        "message": f"{message}；重启程序后不会自动启动",
+        "deferred": not applied,
+    })
 
 
 @app.route("/api/bot/status", methods=["GET"])
@@ -705,10 +740,20 @@ def api_review_generate():
     data = request.get_json(silent=True) or {}
     limit = normalize_review_read_limit(data.get("limit", REVIEW_READ_DEFAULT))
     review_since = data.get("review_since") if "review_since" in data else None
+    review_time_range = (
+        data.get("review_time_range")
+        if "review_time_range" in data
+        else None
+    )
+    if review_time_range is not None:
+        review_time_range = str(review_time_range or "").strip()
+        if review_time_range not in {"", "custom", *REVIEW_TIME_RANGE_SECONDS}:
+            return jsonify({"ok": False, "message": "时间范围无效"}), 400
     try:
         result = get_bot().generate_review_drafts(
             limit=limit,
             review_since=review_since,
+            review_time_range=review_time_range,
         )
         return jsonify({"ok": True, **result})
     except ReviewOperationBusyError as e:
@@ -716,6 +761,42 @@ def api_review_generate():
     except Exception as e:
         get_bot().logger.exception("生成审核草稿失败")
         return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.route("/api/review/preferences", methods=["POST"])
+def api_review_preferences():
+    data = request.get_json(silent=True) or {}
+    limit = normalize_review_read_limit(
+        data.get("limit", REVIEW_READ_DEFAULT)
+    )
+    review_time_range = str(data.get("review_time_range") or "").strip()
+    review_since = str(data.get("review_since") or "").strip()
+    if review_time_range not in {"", "custom", *REVIEW_TIME_RANGE_SECONDS}:
+        return jsonify({"ok": False, "message": "时间范围无效"}), 400
+    if review_time_range != "custom":
+        review_since = ""
+    try:
+        BiliCommentBot._resolve_review_since(review_since, review_time_range)
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+    cfg = load_config()
+    reply_cfg = cfg.setdefault("reply", {})
+    reply_cfg["max_process"] = limit
+    reply_cfg["review_time_range"] = review_time_range
+    reply_cfg["review_since"] = review_since
+    if not save_config(cfg):
+        return jsonify({"ok": False, "message": "保存读取偏好失败"}), 500
+    applied = get_bot().reload_config(cfg)
+    return jsonify({
+        "ok": True,
+        "message": (
+            "读取偏好已保存"
+            if applied
+            else "读取偏好已保存，当前任务结束后生效"
+        ),
+        "deferred": not applied,
+    })
 
 
 @app.route("/api/review/approve", methods=["POST"])
@@ -974,7 +1055,7 @@ def main():
         except Exception as exc:
             print(f"⚠️  B站账号身份识别失败: {exc}")
 
-    auto_start_monitor = os.environ.get("BILI_AUTO_START_MONITOR", "1").strip() == "1"
+    auto_start_monitor = should_auto_start_monitor(cfg)
     if cookie and api_key and auto_start_monitor:
         print("检测到有效配置，自动启动机器人...")
         if bot.start():

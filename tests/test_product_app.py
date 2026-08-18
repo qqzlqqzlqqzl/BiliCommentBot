@@ -46,7 +46,7 @@ class ProductAppTests(unittest.TestCase):
                     temp_dir,
                 )
                 self.assertEqual(os.environ["BILI_PORT"], "32123")
-                self.assertEqual(os.environ["BILI_AUTO_START_MONITOR"], "0")
+                self.assertNotIn("BILI_AUTO_START_MONITOR", os.environ)
                 self.assertEqual(os.environ["BILI_OPEN_BROWSER"], "0")
                 self.assertNotIn("BILI_REVIEW_HARD_LIMIT", os.environ)
 
@@ -91,6 +91,19 @@ class ProductAppTests(unittest.TestCase):
         )
         self.assertIn('id="cfg-rate_limit-retry_delay" value="20"', template)
         self.assertNotIn('id="cfg-bilibili-uid"', template)
+        self.assertIn("review_time_range: reviewTimeRange", template)
+        self.assertIn("连续 3 页没有新增待生成评论", template)
+        save_config_body = template.split(
+            "function saveConfig()", 1
+        )[1].split("function clearConfigSecret", 1)[0]
+        self.assertNotIn(
+            "max_process: normalizeReviewLimit",
+            save_config_body,
+        )
+        self.assertNotIn(
+            "review_since: get('cfg-reply-review_since')",
+            save_config_body,
+        )
 
     def test_add_account_starts_qr_login_without_manual_name(self):
         template = (

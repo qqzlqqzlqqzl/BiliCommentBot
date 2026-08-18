@@ -307,7 +307,7 @@
             <option value="10000">最近 10000 条</option>
             <option value="50000">尽可能读取（最多 50000 条）</option>
           </select>
-          <span class="form-hint" style="margin:0">默认 500 条；自己的回复、已经回复过的评论和已有草稿会在送豆包前排除。</span>
+          <span class="form-hint" style="margin:0">默认最多扫描 500 条原始评论；连续 3 页没有新增待生成评论会提前停止。</span>
           <label class="form-label" for="review-time-range" style="margin:0">时间范围</label>
           <select class="form-select" id="review-time-range" style="width:140px" onchange="updateReviewTimeRange()">
             <option value="">不限时间</option>
@@ -1088,7 +1088,11 @@ function loadConfig() {
     set('cfg-reply-max_process', normalizeReviewLimit(r.max_process));
     set('cfg-reply-review_since', r.review_since);
     if (!reviewPreferencesLoaded) {
-      restoreReviewPreferences(r.max_process, r.review_since);
+      restoreReviewPreferences(
+        r.max_process,
+        r.review_since,
+        r.review_time_range
+      );
       reviewPreferencesLoaded = true;
     }
     set('cfg-reply-reply_delay', r.reply_delay);
@@ -1170,8 +1174,6 @@ function saveConfig() {
       like_enabled: get('cfg-reply-like_enabled'),
       like_user_video_enabled: get('cfg-reply-like_user_video_enabled'),
       like_user_video_only_followers: get('cfg-reply-like_user_video_only_followers'),
-      max_process: normalizeReviewLimit(get('cfg-reply-max_process')),
-      review_since: get('cfg-reply-review_since'),
       reply_delay: get('cfg-reply-reply_delay'),
       context_comments_count: get('cfg-reply-context_comments_count'),
       chained_reply_enabled: get('cfg-reply-chained_reply_enabled'),
@@ -1388,10 +1390,33 @@ function formatCommentTime(unixSeconds) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-function saveReviewPreferences() {
-  localStorage.setItem('bilibot.review.limit.v2', document.getElementById('review-limit').value);
-  localStorage.setItem('bilibot.review.timeRange', document.getElementById('review-time-range').value);
-  localStorage.setItem('bilibot.review.since', document.getElementById('review-since').value);
+function reviewPreferencesPayload() {
+  const reviewTimeRange = document.getElementById('review-time-range').value;
+  return {
+    limit: normalizeReviewLimit(document.getElementById('review-limit').value),
+    review_time_range: reviewTimeRange,
+    review_since: reviewTimeRange === 'custom'
+      ? document.getElementById('review-since').value || ''
+      : '',
+  };
+}
+
+async function saveReviewPreferences(showError = false) {
+  try {
+    const response = await fetch('/api/review/preferences', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(reviewPreferencesPayload()),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) {
+      throw new Error(data.message || '保存读取偏好失败');
+    }
+    return data;
+  } catch (error) {
+    if (showError) showToast(error.message || String(error), 'error');
+    throw error;
+  }
 }
 
 const REVIEW_LIMIT_OPTIONS = [10, 20, 50, 100, 200, 300, 500, 1000, 2000, 5000, 10000, 50000];
@@ -1405,17 +1430,14 @@ function normalizeReviewLimit(value, fallback = 500) {
   return allowed.length ? allowed[allowed.length - 1] : 500;
 }
 
-function restoreReviewPreferences(defaultLimit, defaultSince) {
-  const savedLimit = localStorage.getItem('bilibot.review.limit.v2');
-  const savedRange = localStorage.getItem('bilibot.review.timeRange');
-  const savedSince = localStorage.getItem('bilibot.review.since');
+function restoreReviewPreferences(defaultLimit, defaultSince, defaultRange) {
   const timeRange = document.getElementById('review-time-range');
   const sinceInput = document.getElementById('review-since');
   const limitSelect = document.getElementById('review-limit');
-  const preferredLimit = String(normalizeReviewLimit(savedLimit || defaultLimit || 500));
+  const preferredLimit = String(normalizeReviewLimit(defaultLimit || 500));
   limitSelect.value = preferredLimit;
-  timeRange.value = savedRange !== null ? savedRange : (defaultSince ? 'custom' : '');
-  sinceInput.value = savedSince !== null ? savedSince : (defaultSince || '');
+  timeRange.value = defaultRange || (defaultSince ? 'custom' : '');
+  sinceInput.value = defaultSince || '';
   sinceInput.style.display = timeRange.value === 'custom' ? '' : 'none';
 }
 
@@ -1433,32 +1455,38 @@ function updateReviewTimeRange() {
     }[range];
     sinceInput.value = localDateTimeValue(new Date(Date.now() - milliseconds));
   }
-  saveReviewPreferences();
+  saveReviewPreferences().catch(() => {});
 }
 
 function selectedReviewSince() {
   const range = document.getElementById('review-time-range').value;
   if (!range) return '';
   if (range === 'custom') return document.getElementById('review-since').value || '';
-  const milliseconds = {
-    '24h': 24 * 3600e3,
-    '3d': 3 * 24 * 3600e3,
-    '7d': 7 * 24 * 3600e3,
-  }[range];
-  return localDateTimeValue(new Date(Date.now() - milliseconds));
+  return '';
 }
 
-function generateReviewDrafts() {
+async function generateReviewDrafts() {
   const button = document.getElementById('btn-review-generate');
   const limit = normalizeReviewLimit(document.getElementById('review-limit').value);
+  const reviewTimeRange = document.getElementById('review-time-range').value;
   const reviewSince = selectedReviewSince();
-  saveReviewPreferences();
   button.disabled = true;
   button.textContent = '豆包生成中...';
+  try {
+    await saveReviewPreferences(true);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = '生成最近评论草稿';
+    return;
+  }
   fetch('/api/review/generate', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({limit, review_since: reviewSince}),
+    body: JSON.stringify({
+      limit,
+      review_since: reviewSince,
+      review_time_range: reviewTimeRange,
+    }),
   }).then(r => r.json()).then(d => {
     if (d.ok) {
       showToast(`生成 ${d.generated} 条：可回复 ${d.replyable} 条，跳过 ${d.skipped} 条`, 'success');
@@ -1696,8 +1724,14 @@ function escHtml(str) {
 // ── 初始化 ──
 (function init() {
   initTheme();
-  document.getElementById('review-limit').addEventListener('change', saveReviewPreferences);
-  document.getElementById('review-since').addEventListener('change', saveReviewPreferences);
+  document.getElementById('review-limit').addEventListener(
+    'change',
+    () => saveReviewPreferences().catch(() => {})
+  );
+  document.getElementById('review-since').addEventListener(
+    'change',
+    () => saveReviewPreferences().catch(() => {})
+  );
   loadAccounts().then(() => {
     loadConfig();
     fetch('/api/bot/status').then(r=>r.json()).then(d => updateStats(d));

@@ -30,6 +30,9 @@ class ReviewApiTests(unittest.TestCase):
             "replyable": 1,
             "skipped": 1,
         }
+        self.fake_bot.reload_config.return_value = True
+        self.fake_bot.start.return_value = True
+        self.fake_bot.stop.return_value = True
         self.bot_patch = patch.object(server, "get_bot", return_value=self.fake_bot)
         self.bot_patch.start()
 
@@ -101,14 +104,100 @@ class ReviewApiTests(unittest.TestCase):
     def test_generate_passes_count_and_time_boundaries(self):
         response = self.client.post(
             "/api/review/generate",
-            json={"limit": 50, "review_since": "2026-08-10T00:00"},
+            json={
+                "limit": 50,
+                "review_since": "2026-08-10T00:00",
+                "review_time_range": "custom",
+            },
         )
 
         self.assertEqual(response.status_code, 200)
         self.fake_bot.generate_review_drafts.assert_called_once_with(
             limit=50,
             review_since="2026-08-10T00:00",
+            review_time_range="custom",
         )
+
+    def test_generate_passes_relative_time_range_without_browser_timestamp(self):
+        response = self.client.post(
+            "/api/review/generate",
+            json={
+                "limit": 100,
+                "review_since": "",
+                "review_time_range": "24h",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.fake_bot.generate_review_drafts.assert_called_once_with(
+            limit=100,
+            review_since="",
+            review_time_range="24h",
+        )
+
+    def test_generate_rejects_unknown_time_range(self):
+        response = self.client.post(
+            "/api/review/generate",
+            json={"limit": 100, "review_time_range": "yesterday-ish"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.fake_bot.generate_review_drafts.assert_not_called()
+
+    def test_monitor_start_persists_restart_preference(self):
+        config = {"bilibili": {"auto_start_monitor": False}}
+        with (
+            patch.object(server, "load_config", return_value=config),
+            patch.object(server, "save_config", return_value=True) as save,
+        ):
+            response = self.client.post("/api/bot/start")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(config["bilibili"]["auto_start_monitor"])
+        save.assert_called_once_with(config)
+        self.fake_bot.reload_config.assert_called_once_with(config)
+        self.fake_bot.start.assert_called_once_with()
+
+    def test_monitor_stop_persists_restart_preference_even_if_already_stopped(self):
+        config = {"bilibili": {"auto_start_monitor": True}}
+        self.fake_bot.stop.return_value = False
+        with (
+            patch.object(server, "load_config", return_value=config),
+            patch.object(server, "save_config", return_value=True) as save,
+        ):
+            response = self.client.post("/api/bot/stop")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(config["bilibili"]["auto_start_monitor"])
+        save.assert_called_once_with(config)
+        self.assertIn("保持停止", response.get_json()["message"])
+
+    def test_review_preferences_persist_relative_range_for_monitor(self):
+        config = {
+            "reply": {
+                "max_process": 500,
+                "review_time_range": "",
+                "review_since": "",
+            }
+        }
+        with (
+            patch.object(server, "load_config", return_value=config),
+            patch.object(server, "save_config", return_value=True) as save,
+        ):
+            response = self.client.post(
+                "/api/review/preferences",
+                json={
+                    "limit": 100,
+                    "review_time_range": "24h",
+                    "review_since": "不应保存的旧时间",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(config["reply"]["max_process"], 100)
+        self.assertEqual(config["reply"]["review_time_range"], "24h")
+        self.assertEqual(config["reply"]["review_since"], "")
+        save.assert_called_once_with(config)
 
     def test_generate_defaults_to_five_hundred(self):
         response = self.client.post("/api/review/generate", json={})
@@ -117,6 +206,7 @@ class ReviewApiTests(unittest.TestCase):
         self.fake_bot.generate_review_drafts.assert_called_once_with(
             limit=500,
             review_since=None,
+            review_time_range=None,
         )
 
     def test_generate_respects_temporary_debug_cap(self):
@@ -127,6 +217,7 @@ class ReviewApiTests(unittest.TestCase):
         self.fake_bot.generate_review_drafts.assert_called_once_with(
             limit=110,
             review_since=None,
+            review_time_range=None,
         )
 
     def test_duplicate_generate_returns_conflict(self):
