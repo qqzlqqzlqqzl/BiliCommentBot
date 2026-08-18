@@ -103,6 +103,14 @@ try {
         throw "页面默认读取数量不是 500"
     }
     if (
+        $page.Content -notmatch 'id="btn-review-select-all"' -or
+        $page.Content -notmatch 'id="btn-review-clear-all"' -or
+        $page.Content -notmatch '/api/review/approve-bulk' -or
+        $page.Content -notmatch '独立 instructions'
+    ) {
+        throw "页面缺少批量勾选或提示词生效范围说明"
+    }
+    if (
         $page.Content -match 'id="cfg-bilibili-uid"' -or
         $page.Content -match 'data-tab="tab-auth"' -or
         $page.Content -match 'id="cfg-auth-enabled"'
@@ -132,8 +140,8 @@ try {
         throw "发布 EXE 的默认参数未恢复为 500/600/10/3/20"
     }
     if (
-        [string]$defaultConfig.config.ark.system_prompt -notmatch "不要显得太过幼稚" -or
-        [string]$defaultConfig.config.ark.system_prompt -notmatch "不要一直哈哈哈"
+        [string]$defaultConfig.config.ark.system_prompt -notmatch "默认不要使用" -or
+        [string]$defaultConfig.config.ark.system_prompt -notmatch "哈哈哈"
     ) {
         throw "发布 EXE 的默认豆包提示词缺少已确认约束"
     }

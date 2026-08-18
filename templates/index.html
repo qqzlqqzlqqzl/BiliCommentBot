@@ -319,6 +319,8 @@
           <input class="form-input" id="review-since" type="datetime-local" style="width:200px;display:none" aria-label="自定义起始时间">
           <button class="btn btn-primary" id="btn-review-generate" onclick="generateReviewDrafts()">生成最近评论草稿</button>
           <button class="btn btn-secondary" onclick="loadReviewDrafts()">刷新列表</button>
+          <button class="btn btn-secondary" id="btn-review-select-all" onclick="setAllReplyableDrafts(true)">全选可回复</button>
+          <button class="btn btn-secondary" id="btn-review-clear-all" onclick="setAllReplyableDrafts(false)">清空勾选</button>
           <button class="btn btn-success" id="btn-review-send" onclick="sendApprovedDrafts()">发送已勾选</button>
           <label class="form-label" for="review-status-filter" style="margin:0 0 0 8px">显示</label>
           <select class="form-input" id="review-status-filter" onchange="loadReviewDrafts()" style="width:150px">
@@ -467,6 +469,7 @@
           <div class="form-group">
             <label class="form-label">筛选与回复提示词</label>
             <textarea class="form-textarea" id="cfg-ark-system_prompt" rows="5"></textarea>
+            <div class="form-hint">会作为豆包 Responses API 的独立 instructions 发送。保存后只影响新生成或手动重新生成的候选，已有草稿不会自动改写。</div>
           </div>
         </div>
       </div>
@@ -1274,6 +1277,10 @@ function loadReviewDrafts(retryOnNetworkError = true) {
     const sendButton = document.getElementById('btn-review-send');
     sendButton.disabled = approved === 0 || isSending;
     sendButton.textContent = isSending ? '正在串行发送...' : '发送已勾选';
+    const bulkDisabled = replyable === 0 || isGenerating || isSending;
+    document.getElementById('btn-review-select-all').disabled = bulkDisabled;
+    document.getElementById('btn-review-clear-all').disabled =
+      approved === 0 || isGenerating || isSending;
     const generateButton = document.getElementById('btn-review-generate');
     generateButton.disabled = isGenerating;
     generateButton.textContent = isGenerating ? '豆包生成中...' : '生成最近评论草稿';
@@ -1462,6 +1469,46 @@ function setDraftApproval(commentId, approved, checkbox) {
     loadReviewDrafts();
   }).catch(e => {
     showToast(`保存批准状态失败：${e}`, 'error');
+    loadReviewDrafts();
+  });
+}
+
+function setAllReplyableDrafts(approved) {
+  const button = document.getElementById(
+    approved ? 'btn-review-select-all' : 'btn-review-clear-all'
+  );
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = approved ? '正在全选...' : '正在清空...';
+  fetch('/api/review/drafts').then(r => r.json()).then(d => {
+    if (!d.ok) throw new Error(d.message || '读取草稿失败');
+    const commentIds = (d.drafts || []).filter(item => {
+      if (!item.should_reply || !String(item.reply || '').trim()) return false;
+      return approved
+        ? ['pending', 'approved', 'failed'].includes(item.status)
+        : item.approved && item.status === 'approved';
+    }).map(item => String(item.comment_id));
+    if (!commentIds.length) {
+      showToast(approved ? '没有可全选的候选回复' : '当前没有已勾选回复', 'info');
+      return null;
+    }
+    return fetch('/api/review/approve-bulk', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({comment_ids: commentIds, approved}),
+    });
+  }).then(response => response ? response.json() : null).then(result => {
+    if (!result) return;
+    if (!result.ok) throw new Error(result.message || '批量保存失败');
+    showToast(
+      approved ? `已全选 ${result.updated} 条可回复候选` : `已清空 ${result.updated} 条勾选`,
+      'success'
+    );
+  }).catch(e => {
+    showToast(`批量勾选失败：${e.message || e}`, 'error');
+  }).finally(() => {
+    button.disabled = false;
+    button.textContent = originalText;
     loadReviewDrafts();
   });
 }

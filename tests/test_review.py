@@ -76,6 +76,8 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertTrue(parsed[0]["should_reply"])
 
     def test_doubao_prompt_marks_follow_up_and_requires_new_value(self):
+        custom_prompt = "这是用户保存的自定义提示词：禁止使用哈哈。"
+        self.bot.config["ark"]["system_prompt"] = custom_prompt
         comment = bot_module.Comment(
             comment_id="1",
             content="谢谢哈哈",
@@ -113,8 +115,14 @@ class ReviewWorkflowTests(unittest.TestCase):
 
         payload = post.call_args.kwargs["json"]
         prompt = payload["input"][0]["content"][0]["text"]
+        self.assertEqual(
+            payload["instructions"],
+            custom_prompt,
+        )
+        self.assertNotIn(custom_prompt, prompt)
         self.assertIn('"is_follow_up": true', prompt)
         self.assertIn("纯“谢谢/收到/哈哈”", prompt)
+        self.assertIn("风格硬约束", prompt)
         self.assertFalse(result[0]["should_reply"])
 
     def test_regenerate_prompt_contains_previous_reply_and_requires_difference(self):
@@ -291,6 +299,45 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(item["context"][0].content, "之前的回复")
         self.assertEqual(item["previous_reply"], "豆包原文")
 
+    def test_bulk_approval_updates_replyable_drafts_in_one_save(self):
+        self.bot._review_drafts["1"] = self._draft("1", approved=False, status="pending")
+        self.bot._review_drafts["2"] = self._draft("2", approved=False, status="failed")
+
+        with patch.object(self.bot, "_save_review_drafts") as save:
+            selected = self.bot.set_review_approvals(["1", "2"], True)
+
+        self.assertEqual(selected, {"updated": 2, "approved": True})
+        self.assertEqual(self.bot._review_drafts["1"]["status"], "approved")
+        self.assertEqual(self.bot._review_drafts["2"]["status"], "approved")
+        save.assert_called_once()
+
+        with patch.object(self.bot, "_save_review_drafts") as save:
+            cleared = self.bot.set_review_approvals(["1", "2"], False)
+
+        self.assertEqual(cleared, {"updated": 2, "approved": False})
+        self.assertEqual(self.bot._review_drafts["1"]["status"], "pending")
+        self.assertEqual(self.bot._review_drafts["2"]["status"], "pending")
+        save.assert_called_once()
+
+    def test_bulk_approval_is_atomic_when_any_draft_is_not_replyable(self):
+        self.bot._review_drafts["1"] = self._draft("1", approved=False, status="pending")
+        self.bot._review_drafts["2"] = self._draft("2", approved=False, status="skipped")
+        self.bot._review_drafts["2"]["should_reply"] = False
+        self.bot._review_drafts["2"]["reply"] = ""
+
+        with self.assertRaisesRegex(ValueError, "没有可发送"):
+            self.bot.set_review_approvals(["1", "2"], True)
+
+        self.assertFalse(self.bot._review_drafts["1"]["approved"])
+        self.assertEqual(self.bot._review_drafts["1"]["status"], "pending")
+
+    def test_bulk_approval_is_blocked_during_active_review_operation(self):
+        self.bot._review_drafts["1"] = self._draft("1", approved=False, status="pending")
+
+        with self.bot._review_operation("sending"):
+            with self.assertRaisesRegex(ReviewOperationBusyError, "暂时不能批量"):
+                self.bot.set_review_approvals(["1"], True)
+
     def test_regenerate_retries_when_doubao_returns_same_reply(self):
         item = {
             "comment": bot_module.Comment(
@@ -412,8 +459,8 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["rate_limit"]["max_retries"], 3)
         self.assertEqual(DEFAULT_CONFIG["rate_limit"]["retry_delay"], 20)
         self.assertEqual(DEFAULT_CONFIG["reply"]["max_process"], 500)
-        self.assertIn("不要显得太过幼稚", DEFAULT_CONFIG["ark"]["system_prompt"])
-        self.assertIn("不要一直哈哈哈", DEFAULT_CONFIG["ark"]["system_prompt"])
+        self.assertIn("默认不要使用", DEFAULT_CONFIG["ark"]["system_prompt"])
+        self.assertIn("哈哈哈", DEFAULT_CONFIG["ark"]["system_prompt"])
 
     def test_verify_login_updates_uid_and_persists_identity(self):
         self.bot.config["bilibili"]["uid"] = ""

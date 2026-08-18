@@ -15,6 +15,10 @@ class ReviewApiTests(unittest.TestCase):
             "approved": True,
             "status": "approved",
         }
+        self.fake_bot.set_review_approvals.return_value = {
+            "updated": 2,
+            "approved": True,
+        }
         self.fake_bot.regenerate_review_draft.return_value = {
             "comment_id": "1",
             "approved": False,
@@ -54,6 +58,33 @@ class ReviewApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.fake_bot.set_review_approval.assert_not_called()
+
+    def test_bulk_approve_requires_explicit_ids_and_real_boolean(self):
+        missing_ids = self.client.post(
+            "/api/review/approve-bulk",
+            json={"approved": True},
+        )
+        invalid_approved = self.client.post(
+            "/api/review/approve-bulk",
+            json={"comment_ids": ["1"], "approved": "true"},
+        )
+
+        self.assertEqual(missing_ids.status_code, 400)
+        self.assertEqual(invalid_approved.status_code, 400)
+        self.fake_bot.set_review_approvals.assert_not_called()
+
+    def test_bulk_approve_passes_only_explicit_ids(self):
+        response = self.client.post(
+            "/api/review/approve-bulk",
+            json={"comment_ids": ["1", "2"], "approved": True},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["updated"], 2)
+        self.fake_bot.set_review_approvals.assert_called_once_with(
+            ["1", "2"],
+            True,
+        )
 
     def test_regenerate_requires_comment_id(self):
         response = self.client.post("/api/review/regenerate", json={})

@@ -93,7 +93,7 @@ DEFAULT_CONFIG = {
         "max_concurrency": 16,
         "max_retries": 5,
         "retry_base_seconds": 2.0,
-        "system_prompt": "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实，同时不要显得太过幼稚，不要一直哈哈哈。",
+        "system_prompt": "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实。默认不要使用“哈哈”“哈哈哈”“笑死”“绷不住”等幼稚或重复的口头禅；只有观众原话明确在开玩笑，而且确实需要接梗时，才可以偶尔使用一次。",
     },
     "reply": {
         "enabled": True,
@@ -1009,6 +1009,47 @@ class BiliCommentBot:
             self._save_review_drafts()
             return dict(draft)
 
+    def set_review_approvals(self, comment_ids: List[str], approved: bool) -> dict:
+        """原子地批量修改批准状态；不访问 B站接口。"""
+        normalized_ids = list(dict.fromkeys(
+            str(comment_id).strip()
+            for comment_id in comment_ids
+            if str(comment_id).strip()
+        ))
+        if not normalized_ids:
+            raise ValueError("必须明确提交至少一个 comment_id")
+
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            if any(self._active_review_operations.values()):
+                raise ReviewOperationBusyError(
+                    "当前有生成、重新生成或发送任务，暂时不能批量修改勾选"
+                )
+            with self._review_lock:
+                drafts = []
+                for comment_id in normalized_ids:
+                    draft = self._review_drafts.get(comment_id)
+                    if not draft:
+                        raise KeyError(f"草稿不存在: {comment_id}")
+                    if not draft.get("should_reply") or not str(draft.get("reply") or "").strip():
+                        raise ValueError(f"该评论没有可发送的候选回复: {comment_id}")
+                    if draft.get("status") in {
+                        "sent", "skipped", "regenerating", "sending", "send_unknown"
+                    }:
+                        raise ValueError(
+                            f"该回复当前不能更改批准状态: {comment_id}"
+                        )
+                    drafts.append(draft)
+
+                for draft in drafts:
+                    draft["approved"] = bool(approved)
+                    draft["status"] = "approved" if approved else "pending"
+                self._save_review_drafts()
+                return {
+                    "updated": len(drafts),
+                    "approved": bool(approved),
+                }
+
     def regenerate_review_draft(self, comment_id: str) -> dict:
         """使用当前最新配置重新生成单条候选回复，不访问 B站接口。"""
         comment_id = str(comment_id)
@@ -1691,9 +1732,7 @@ class BiliCommentBot:
                 ],
             })
 
-        prompt = f"""{system_prompt}
-
-请处理下面这批评论。
+        prompt = f"""请处理下面这批评论。
 
 判断规则：
 1. 只有容易理解、容易自然回应、不容易犯错的评论才 should_reply=true。
@@ -1704,6 +1743,7 @@ class BiliCommentBot:
 6. reply 必须是可直接发出的豆包原文，通常不超过60个汉字；不要加“回复：”、引号、分析或备选项。
 7. 不要编造视频和评论里没有的事实。
 8. regenerate=true 表示用户不满意旧回复。必须重新组织表达，不能与 previous_reply 或 avoid_replies 中的内容相同，也不能只替换标点、语气词或少量近义词。
+9. 风格硬约束：默认不要使用“哈哈”“哈哈哈”“笑死”“绷不住”等幼稚或重复口头禅。只有观众原话明确在开玩笑且回复确实需要接梗时，才可以偶尔使用一次；拿不准就不用。
 
 只输出严格 JSON 数组：
 [{{"id":"评论id","should_reply":true,"reply":"直接回复正文","reason":"简短判断"}}]
@@ -1714,6 +1754,7 @@ class BiliCommentBot:
 """
         request_payload = {
             "model": model,
+            "instructions": system_prompt,
             "input": [{
                 "role": "user",
                 "content": [{"type": "input_text", "text": prompt}],
@@ -2215,12 +2256,14 @@ class BiliCommentBot:
             float(ark_config.get("request_interval_seconds", 0.15)),
         )
         self.logger.info(
-            "开始豆包生成：共%s条，%s批，每批最多%s条，最大并发%s，请求起始间隔%.2f秒",
+            "开始豆包生成：共%s条，%s批，每批最多%s条，最大并发%s，请求起始间隔%.2f秒；"
+            "自定义提示词%s字，将作为 Responses API instructions 发送",
             len(items),
             len(batches),
             batch_size,
             min(len(batches), max_concurrency),
             request_interval,
+            len(str(ark_config.get("system_prompt") or "")),
         )
         completed_items = 0
         completed_batches = 0

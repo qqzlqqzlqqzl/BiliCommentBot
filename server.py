@@ -733,6 +733,26 @@ def api_review_approve():
         return jsonify({"ok": False, "message": str(e)}), 400
 
 
+@app.route("/api/review/approve-bulk", methods=["POST"])
+def api_review_approve_bulk():
+    data = request.get_json(silent=True) or {}
+    comment_ids = data.get("comment_ids")
+    if not isinstance(comment_ids, list) or not comment_ids:
+        return jsonify({
+            "ok": False,
+            "message": "必须明确提交至少一个 comment_id",
+        }), 400
+    if not isinstance(data.get("approved"), bool):
+        return jsonify({"ok": False, "message": "approved 必须是布尔值"}), 400
+    try:
+        result = get_bot().set_review_approvals(comment_ids, data["approved"])
+        return jsonify({"ok": True, **result})
+    except ReviewOperationBusyError as e:
+        return jsonify({"ok": False, "message": str(e)}), 409
+    except (KeyError, ValueError) as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+
+
 @app.route("/api/review/regenerate", methods=["POST"])
 def api_review_regenerate():
     data = request.get_json(silent=True) or {}
