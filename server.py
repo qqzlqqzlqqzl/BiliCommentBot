@@ -726,10 +726,28 @@ def api_history_clear():
 @app.route("/api/review/drafts", methods=["GET"])
 def api_review_drafts():
     bot = get_bot()
-    drafts = bot.get_review_drafts()
+    all_drafts = bot.get_review_drafts()
+    review_time_range = str(request.args.get("review_time_range") or "").strip()
+    review_since = str(request.args.get("review_since") or "").strip()
+    try:
+        since_timestamp = BiliCommentBot._resolve_review_since(
+            review_since,
+            review_time_range,
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+    drafts = all_drafts
+    if since_timestamp is not None:
+        drafts = [
+            draft
+            for draft in all_drafts
+            if int(draft.get("comment_time") or 0) >= since_timestamp
+        ]
     return jsonify({
         "ok": True,
         "total": len(drafts),
+        "total_all": len(all_drafts),
+        "since_timestamp": since_timestamp,
         "drafts": drafts,
         "operations": bot.get_review_operation_status(),
     })

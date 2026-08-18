@@ -92,6 +92,9 @@ class ProductAppTests(unittest.TestCase):
         self.assertIn('id="cfg-rate_limit-retry_delay" value="20"', template)
         self.assertNotIn('id="cfg-bilibili-uid"', template)
         self.assertIn("review_time_range: reviewTimeRange", template)
+        self.assertIn("function reviewDraftsUrl()", template)
+        self.assertIn("fetch(reviewDraftsUrl())", template)
+        self.assertIn("当前时间范围", template)
         self.assertIn("连续 3 页没有新增待生成评论", template)
         save_config_body = template.split(
             "function saveConfig()", 1

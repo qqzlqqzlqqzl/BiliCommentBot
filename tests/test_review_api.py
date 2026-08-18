@@ -30,6 +30,9 @@ class ReviewApiTests(unittest.TestCase):
             "replyable": 1,
             "skipped": 1,
         }
+        self.fake_bot.get_review_operation_status.return_value = {
+            "active": {"generating": 0, "sending": 0}
+        }
         self.fake_bot.reload_config.return_value = True
         self.fake_bot.start.return_value = True
         self.fake_bot.stop.return_value = True
@@ -38,6 +41,40 @@ class ReviewApiTests(unittest.TestCase):
 
     def tearDown(self):
         self.bot_patch.stop()
+
+    def test_draft_list_filters_existing_drafts_by_relative_time_range(self):
+        self.fake_bot.get_review_drafts.return_value = [
+            {"comment_id": "new", "comment_time": 1_999_999},
+            {"comment_id": "old", "comment_time": 1_900_000},
+        ]
+
+        with patch.object(server.time, "time", return_value=2_000_000):
+            response = self.client.get(
+                "/api/review/drafts?review_time_range=24h"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["total_all"], 2)
+        self.assertEqual(
+            payload["since_timestamp"],
+            2_000_000 - 24 * 60 * 60,
+        )
+        self.assertEqual(
+            [draft["comment_id"] for draft in payload["drafts"]],
+            ["new"],
+        )
+
+    def test_draft_list_rejects_unknown_time_range(self):
+        self.fake_bot.get_review_drafts.return_value = []
+
+        response = self.client.get(
+            "/api/review/drafts?review_time_range=yesterday-ish"
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(response.get_json()["ok"])
 
     def test_send_requires_explicit_nonempty_comment_ids(self):
         missing = self.client.post("/api/review/send", json={})

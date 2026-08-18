@@ -103,6 +103,13 @@ try {
         throw "页面默认读取数量不是 500"
     }
     if (
+        $page.Content -notmatch '连续 3 页没有新增待生成评论' -or
+        $page.Content -notmatch 'review_time_range: reviewTimeRange' -or
+        $page.Content -notmatch '/api/review/preferences'
+    ) {
+        throw "页面缺少三页停止或后台时间范围持久化逻辑"
+    }
+    if (
         $page.Content -notmatch 'id="btn-review-select-all"' -or
         $page.Content -notmatch 'id="btn-review-clear-all"' -or
         $page.Content -notmatch '/api/review/approve-bulk' -or
@@ -132,12 +139,31 @@ try {
     $defaultConfig = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
     if (
         [int]$defaultConfig.config.bilibili.check_interval -ne 600 -or
+        [bool]$defaultConfig.config.bilibili.auto_start_monitor -ne $false -or
         [double]$defaultConfig.config.rate_limit.min_request_interval -ne 10 -or
         [int]$defaultConfig.config.rate_limit.max_retries -ne 3 -or
         [int]$defaultConfig.config.rate_limit.retry_delay -ne 20 -or
         [int]$defaultConfig.config.reply.max_process -ne 500
     ) {
         throw "发布 EXE 的默认参数未恢复为 500/600/10/3/20"
+    }
+    $preferences = Post-Json "$baseUrl/api/review/preferences" @{
+        limit = 100
+        review_time_range = "24h"
+        review_since = ""
+    }
+    if (-not $preferences.ok) {
+        throw "审核读取偏好保存失败"
+    }
+    $preferenceConfig = Invoke-RestMethod `
+        -Uri "$baseUrl/api/config" `
+        -TimeoutSec 10
+    if (
+        [int]$preferenceConfig.config.reply.max_process -ne 100 -or
+        [string]$preferenceConfig.config.reply.review_time_range -ne "24h" -or
+        [string]$preferenceConfig.config.reply.review_since -ne ""
+    ) {
+        throw "审核读取数量或24小时时间范围没有按账号持久化"
     }
     if (
         [string]$defaultConfig.config.ark.system_prompt -notmatch "默认不要使用" -or
@@ -151,9 +177,30 @@ try {
             cookie = "SESSDATA=smoke-secret"
         }
         ark = @{ api_key = "smoke-ark-secret" }
+        reply = @{ enabled = $false }
     }
     if (-not $saved.ok) {
         throw "账号 1 配置保存失败"
+    }
+    $monitorStart = Post-Json "$baseUrl/api/bot/start" @{}
+    if (-not $monitorStart.ok) {
+        throw "草稿监控启动失败"
+    }
+    $monitorConfig = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
+    $monitorStatus = Invoke-RestMethod -Uri "$baseUrl/api/bot/status" -TimeoutSec 10
+    if (
+        [bool]$monitorConfig.config.bilibili.auto_start_monitor -ne $true -or
+        -not [bool]$monitorStatus.running
+    ) {
+        throw "草稿监控开启状态没有持久化"
+    }
+    $monitorStop = Post-Json "$baseUrl/api/bot/stop" @{}
+    if (-not $monitorStop.ok) {
+        throw "草稿监控停止失败"
+    }
+    $monitorConfig = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
+    if ([bool]$monitorConfig.config.bilibili.auto_start_monitor -ne $false) {
+        throw "草稿监控关闭状态没有持久化"
     }
 
     $created = Post-Json "$baseUrl/api/accounts" @{ name = "烟测账号 2" }
@@ -242,6 +289,9 @@ try {
         ExePid = $runtime.pid
         Port = $runtime.port
         ReleaseHardLimit = 50000
+        ReviewPreferenceLimit = $preferenceConfig.config.reply.max_process
+        ReviewPreferenceRange = $preferenceConfig.config.reply.review_time_range
+        MonitorPreferencePersisted = $true
         AccountCount = $manifest.accounts.Count
         LocalSocketClient = $true
         SecretsRedacted = $true

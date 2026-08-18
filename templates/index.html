@@ -1271,8 +1271,21 @@ function reviewStatusBadge(item) {
   return `<span class="badge ${cls}">${escHtml(reviewStatusLabel(item))}</span>`;
 }
 
+function reviewDraftsUrl() {
+  const payload = reviewPreferencesPayload();
+  const params = new URLSearchParams();
+  if (payload.review_time_range) {
+    params.set('review_time_range', payload.review_time_range);
+  }
+  if (payload.review_since) {
+    params.set('review_since', payload.review_since);
+  }
+  const query = params.toString();
+  return `/api/review/drafts${query ? `?${query}` : ''}`;
+}
+
 function loadReviewDrafts(retryOnNetworkError = true) {
-  fetch('/api/review/drafts').then(r => r.json()).then(d => {
+  fetch(reviewDraftsUrl()).then(r => r.json()).then(d => {
     if (!d.ok) {
       showToast(d.message || '读取审核草稿失败', 'error');
       return;
@@ -1285,8 +1298,12 @@ function loadReviewDrafts(retryOnNetworkError = true) {
     const activeOperations = (d.operations && d.operations.active) || {};
     const isGenerating = Number(activeOperations.generating || 0) > 0;
     const isSending = Number(activeOperations.sending || 0) > 0;
+    const totalAll = Number(d.total_all ?? items.length);
+    const rangeSummary = totalAll === items.length
+      ? `共 ${items.length} 条`
+      : `当前时间范围 ${items.length} 条（全部 ${totalAll} 条）`;
     document.getElementById('review-summary').textContent =
-      `共 ${items.length} 条，可审核 ${replyable} 条，已勾选 ${approved} 条`
+      `${rangeSummary}，可审核 ${replyable} 条，已勾选 ${approved} 条`
       + (isSending ? '，正在串行发送' : '')
       + (isGenerating ? '，正在生成草稿' : '');
     const sendButton = document.getElementById('btn-review-send');
@@ -1456,6 +1473,7 @@ function updateReviewTimeRange() {
     sinceInput.value = localDateTimeValue(new Date(Date.now() - milliseconds));
   }
   saveReviewPreferences().catch(() => {});
+  loadReviewDrafts();
 }
 
 function selectedReviewSince() {
@@ -1521,7 +1539,7 @@ function setAllReplyableDrafts(approved) {
   const originalText = button.textContent;
   button.disabled = true;
   button.textContent = approved ? '正在全选...' : '正在清空...';
-  fetch('/api/review/drafts').then(r => r.json()).then(d => {
+  fetch(reviewDraftsUrl()).then(r => r.json()).then(d => {
     if (!d.ok) throw new Error(d.message || '读取草稿失败');
     const commentIds = (d.drafts || []).filter(item => {
       if (!item.should_reply || !String(item.reply || '').trim()) return false;
@@ -1580,7 +1598,7 @@ function regenerateDraft(commentId, button) {
 }
 
 function sendApprovedDrafts() {
-  fetch('/api/review/drafts').then(r => r.json()).then(d => {
+  fetch(reviewDraftsUrl()).then(r => r.json()).then(d => {
     if (!d.ok) throw new Error(d.message || '读取草稿失败');
     const approved = (d.drafts || []).filter(item => item.approved && item.status === 'approved');
     if (!approved.length) {
