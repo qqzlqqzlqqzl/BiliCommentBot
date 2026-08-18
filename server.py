@@ -875,10 +875,33 @@ def api_review_send():
     if not isinstance(comment_ids, list) or not comment_ids:
         return jsonify({"ok": False, "message": "必须明确提交至少一个已批准的 comment_id"}), 400
     try:
-        result = get_bot().send_approved_drafts(comment_ids=comment_ids)
+        config = load_config()
+        reply_config = config.get("reply") or {}
+        saved_since = BiliCommentBot._resolve_review_since(
+            reply_config.get("review_since", ""),
+            reply_config.get("review_time_range", ""),
+        )
+        submitted_since = None
+        if "review_since" in data or "review_time_range" in data:
+            submitted_since = BiliCommentBot._resolve_review_since(
+                data.get("review_since", ""),
+                data.get("review_time_range", ""),
+            )
+        cutoffs = [
+            cutoff
+            for cutoff in (saved_since, submitted_since)
+            if cutoff is not None
+        ]
+        since_timestamp = max(cutoffs) if cutoffs else None
+        result = get_bot().send_approved_drafts(
+            comment_ids=comment_ids,
+            since_timestamp=since_timestamp,
+        )
         return jsonify({"ok": True, **result})
     except ReviewOperationBusyError as e:
         return jsonify({"ok": False, "message": str(e)}), 409
+    except ValueError as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
     except Exception as e:
         return jsonify({"ok": False, "message": str(e)}), 500
 

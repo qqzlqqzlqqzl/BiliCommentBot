@@ -1612,7 +1612,10 @@ function sendApprovedDrafts() {
     fetch('/api/review/send', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({comment_ids: approved.map(item => String(item.comment_id))}),
+      body: JSON.stringify({
+        comment_ids: approved.map(item => String(item.comment_id)),
+        ...reviewPreferencesPayload(),
+      }),
     }).then(r => r.json()).then(result => {
       if (result.ok) {
         const unknown = Number(result.unknown || 0);

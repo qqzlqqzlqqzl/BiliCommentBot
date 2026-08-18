@@ -38,8 +38,18 @@ class ReviewApiTests(unittest.TestCase):
         self.fake_bot.stop.return_value = True
         self.bot_patch = patch.object(server, "get_bot", return_value=self.fake_bot)
         self.bot_patch.start()
+        self.config_patch = patch.object(
+            server,
+            "load_config",
+            return_value={
+                "reply": {"review_time_range": "", "review_since": ""},
+                "bilibili": {},
+            },
+        )
+        self.config_patch.start()
 
     def tearDown(self):
+        self.config_patch.stop()
         self.bot_patch.stop()
 
     def test_draft_list_filters_existing_drafts_by_relative_time_range(self):
@@ -88,7 +98,58 @@ class ReviewApiTests(unittest.TestCase):
         response = self.client.post("/api/review/send", json={"comment_ids": ["1"]})
 
         self.assertEqual(response.status_code, 200)
-        self.fake_bot.send_approved_drafts.assert_called_once_with(comment_ids=["1"])
+        self.fake_bot.send_approved_drafts.assert_called_once_with(
+            comment_ids=["1"],
+            since_timestamp=None,
+        )
+
+    def test_send_enforces_stricter_submitted_time_range(self):
+        with patch.object(server.time, "time", return_value=2_000_000):
+            response = self.client.post(
+                "/api/review/send",
+                json={
+                    "comment_ids": ["1"],
+                    "review_time_range": "24h",
+                    "review_since": "",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.fake_bot.send_approved_drafts.assert_called_once_with(
+            comment_ids=["1"],
+            since_timestamp=2_000_000 - 24 * 60 * 60,
+        )
+
+    def test_send_cannot_bypass_saved_time_range_with_empty_request_range(self):
+        self.config_patch.stop()
+        with (
+            patch.object(
+                server,
+                "load_config",
+                return_value={
+                    "reply": {
+                        "review_time_range": "24h",
+                        "review_since": "",
+                    }
+                },
+            ),
+            patch.object(server.time, "time", return_value=2_000_000),
+        ):
+            response = self.client.post(
+                "/api/review/send",
+                json={
+                    "comment_ids": ["1"],
+                    "review_time_range": "",
+                    "review_since": "",
+                },
+            )
+        self.config_patch.start()
+
+        self.assertEqual(response.status_code, 200)
+        self.fake_bot.send_approved_drafts.assert_called_once_with(
+            comment_ids=["1"],
+            since_timestamp=2_000_000 - 24 * 60 * 60,
+        )
 
     def test_approve_requires_real_boolean(self):
         response = self.client.post(

@@ -2458,7 +2458,11 @@ class BiliCommentBot:
         })
         return {"generated": generated, "replyable": replyable, "skipped": skipped}
 
-    def send_approved_drafts(self, comment_ids: List[str] = None) -> dict:
+    def send_approved_drafts(
+        self,
+        comment_ids: List[str] = None,
+        since_timestamp: int = None,
+    ) -> dict:
         self._ensure_review_operation_state()
         with self._review_operation(
             "sending",
@@ -2468,11 +2472,30 @@ class BiliCommentBot:
                 str(value) for value in comment_ids
             }
             with self._review_lock:
+                range_excluded_ids = [
+                    str(draft["comment_id"])
+                    for draft in self._review_drafts.values()
+                    if draft.get("approved")
+                    and draft.get("status") == "approved"
+                    and requested is not None
+                    and str(draft["comment_id"]) in requested
+                    and since_timestamp is not None
+                    and int(draft.get("comment_time") or 0) < since_timestamp
+                ]
+                if range_excluded_ids:
+                    raise ValueError(
+                        f"有{len(range_excluded_ids)}条已勾选草稿超出当前时间范围，"
+                        "请刷新列表后重新确认"
+                    )
                 draft_ids = [
                     str(draft["comment_id"])
                     for draft in self._review_drafts.values()
                     if draft.get("approved")
                     and draft.get("status") == "approved"
+                    and (
+                        since_timestamp is None
+                        or int(draft.get("comment_time") or 0) >= since_timestamp
+                    )
                     and (
                         requested is None
                         or str(draft["comment_id"]) in requested

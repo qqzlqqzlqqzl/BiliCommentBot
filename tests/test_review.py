@@ -625,6 +625,24 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(self.bot._review_drafts["1"]["status"], "sent")
         self.assertEqual(self.bot._review_drafts["3"]["status"], "approved")
 
+    def test_send_rejects_approved_draft_outside_time_range_atomically(self):
+        recent = self._draft("1", approved=True, status="approved")
+        recent["comment_time"] = 200
+        old = self._draft("2", approved=True, status="approved")
+        old["comment_time"] = 100
+        self.bot._review_drafts["1"] = recent
+        self.bot._review_drafts["2"] = old
+
+        with self.assertRaisesRegex(ValueError, "超出当前时间范围"):
+            self.bot.send_approved_drafts(
+                comment_ids=["1", "2"],
+                since_timestamp=150,
+            )
+
+        self.bot.reply_comment.assert_not_called()
+        self.assertEqual(self.bot._review_drafts["1"]["status"], "approved")
+        self.assertEqual(self.bot._review_drafts["2"]["status"], "approved")
+
     def test_send_marks_draft_sending_on_disk_before_bilibili_request(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
         observed = {}
