@@ -91,6 +91,23 @@ class ProductAppTests(unittest.TestCase):
         )
         self.assertIn('id="cfg-rate_limit-retry_delay" value="20"', template)
         self.assertNotIn('id="cfg-bilibili-uid"', template)
+
+    def test_add_account_starts_qr_login_without_manual_name(self):
+        template = (
+            Path(__file__).resolve().parents[1] / "templates" / "index.html"
+        ).read_text(encoding="utf-8")
+        create_account_body = template.split(
+            "async function createAccount()", 1
+        )[1].split("function importAccount()", 1)[0]
+
+        self.assertNotIn("prompt(", create_account_body)
+        self.assertIn("body: JSON.stringify({})", create_account_body)
+        self.assertIn("await loadAccounts()", create_account_body)
+        self.assertIn("navigateTo('login')", create_account_body)
+        self.assertIn("await generateQR(true)", create_account_body)
+        self.assertIn("B站扫码登录", template)
+        self.assertNotIn("微信扫码登录 B 站", template)
+        self.assertIn("d.code < 0 || d.code === 86038", template)
         self.assertNotIn('data-tab="tab-auth"', template)
         self.assertNotIn('id="cfg-auth-enabled"', template)
 

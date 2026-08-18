@@ -730,9 +730,9 @@
     <div class="page" id="page-login">
       <div class="page-title"><span class="icon">🔑</span>扫码登录</div>
       <div class="card" style="max-width:500px">
-        <div class="card-title">微信扫码登录 B 站</div>
+        <div class="card-title">B站扫码登录</div>
         <p style="font-size:14px;color:var(--text2);margin-bottom:20px">
-          点击「生成二维码」后，使用 B站 App 扫码登录。Cookie 获取成功后会自动填入配置并保存。
+          使用 B站 App 扫码并在手机上确认。登录成功后会自动保存登录状态、绑定 UID，并显示该账号的 B站昵称。
         </p>
         <button class="btn btn-primary" id="btn-gen-qr" onclick="generateQR()">📱 生成二维码</button>
         <div id="qr-container" style="margin-top:20px"></div>
@@ -856,18 +856,28 @@ function selectAccount(accountId) {
   });
 }
 
-function createAccount() {
-  const name = prompt('新账号名称：');
-  if (name === null) return;
-  fetch('/api/accounts', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({name}),
-  }).then(async response => {
+async function createAccount() {
+  const btn = document.getElementById('btn-add-account');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  try {
+    const response = await fetch('/api/accounts', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({}),
+    });
     const data = await response.json();
     if (!response.ok || !data.ok) throw new Error(data.message || '添加账号失败');
-    location.reload();
-  }).catch(error => showToast(error.message, 'error'));
+    await loadAccounts();
+    document.getElementById('qr-container').innerHTML = '';
+    navigateTo('login');
+    showToast('新账号已创建，请使用 B站 App 扫码', 'success');
+    await generateQR(true);
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function importAccount() {
@@ -914,6 +924,9 @@ socket.on('qr_status', d => {
     if (d.code === 0) el.style.color = 'var(--green)';
     else if (d.code < 0 || d.code === 86038) el.style.color = 'var(--red)';
     else el.style.color = 'var(--accent2)';
+  }
+  if (d.code < 0 || d.code === 86038) {
+    document.getElementById('btn-gen-qr').disabled = false;
   }
 });
 socket.on('qr_cookie', d => {
@@ -1573,12 +1586,18 @@ function sendApprovedDrafts() {
 }
 
 // ── 扫码登录 ──
-function generateQR() {
+async function generateQR(force = false) {
   const btn = document.getElementById('btn-gen-qr');
+  if (btn.disabled && !force) return;
   btn.disabled = true;
   const container = document.getElementById('qr-container');
   container.innerHTML = '<span style="color:var(--text2)">生成中...</span>';
-  fetch('/api/qr/generate', {method:'POST'}).then(r=>r.json()).then(d=>{
+  try {
+    const response = await fetch('/api/qr/generate', {method:'POST'});
+    const d = await response.json();
+    if (!response.ok || !d.ok) {
+      throw new Error(d.message || '二维码生成失败');
+    }
     if (d.ok) {
       qrAccountId = String(d.account_id || currentAccountId);
       container.innerHTML = `
@@ -1587,14 +1606,11 @@ function generateQR() {
           <div id="qr-status" class="qr-status" style="color:var(--accent2)">等待扫码...</div>
           <div style="font-size:12px;color:var(--text2);margin-top:8px">请使用 B站 App 扫码，有效期 3 分钟</div>
         </div>`;
-    } else {
-      container.innerHTML = `<div class="alert alert-danger">${d.message}</div>`;
-      btn.disabled = false;
     }
-  }).catch(e => {
-    container.innerHTML = `<div class="alert alert-danger">请求失败: ${e}</div>`;
+  } catch (error) {
+    container.innerHTML = `<div class="alert alert-danger">${escHtml(error.message || error)}</div>`;
     btn.disabled = false;
-  });
+  }
 }
 
 // ── 历史记录 ──

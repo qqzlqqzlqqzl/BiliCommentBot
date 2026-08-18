@@ -57,6 +57,17 @@ class ServerAccountApiTests(unittest.TestCase):
             first_id,
         )
 
+    def test_creates_pending_login_account_without_manual_name(self):
+        response = self.client.post("/api/accounts", json={})
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["account"]["name"], "待登录账号")
+        self.assertEqual(
+            self.client.get("/api/accounts").get_json()["current_account_id"],
+            payload["account"]["id"],
+        )
+
     def test_imports_legacy_account_through_api(self):
         with tempfile.TemporaryDirectory() as source_dir:
             with open(
@@ -155,6 +166,62 @@ class ServerAccountApiTests(unittest.TestCase):
             if item["id"] == account_id
         )
         self.assertEqual(account["name"], "喵酱第一")
+
+    def test_qr_login_pipeline_saves_cookie_uid_and_detected_name(self):
+        account = self.client.post("/api/accounts", json={}).get_json()["account"]
+        emitted = []
+
+        class FakeResponse:
+            @staticmethod
+            def json():
+                return {
+                    "data": {
+                        "code": 0,
+                        "url": "https://passport.bilibili.com/?bili_jct=csrf-token",
+                    }
+                }
+
+        class FakeSession:
+            cookies = {"SESSDATA": "session-token"}
+
+            @staticmethod
+            def get(*args, **kwargs):
+                return FakeResponse()
+
+        class FakeBot:
+            @staticmethod
+            def verify_login():
+                server._save_identity(
+                    "3546589337487797",
+                    "扫码识别昵称",
+                    account["id"],
+                )
+                return {"valid": True, "user_info": {"mid": "3546589337487797"}}
+
+        with (
+            patch.object(server, "get_bot", return_value=FakeBot()),
+            patch.object(
+                server,
+                "_emit_qr",
+                side_effect=lambda event, account_id, payload: emitted.append(
+                    (event, account_id, payload)
+                ),
+            ),
+        ):
+            server._poll_qr_login(account["id"], "qr-key", FakeSession())
+
+        config = server.load_config(account["id"])
+        saved_account = next(
+            item
+            for item in self.client.get("/api/accounts").get_json()["accounts"]
+            if item["id"] == account["id"]
+        )
+        self.assertIn("SESSDATA=session-token", config["bilibili"]["cookie"])
+        self.assertIn("bili_jct=csrf-token", config["bilibili"]["cookie"])
+        self.assertEqual(config["bilibili"]["uid"], "3546589337487797")
+        self.assertEqual(saved_account["name"], "扫码识别昵称")
+        self.assertEqual(emitted[-1][0], "qr_cookie")
+        self.assertEqual(emitted[-1][1], account["id"])
 
     def test_config_get_does_not_return_saved_secrets(self):
         self.client.post(

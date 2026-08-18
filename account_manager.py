@@ -172,14 +172,27 @@ class AccountManager:
         if any(operations.get("active", {}).values()):
             raise AccountBusyError("当前账号有审核任务正在执行，暂时不能切换")
 
+    def _pending_account_name(self) -> str:
+        existing_names = {
+            str(account.get("name") or "").strip()
+            for account in self._manifest["accounts"]
+        }
+        base_name = "待登录账号"
+        if base_name not in existing_names:
+            return base_name
+        suffix = 2
+        while f"{base_name} {suffix}" in existing_names:
+            suffix += 1
+        return f"{base_name} {suffix}"
+
     def create_account(self, name: str) -> dict:
         clean_name = str(name or "").strip()
-        if not clean_name:
-            raise ValueError("账号名称不能为空")
         if len(clean_name) > 40:
             raise ValueError("账号名称不能超过 40 个字符")
         with self._lock:
             self._assert_current_idle()
+            if not clean_name:
+                clean_name = self._pending_account_name()
             account = {
                 "id": self._new_account_id(),
                 "name": clean_name,

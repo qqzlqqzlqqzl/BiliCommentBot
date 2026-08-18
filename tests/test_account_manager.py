@@ -75,6 +75,17 @@ class AccountManagerTests(unittest.TestCase):
             os.path.normcase(second_bot.account["data_dir"]),
         )
 
+    def test_empty_account_name_creates_unique_pending_login_names(self):
+        first_pending = self.manager.create_account("")
+        second_pending = self.manager.create_account("   ")
+
+        self.assertEqual(first_pending["name"], "待登录账号")
+        self.assertEqual(second_pending["name"], "待登录账号 2")
+        self.assertEqual(
+            self.manager.current_account_id(),
+            second_pending["id"],
+        )
+
     def test_rename_account_persists_detected_bilibili_name(self):
         account_id = self.manager.current_account_id()
 
