@@ -133,6 +133,16 @@ try {
     ) {
         throw "回复审核工具栏分组、普通按钮配色或默认日间主题不正确"
     }
+    if (
+        $page.Content -notmatch 'class="help-tooltip"' -or
+        $page.Content -notmatch 'function initHelpTooltips\(\)' -or
+        $page.Content -notmatch '只重新读取本机已保存的审核草稿和状态' -or
+        $page.Content -notmatch '它不受左侧“显示”筛选影响' -or
+        $page.Content -notmatch '勾选只代表批准这条候选，不会立即发送' -or
+        $page.Content -notmatch '阻止后续扫描再次生成'
+    ) {
+        throw "回复审核页面缺少关键功能的真实影响范围悬浮说明"
+    }
     try {
         Post-Json "$baseUrl/api/review/dismiss" @{
             comment_id = ""
