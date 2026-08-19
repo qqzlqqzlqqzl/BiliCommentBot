@@ -580,7 +580,7 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(result, {"sent": 0, "failed": 0, "unknown": 0})
         self.bot.reply_comment.assert_not_called()
 
-    def test_reply_comment_sends_doubao_text_without_configured_prefix(self):
+    def test_reply_comment_sends_doubao_text_and_targets_current_comment(self):
         reply_bot = BiliCommentBot.__new__(BiliCommentBot)
         reply_bot.config = copy.deepcopy(DEFAULT_CONFIG)
         reply_bot.config["reply"]["prefix"] = "不应发送的前缀"
@@ -599,11 +599,14 @@ class ReviewWorkflowTests(unittest.TestCase):
             "BV1test",
             "100",
             "豆包原始候选",
+            root_id="900",
         )
 
         self.assertTrue(result.ok)
         sent_data = reply_bot.make_request_with_retry.call_args.kwargs["data"]
         self.assertEqual(sent_data["message"], "豆包原始候选")
+        self.assertEqual(sent_data["root"], "900")
+        self.assertEqual(sent_data["parent"], "100")
 
     def test_only_explicitly_approved_requested_draft_is_sent(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
@@ -618,12 +621,32 @@ class ReviewWorkflowTests(unittest.TestCase):
             "1",
             "豆包原文",
             root_id=None,
-            parent_id=None,
             oid=None,
             comment_type=1,
         )
         self.assertEqual(self.bot._review_drafts["1"]["status"], "sent")
         self.assertEqual(self.bot._review_drafts["3"]["status"], "approved")
+
+    def test_child_reply_is_sent_to_child_not_its_existing_parent(self):
+        draft = self._draft("200", approved=True, status="approved")
+        draft.update({
+            "root_id": "100",
+            "parent_id": "100",
+            "depth": 1,
+        })
+        self.bot._review_drafts["200"] = draft
+
+        result = self.bot.send_approved_drafts(comment_ids=["200"])
+
+        self.assertEqual(result, {"sent": 1, "failed": 0, "unknown": 0})
+        self.bot.reply_comment.assert_called_once_with(
+            "BV1test",
+            "200",
+            "豆包原文",
+            root_id="100",
+            oid=None,
+            comment_type=1,
+        )
 
     def test_send_rejects_approved_draft_outside_time_range_atomically(self):
         recent = self._draft("1", approved=True, status="approved")
@@ -818,7 +841,6 @@ class ReviewWorkflowTests(unittest.TestCase):
             "501",
             "豆包候选回复",
             root_id=None,
-            parent_id=None,
             oid="9501",
             comment_type=1,
         )

@@ -2097,7 +2097,6 @@ class BiliCommentBot:
         comment_id: str,
         content: str,
         root_id: str = None,
-        parent_id: str = None,
         oid: str = None,
         comment_type: int = 1,
     ) -> ReplyAttemptResult:
@@ -2118,7 +2117,8 @@ class BiliCommentBot:
             self.logger.error(f"无法确定评论所属稿件: comment_id={comment_id}")
             return ReplyAttemptResult(False, False, "无法确定评论所属稿件")
         root = root_id if root_id else comment_id
-        parent = parent_id if parent_id else comment_id
+        # parent 表示本次要回复的目标评论，而不是目标评论原来的上级。
+        parent = comment_id
 
         data = {
             "type": int(comment_type or 1),
@@ -2538,11 +2538,6 @@ class BiliCommentBot:
                     draft["reply"],
                     root_id=(
                         draft.get("root_id")
-                        if draft.get("depth", 0) > 0
-                        else None
-                    ),
-                    parent_id=(
-                        draft.get("parent_id")
                         if draft.get("depth", 0) > 0
                         else None
                     ),
