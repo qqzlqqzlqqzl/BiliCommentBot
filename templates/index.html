@@ -4,9 +4,33 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{{ instance_name }} · B站评论审核助手</title>
+<script>
+  (() => {
+    const preference = localStorage.getItem('bilibot.theme') || 'light';
+    const resolved = preference === 'system'
+      ? (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark')
+      : preference;
+    document.documentElement.dataset.theme = resolved;
+  })();
+</script>
 <script src="/static/socket.io.min.js"></script>
 <style>
-  :root, html[data-theme="dark"] {
+  :root, html[data-theme="light"] {
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --surface2: #eef1f5;
+    --border: #d8dde7;
+    --accent: #e95c88;
+    --accent2: #1689be;
+    --green: #168a46;
+    --yellow: #a87000;
+    --red: #d53d3d;
+    --text: #20232d;
+    --text2: #626b7c;
+    --radius: 10px;
+    color-scheme: light;
+  }
+  html[data-theme="dark"] {
     --bg: #0f1117;
     --surface: #1a1d27;
     --surface2: #22263a;
@@ -20,20 +44,6 @@
     --text2: #8b92b8;
     --radius: 10px;
     color-scheme: dark;
-  }
-  html[data-theme="light"] {
-    --bg: #f5f6f8;
-    --surface: #ffffff;
-    --surface2: #eef1f5;
-    --border: #d8dde7;
-    --accent: #e95c88;
-    --accent2: #1689be;
-    --green: #168a46;
-    --yellow: #a87000;
-    --red: #d53d3d;
-    --text: #20232d;
-    --text2: #626b7c;
-    color-scheme: light;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; min-height: 100vh; }
@@ -183,8 +193,22 @@
     .main { margin-left: 60px; padding: 16px; }
     .form-row, .form-row-3 { grid-template-columns: 1fr; }
   }
-  .review-toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:16px; }
-  .review-summary { color:var(--text2); font-size:13px; margin-left:auto; }
+  .review-toolbar { display:grid; gap:12px; margin-bottom:16px; }
+  .review-toolbar-row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .review-toolbar-field { display:flex; align-items:center; gap:10px; flex:0 0 auto; }
+  .review-toolbar-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  .review-scan-hint { color:var(--text2); font-size:12px; flex:1 1 300px; min-width:220px; }
+  .review-action-row { border-top:1px solid var(--border); padding-top:12px; }
+  .review-summary { color:var(--text2); font-size:13px; margin-left:auto; text-align:right; }
+  @media (max-width: 1100px) {
+    .review-summary { flex-basis:100%; margin-left:0; text-align:left; }
+  }
+  @media (max-width: 768px) {
+    .review-toolbar-field, .review-toolbar-actions { width:100%; }
+    .review-toolbar-field .form-select, .review-toolbar-field .form-input { flex:1; width:auto !important; }
+    .review-toolbar-actions .btn { flex:1; justify-content:center; }
+    .review-scan-hint { flex-basis:100%; }
+  }
   .review-table td { vertical-align:top; line-height:1.55; }
   .review-comment { min-width:220px; max-width:360px; word-break:break-word; }
   .review-reply { min-width:220px; max-width:360px; word-break:break-word; color:var(--green); }
@@ -292,49 +316,63 @@
           豆包只生成候选回复，不会自动发送。只有你勾选批准并再次确认的内容，才会原样发到 B站。
         </div>
         <div class="review-toolbar">
-          <label class="form-label" for="review-limit" style="margin:0">本次读取</label>
-          <select class="form-select" id="review-limit" style="width:190px">
-            <option value="10">最近 10 条</option>
-            <option value="20">最近 20 条</option>
-            <option value="50">最近 50 条</option>
-            <option value="100">最近 100 条</option>
-            <option value="200">最近 200 条</option>
-            <option value="300">最近 300 条</option>
-            <option value="500" selected>最近 500 条（默认）</option>
-            <option value="1000">最近 1000 条</option>
-            <option value="2000">最近 2000 条</option>
-            <option value="5000">最近 5000 条</option>
-            <option value="10000">最近 10000 条</option>
-            <option value="50000">尽可能读取（最多 50000 条）</option>
-          </select>
-          <span class="form-hint" style="margin:0">默认最多扫描 500 条原始评论；连续 3 页没有新增待生成评论会提前停止。</span>
-          <label class="form-label" for="review-time-range" style="margin:0">时间范围</label>
-          <select class="form-select" id="review-time-range" style="width:140px" onchange="updateReviewTimeRange()">
-            <option value="">不限时间</option>
-            <option value="24h">最近24小时</option>
-            <option value="3d">最近3天</option>
-            <option value="7d">最近7天</option>
-            <option value="custom">自定义时间</option>
-          </select>
-          <input class="form-input" id="review-since" type="datetime-local" style="width:200px;display:none" aria-label="自定义起始时间">
-          <button class="btn btn-primary" id="btn-review-generate" onclick="generateReviewDrafts()">生成最近评论草稿</button>
-          <button class="btn btn-secondary" onclick="loadReviewDrafts()">刷新列表</button>
-          <button class="btn btn-secondary" id="btn-review-select-all" onclick="setAllReplyableDrafts(true)">全选可回复</button>
-          <button class="btn btn-secondary" id="btn-review-clear-all" onclick="setAllReplyableDrafts(false)">清空勾选</button>
-          <button class="btn btn-success" id="btn-review-send" onclick="sendApprovedDrafts()">发送已勾选</button>
-          <label class="form-label" for="review-status-filter" style="margin:0 0 0 8px">显示</label>
-          <select class="form-input" id="review-status-filter" onchange="loadReviewDrafts()" style="width:150px">
-            <option value="pending" selected>待审核</option>
-            <option value="skipped">豆包建议跳过</option>
-            <option value="dismissed">人工不回复</option>
-            <option value="approved">已勾选</option>
-            <option value="sent">已发送</option>
-            <option value="failed">发送失败</option>
-            <option value="sending">发送中</option>
-            <option value="send_unknown">发送结果待核对</option>
-            <option value="all">全部</option>
-          </select>
-          <span class="review-summary" id="review-summary">共 0 条，可审核 0 条，已勾选 0 条</span>
+          <div class="review-toolbar-row review-scan-row">
+            <div class="review-toolbar-field">
+              <label class="form-label" for="review-limit" style="margin:0">本次读取</label>
+              <select class="form-select" id="review-limit" style="width:190px">
+                <option value="10">最近 10 条</option>
+                <option value="20">最近 20 条</option>
+                <option value="50">最近 50 条</option>
+                <option value="100">最近 100 条</option>
+                <option value="200">最近 200 条</option>
+                <option value="300">最近 300 条</option>
+                <option value="500" selected>最近 500 条（默认）</option>
+                <option value="1000">最近 1000 条</option>
+                <option value="2000">最近 2000 条</option>
+                <option value="5000">最近 5000 条</option>
+                <option value="10000">最近 10000 条</option>
+                <option value="50000">尽可能读取（最多 50000 条）</option>
+              </select>
+            </div>
+            <span class="review-scan-hint">默认最多扫描 500 条原始评论；连续 3 页没有新增待生成评论会提前停止。</span>
+            <div class="review-toolbar-field">
+              <label class="form-label" for="review-time-range" style="margin:0">时间范围</label>
+              <select class="form-select" id="review-time-range" style="width:140px" onchange="updateReviewTimeRange()">
+                <option value="">不限时间</option>
+                <option value="24h">最近24小时</option>
+                <option value="3d">最近3天</option>
+                <option value="7d">最近7天</option>
+                <option value="custom">自定义时间</option>
+              </select>
+              <input class="form-input" id="review-since" type="datetime-local" style="width:200px;display:none" aria-label="自定义起始时间">
+            </div>
+            <div class="review-toolbar-actions">
+              <button class="btn btn-secondary" id="btn-review-generate" onclick="generateReviewDrafts()">生成最近评论草稿</button>
+              <button class="btn btn-secondary" onclick="loadReviewDrafts()">刷新列表</button>
+            </div>
+          </div>
+          <div class="review-toolbar-row review-action-row">
+            <div class="review-toolbar-field">
+              <label class="form-label" for="review-status-filter" style="margin:0">显示</label>
+              <select class="form-select" id="review-status-filter" onchange="loadReviewDrafts()" style="width:150px">
+                <option value="pending" selected>待审核</option>
+                <option value="skipped">豆包建议跳过</option>
+                <option value="dismissed">人工不回复</option>
+                <option value="approved">已勾选</option>
+                <option value="sent">已发送</option>
+                <option value="failed">发送失败</option>
+                <option value="sending">发送中</option>
+                <option value="send_unknown">发送结果待核对</option>
+                <option value="all">全部</option>
+              </select>
+            </div>
+            <div class="review-toolbar-actions">
+              <button class="btn btn-secondary" id="btn-review-select-all" onclick="setAllReplyableDrafts(true)">全选可回复</button>
+              <button class="btn btn-secondary" id="btn-review-clear-all" onclick="setAllReplyableDrafts(false)">清空勾选</button>
+              <button class="btn btn-success" id="btn-review-send" onclick="sendApprovedDrafts()">发送已勾选</button>
+            </div>
+            <span class="review-summary" id="review-summary">共 0 条，可审核 0 条，已勾选 0 条</span>
+          </div>
         </div>
         <div class="table-wrap">
           <table class="review-table">
@@ -814,11 +852,11 @@ function setThemePreference(preference) {
 }
 
 function initTheme() {
-  const preference = localStorage.getItem('bilibot.theme') || 'system';
+  const preference = localStorage.getItem('bilibot.theme') || 'light';
   document.getElementById('theme-select').value = preference;
   applyTheme(preference);
   window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
-    if ((localStorage.getItem('bilibot.theme') || 'system') === 'system') {
+    if ((localStorage.getItem('bilibot.theme') || 'light') === 'system') {
       applyTheme('system');
     }
   });
@@ -1316,8 +1354,10 @@ function loadReviewDrafts(retryOnNetworkError = true) {
     document.getElementById('btn-review-clear-all').disabled =
       approved === 0 || isGenerating || isSending;
     const generateButton = document.getElementById('btn-review-generate');
-    generateButton.disabled = isGenerating;
-    generateButton.textContent = isGenerating ? '豆包生成中...' : '生成最近评论草稿';
+    generateButton.disabled = isGenerating || isSending;
+    generateButton.textContent = isGenerating
+      ? '豆包生成中...'
+      : isSending ? '发送进行中' : '生成最近评论草稿';
 
     const selectedStatus = document.getElementById('review-status-filter').value;
     const visibleItems = selectedStatus === 'all'

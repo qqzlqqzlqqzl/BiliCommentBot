@@ -125,6 +125,14 @@ try {
     ) {
         throw "页面缺少人工不回复或恢复审核功能"
     }
+    if (
+        $page.Content -notmatch 'class="review-toolbar-row review-scan-row"' -or
+        $page.Content -notmatch 'class="review-toolbar-row review-action-row"' -or
+        $page.Content -notmatch 'class="btn btn-secondary" id="btn-review-generate"' -or
+        $page.Content -notmatch "localStorage.getItem\('bilibot.theme'\) \|\| 'light'"
+    ) {
+        throw "回复审核工具栏分组、普通按钮配色或默认日间主题不正确"
+    }
     try {
         Post-Json "$baseUrl/api/review/dismiss" @{
             comment_id = ""
