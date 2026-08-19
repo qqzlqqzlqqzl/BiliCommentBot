@@ -20,7 +20,8 @@ dist\BiliCommentReviewer\
 双击其中的 `BiliCommentReviewer.exe` 即可。不要只复制 EXE；整个目录需要一起保留。
 
 - 第一次启动会在 `%LOCALAPPDATA%\BiliCommentReviewer` 创建产品数据目录。
-- 应用自动使用空闲的本地端口，不需要手动管理 5000/5001。
+- 应用固定使用 `http://127.0.0.1:57277/`，不再因为端口冲突随机更换 URL。
+- 如果 `57277` 被其他程序占用，应用会明确提示并停止启动。
 - 再次双击会打开已经运行的实例，不会再启动一套后台。
 - 一个应用内可以添加多个账号；Cookie、草稿、历史、缓存和日志按账号隔离。
 - 已保存的 Cookie、Refresh Token、API Key 和密码哈希不会回显到浏览器页面。

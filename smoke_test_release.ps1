@@ -83,6 +83,9 @@ try {
         -WindowStyle Hidden
 
     $runtime = Wait-ForRuntime (Join-Path $testRoot "runtime.json")
+    if ([int]$runtime.port -ne 57277) {
+        throw "发布 EXE 未使用固定端口 57277"
+    }
     $baseUrl = "http://127.0.0.1:$($runtime.port)"
     $health = Wait-ForHealth $baseUrl
     if (-not $health.ok -or -not $health.product_mode) {

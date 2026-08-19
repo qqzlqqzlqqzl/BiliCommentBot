@@ -56,27 +56,23 @@ class ProductAppTests(unittest.TestCase):
             "http://127.0.0.1:32123/api/health",
         )
 
-    def test_choose_local_port_prefers_stable_product_port(self):
+    def test_product_uses_fixed_port(self):
+        self.assertEqual(product_app.DEFAULT_PRODUCT_PORT, 57277)
         with patch.object(
             product_app,
             "local_port_is_available",
-            side_effect=lambda port: port == product_app.DEFAULT_PRODUCT_PORT,
+            return_value=True,
         ):
-            self.assertEqual(
-                product_app.choose_local_port(previous_port=32123),
-                product_app.DEFAULT_PRODUCT_PORT,
-            )
+            self.assertEqual(product_app.choose_local_port(), 57277)
 
-    def test_choose_local_port_reuses_previous_when_default_is_busy(self):
+    def test_fixed_port_conflict_does_not_fall_back_to_random_port(self):
         with patch.object(
             product_app,
             "local_port_is_available",
-            side_effect=lambda port: port == 32123,
+            return_value=False,
         ):
-            self.assertEqual(
-                product_app.choose_local_port(previous_port=32123),
-                32123,
-            )
+            with self.assertRaisesRegex(RuntimeError, "固定端口 57277 已被占用"):
+                product_app.choose_local_port()
 
     def test_release_environment_does_not_set_debug_limit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
