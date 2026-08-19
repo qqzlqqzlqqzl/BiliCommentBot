@@ -852,6 +852,21 @@ def api_review_approve_bulk():
         return jsonify({"ok": False, "message": str(e)}), 400
 
 
+@app.route("/api/review/dismiss", methods=["POST"])
+def api_review_dismiss():
+    data = request.get_json(silent=True) or {}
+    comment_id = str(data.get("comment_id", "")).strip()
+    if not comment_id:
+        return jsonify({"ok": False, "message": "缺少 comment_id"}), 400
+    if not isinstance(data.get("dismissed"), bool):
+        return jsonify({"ok": False, "message": "dismissed 必须是布尔值"}), 400
+    try:
+        draft = get_bot().set_review_dismissed(comment_id, data["dismissed"])
+        return jsonify({"ok": True, "draft": draft})
+    except (KeyError, ValueError) as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+
+
 @app.route("/api/review/regenerate", methods=["POST"])
 def api_review_regenerate():
     data = request.get_json(silent=True) or {}

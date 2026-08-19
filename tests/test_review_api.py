@@ -19,6 +19,11 @@ class ReviewApiTests(unittest.TestCase):
             "updated": 2,
             "approved": True,
         }
+        self.fake_bot.set_review_dismissed.return_value = {
+            "comment_id": "1",
+            "approved": False,
+            "status": "dismissed",
+        }
         self.fake_bot.regenerate_review_draft.return_value = {
             "comment_id": "1",
             "approved": False,
@@ -186,6 +191,30 @@ class ReviewApiTests(unittest.TestCase):
             ["1", "2"],
             True,
         )
+
+    def test_dismiss_requires_comment_id_and_real_boolean(self):
+        missing_id = self.client.post(
+            "/api/review/dismiss",
+            json={"dismissed": True},
+        )
+        invalid_value = self.client.post(
+            "/api/review/dismiss",
+            json={"comment_id": "1", "dismissed": "true"},
+        )
+
+        self.assertEqual(missing_id.status_code, 400)
+        self.assertEqual(invalid_value.status_code, 400)
+        self.fake_bot.set_review_dismissed.assert_not_called()
+
+    def test_dismiss_passes_single_comment_id(self):
+        response = self.client.post(
+            "/api/review/dismiss",
+            json={"comment_id": "1", "dismissed": True},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["draft"]["status"], "dismissed")
+        self.fake_bot.set_review_dismissed.assert_called_once_with("1", True)
 
     def test_regenerate_requires_comment_id(self):
         response = self.client.post("/api/review/regenerate", json={})

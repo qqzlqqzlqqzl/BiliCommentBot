@@ -1012,8 +1012,50 @@ class BiliCommentBot:
                 raise ValueError("该回复正在发送，不能更改批准状态")
             if draft.get("status") == "send_unknown":
                 raise ValueError("该回复发送结果待核对，不能直接重发")
+            if draft.get("status") == "dismissed":
+                raise ValueError("该评论已设为人工不回复，请先恢复审核")
             draft["approved"] = bool(approved)
             draft["status"] = "approved" if approved else "pending"
+            self._save_review_drafts()
+            return dict(draft)
+
+    def set_review_dismissed(self, comment_id: str, dismissed: bool) -> dict:
+        """持久化人工不回复决定；保留草稿用于去重，避免下次扫描重新出现。"""
+        comment_id = str(comment_id).strip()
+        if not comment_id:
+            raise ValueError("缺少 comment_id")
+
+        with self._review_lock:
+            draft = self._review_drafts.get(comment_id)
+            if not draft:
+                raise KeyError("草稿不存在")
+
+            status = str(draft.get("status") or "")
+            if status == "sent":
+                raise ValueError("该回复已经发送，不能设为人工不回复")
+            if status == "sending":
+                raise ValueError("该回复正在发送，不能设为人工不回复")
+            if status == "regenerating":
+                raise ValueError("豆包正在重新生成该回复，不能设为人工不回复")
+            if status == "send_unknown":
+                raise ValueError("该回复发送结果待核对，不能设为人工不回复")
+
+            draft["approved"] = False
+            if dismissed:
+                draft["status"] = "dismissed"
+                draft["dismissed_at"] = datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            else:
+                if status != "dismissed":
+                    raise ValueError("该评论当前不是人工不回复状态")
+                draft["status"] = (
+                    "pending"
+                    if draft.get("should_reply") and str(draft.get("reply") or "").strip()
+                    else "skipped"
+                )
+                draft.pop("dismissed_at", None)
+
             self._save_review_drafts()
             return dict(draft)
 
@@ -1042,7 +1084,8 @@ class BiliCommentBot:
                     if not draft.get("should_reply") or not str(draft.get("reply") or "").strip():
                         raise ValueError(f"该评论没有可发送的候选回复: {comment_id}")
                     if draft.get("status") in {
-                        "sent", "skipped", "regenerating", "sending", "send_unknown"
+                        "sent", "skipped", "dismissed", "regenerating", "sending",
+                        "send_unknown"
                     }:
                         raise ValueError(
                             f"该回复当前不能更改批准状态: {comment_id}"
@@ -1074,6 +1117,8 @@ class BiliCommentBot:
                     raise ValueError("该回复正在发送，不能重新生成")
                 if current.get("status") == "send_unknown":
                     raise ValueError("该回复发送结果待核对，不能重新生成")
+                if current.get("status") == "dismissed":
+                    raise ValueError("该评论已设为人工不回复，请先恢复审核")
                 original = dict(current)
                 current["approved"] = False
                 current["status"] = "regenerating"

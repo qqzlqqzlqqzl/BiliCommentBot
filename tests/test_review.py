@@ -316,6 +316,45 @@ class ReviewWorkflowTests(unittest.TestCase):
             saved = json.load(handle)
         self.assertEqual(saved[0]["reply"], original_reply)
 
+    def test_manual_dismissal_is_persisted_and_kept_for_scan_deduplication(self):
+        self.bot._review_drafts["1"] = self._draft("1")
+        self.bot.get_creator_comment_feed = Mock(return_value=[])
+
+        dismissed = self.bot.set_review_dismissed("1", True)
+        second_items = self.bot._collect_review_items(limit=100)
+
+        self.assertEqual(dismissed["status"], "dismissed")
+        self.assertFalse(dismissed["approved"])
+        self.assertIn("dismissed_at", dismissed)
+        self.assertEqual(second_items, [])
+        skip_ids = self.bot.get_creator_comment_feed.call_args.kwargs[
+            "skip_comment_ids"
+        ]
+        self.assertIn("1", skip_ids)
+        with open(self.drafts_file, "r", encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved[0]["status"], "dismissed")
+
+    def test_manual_dismissal_can_be_restored_without_regenerating(self):
+        draft = self._draft("1", approved=True, status="approved")
+        original_reply = draft["reply"]
+        self.bot._review_drafts["1"] = draft
+
+        self.bot.set_review_dismissed("1", True)
+        restored = self.bot.set_review_dismissed("1", False)
+
+        self.assertEqual(restored["status"], "pending")
+        self.assertFalse(restored["approved"])
+        self.assertEqual(restored["reply"], original_reply)
+        self.assertNotIn("dismissed_at", restored)
+
+    def test_sent_or_in_flight_draft_cannot_be_manually_dismissed(self):
+        for status in ("sent", "sending", "regenerating", "send_unknown"):
+            with self.subTest(status=status):
+                self.bot._review_drafts["1"] = self._draft("1", status=status)
+                with self.assertRaises(ValueError):
+                    self.bot.set_review_dismissed("1", True)
+
     def test_regenerate_uses_current_prompt_result_and_clears_approval(self):
         draft = self._draft("1", approved=True, status="approved")
         draft["parent_comment"] = "之前的回复"

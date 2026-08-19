@@ -119,6 +119,28 @@ try {
         throw "页面缺少批量勾选或提示词生效范围说明"
     }
     if (
+        $page.Content -notmatch '<option value="dismissed">人工不回复</option>' -or
+        $page.Content -notmatch '/api/review/dismiss' -or
+        $page.Content -notmatch '恢复审核'
+    ) {
+        throw "页面缺少人工不回复或恢复审核功能"
+    }
+    try {
+        Post-Json "$baseUrl/api/review/dismiss" @{
+            comment_id = ""
+            dismissed = $true
+        }
+        throw "人工不回复接口接受了空 comment_id"
+    }
+    catch {
+        if (
+            -not $_.Exception.Response -or
+            [int]$_.Exception.Response.StatusCode -ne 400
+        ) {
+            throw
+        }
+    }
+    if (
         $page.Content -match 'id="cfg-bilibili-uid"' -or
         $page.Content -match 'data-tab="tab-auth"' -or
         $page.Content -match 'id="cfg-auth-enabled"'
@@ -309,6 +331,7 @@ try {
         ReviewPreferenceLimit = $preferenceConfig.config.reply.max_process
         ReviewPreferenceRange = $preferenceConfig.config.reply.review_time_range
         SendRangeGate = $true
+        ManualDismissal = $true
         MonitorPreferencePersisted = $true
         AccountCount = $manifest.accounts.Count
         LocalSocketClient = $true

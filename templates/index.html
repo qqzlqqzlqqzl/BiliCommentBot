@@ -326,6 +326,7 @@
           <select class="form-input" id="review-status-filter" onchange="loadReviewDrafts()" style="width:150px">
             <option value="pending" selected>待审核</option>
             <option value="skipped">豆包建议跳过</option>
+            <option value="dismissed">人工不回复</option>
             <option value="approved">已勾选</option>
             <option value="sent">已发送</option>
             <option value="failed">发送失败</option>
@@ -1254,6 +1255,7 @@ function reviewStatusLabel(item) {
     pending: '待审核',
     approved: '已勾选',
     skipped: '豆包建议跳过',
+    dismissed: '人工不回复',
     regenerating: '豆包重写中',
     sending: '发送中',
     send_unknown: '发送结果待核对',
@@ -1329,8 +1331,10 @@ function loadReviewDrafts(retryOnNetworkError = true) {
     }
     tbody.innerHTML = visibleItems.map(item => {
       const canApprove = item.should_reply
-        && !['sent', 'skipped', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
-      const canRegenerate = !['sent', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
+        && !['sent', 'skipped', 'dismissed', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
+      const canRegenerate = !['sent', 'dismissed', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
+      const canDismiss = !['sent', 'dismissed', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
+      const canRestore = item.status === 'dismissed';
       const parent = item.parent_comment
         ? `<div class="review-parent">上级评论 · ${escHtml(item.parent_author || '')}<br>${escHtml(item.parent_comment)}</div>`
         : '';
@@ -1363,6 +1367,16 @@ function loadReviewDrafts(retryOnNetworkError = true) {
                 onclick="regenerateDraft('${escHtml(String(item.comment_id))}', this)">
                 ${item.status === 'regenerating' ? '生成中...' : '重新生成'}
               </button>
+              ${canDismiss ? `
+                <button class="btn btn-secondary" style="padding:5px 10px;font-size:12px"
+                  onclick="setDraftDismissed('${escHtml(String(item.comment_id))}', true, this)">
+                  不回复
+                </button>` : ''}
+              ${canRestore ? `
+                <button class="btn btn-secondary" style="padding:5px 10px;font-size:12px"
+                  onclick="setDraftDismissed('${escHtml(String(item.comment_id))}', false, this)">
+                  恢复审核
+                </button>` : ''}
             </div>
           </td>
           <td>${reviewStatusBadge(item)}</td>
@@ -1528,6 +1542,26 @@ function setDraftApproval(commentId, approved, checkbox) {
     loadReviewDrafts();
   }).catch(e => {
     showToast(`保存批准状态失败：${e}`, 'error');
+    loadReviewDrafts();
+  });
+}
+
+function setDraftDismissed(commentId, dismissed, button) {
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = dismissed ? '正在移除...' : '正在恢复...';
+  fetch('/api/review/dismiss', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({comment_id: commentId, dismissed}),
+  }).then(r => r.json()).then(d => {
+    if (!d.ok) throw new Error(d.message || '保存人工判断失败');
+    showToast(dismissed ? '已设为人工不回复' : '已恢复到审核列表', 'success');
+  }).catch(e => {
+    showToast(`操作失败：${e.message || e}`, 'error');
+  }).finally(() => {
+    button.disabled = false;
+    button.textContent = originalText;
     loadReviewDrafts();
   });
 }
