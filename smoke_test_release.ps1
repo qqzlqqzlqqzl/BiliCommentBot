@@ -143,6 +143,22 @@ try {
     ) {
         throw "回复审核页面缺少关键功能的真实影响范围悬浮说明"
     }
+    if (
+        $page.Content -notmatch '--log-bg: #f7f8fa' -or
+        $page.Content -notmatch "fetch\('/api/logs/clear'" -or
+        $page.Content -notmatch '关闭后会保留你当前查看的位置' -or
+        $page.Content -notmatch '切换当前操作账号' -or
+        $page.Content -notmatch '按配置的检查间隔在后台扫描最新评论' -or
+        $page.Content -notmatch '配置豆包 API、模型、推理力度' -or
+        $page.Content -notmatch '向 B站申请当前账号的登录二维码' -or
+        $page.Content -notmatch '查看第 \$\{i\} 页回复历史'
+    ) {
+        throw "日间日志配色、日志交互或全局功能悬浮说明不正确"
+    }
+    $clearLogs = Post-Json "$baseUrl/api/logs/clear" @{}
+    if (-not $clearLogs.ok) {
+        throw "清空实时日志接口失败"
+    }
     try {
         Post-Json "$baseUrl/api/review/dismiss" @{
             comment_id = ""

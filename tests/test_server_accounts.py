@@ -163,6 +163,21 @@ class ServerAccountApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    def test_realtime_logs_have_single_prefix_and_can_be_cleared(self):
+        account_id = self.client.get("/api/accounts").get_json()[
+            "current_account_id"
+        ]
+        bot = server.get_bot(account_id)
+        handler = server._account_log_handlers[account_id]
+
+        bot.logger.info("一条测试日志")
+
+        self.assertEqual(handler.log_buffer[-1]["msg"], "一条测试日志")
+        response = self.client.post("/api/logs/clear")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        self.assertEqual(handler.log_buffer, [])
+
     def test_qr_cookie_is_saved_only_to_target_account(self):
         first_id = self.client.get("/api/accounts").get_json()["current_account_id"]
         second_id = self.client.post(

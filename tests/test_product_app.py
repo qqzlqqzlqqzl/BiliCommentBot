@@ -56,6 +56,28 @@ class ProductAppTests(unittest.TestCase):
             "http://127.0.0.1:32123/api/health",
         )
 
+    def test_choose_local_port_prefers_stable_product_port(self):
+        with patch.object(
+            product_app,
+            "local_port_is_available",
+            side_effect=lambda port: port == product_app.DEFAULT_PRODUCT_PORT,
+        ):
+            self.assertEqual(
+                product_app.choose_local_port(previous_port=32123),
+                product_app.DEFAULT_PRODUCT_PORT,
+            )
+
+    def test_choose_local_port_reuses_previous_when_default_is_busy(self):
+        with patch.object(
+            product_app,
+            "local_port_is_available",
+            side_effect=lambda port: port == 32123,
+        ):
+            self.assertEqual(
+                product_app.choose_local_port(previous_port=32123),
+                32123,
+            )
+
     def test_release_environment_does_not_set_debug_limit(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             product_app.configure_environment(Path(temp_dir), 32123)
@@ -97,6 +119,9 @@ class ProductAppTests(unittest.TestCase):
         self.assertIn("当前时间范围", template)
         self.assertIn("...reviewPreferencesPayload()", template)
         self.assertIn("连续 3 页没有新增待生成评论", template)
+        self.assertIn("--log-bg: #f7f8fa", template)
+        self.assertIn("fetch('/api/logs/clear'", template)
+        self.assertIn("关闭后会保留你当前查看的位置", template)
         save_config_body = template.split(
             "function saveConfig()", 1
         )[1].split("function clearConfigSecret", 1)[0]

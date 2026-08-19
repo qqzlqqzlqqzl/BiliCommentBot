@@ -108,7 +108,7 @@ class WebSocketLogHandler(logging.Handler):
 
 ws_log_handler = WebSocketLogHandler(socketio)
 ws_log_handler.setFormatter(
-    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+    logging.Formatter("%(message)s")
 )
 _account_log_handlers = {}
 
@@ -251,7 +251,7 @@ def _setup_logger(
     if account_id:
         handler = WebSocketLogHandler(socketio, account_id=account_id)
         handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
+            logging.Formatter("%(message)s")
         )
         _account_log_handlers[account_id] = handler
         logger.addHandler(handler)
@@ -931,6 +931,19 @@ def api_logs():
     else:
         logs = ws_log_handler.log_buffer[-200:]
     return jsonify({"ok": True, "logs": logs})
+
+
+@app.route("/api/logs/clear", methods=["POST"])
+def api_logs_clear():
+    if is_product_mode():
+        account_id = get_account_manager().current_account_id()
+        get_bot(account_id)
+        handler = _account_log_handlers.get(account_id)
+    else:
+        handler = ws_log_handler
+    if handler:
+        handler.log_buffer.clear()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/qr/generate", methods=["POST"])

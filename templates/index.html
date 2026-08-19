@@ -27,6 +27,10 @@
     --red: #d53d3d;
     --text: #20232d;
     --text2: #626b7c;
+    --log-bg: #f7f8fa;
+    --log-text: #303747;
+    --log-divider: #e3e7ed;
+    --log-time: #778094;
     --radius: 10px;
     color-scheme: light;
   }
@@ -42,6 +46,10 @@
     --red: #f05050;
     --text: #e8eaf6;
     --text2: #8b92b8;
+    --log-bg: #080b12;
+    --log-text: #d6dbe5;
+    --log-divider: rgba(255,255,255,.05);
+    --log-time: #748198;
     --radius: 10px;
     color-scheme: dark;
   }
@@ -135,11 +143,11 @@
 
   /* Log */
   .log-container {
-    background: #080b12; border: 1px solid var(--border); border-radius: var(--radius);
+    background: var(--log-bg); color: var(--log-text); border: 1px solid var(--border); border-radius: var(--radius);
     height: 420px; overflow-y: auto; padding: 12px; font-family: 'Consolas', monospace; font-size: 13px;
   }
-  .log-entry { padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,.03); }
-  .log-entry .log-time { color: #4a5568; margin-right: 8px; }
+  .log-entry { padding: 4px 0; border-bottom: 1px solid var(--log-divider); word-break: break-word; }
+  .log-entry .log-time { color: var(--log-time); margin-right: 8px; }
   .log-entry.INFO .log-level { color: var(--accent2); }
   .log-entry.WARNING .log-level { color: var(--yellow); }
   .log-entry.ERROR .log-level { color: var(--red); }
@@ -255,22 +263,26 @@
       <div class="logo-sub">B站评论人工审核回复</div>
     </div>
     <ul class="nav-list">
-      <li><a href="#" class="active" data-page="dashboard"><span class="icon">📊</span><span>控制台</span><span class="status-dot" id="nav-status-dot"></span></a></li>
-      <li><a href="#" data-page="review"><span class="icon">✅</span><span>回复审核</span></a></li>
-      <li><a href="#" data-page="config"><span class="icon">⚙️</span><span>配置</span></a></li>
-      <li><a href="#" data-page="login"><span class="icon">🔑</span><span>登录</span></a></li>
-      <li><a href="#" data-page="history"><span class="icon">📝</span><span>历史记录</span></a></li>
-      <li><a href="#" data-page="logs"><span class="icon">📋</span><span>实时日志</span></a></li>
+      <li><a href="#" class="active" data-page="dashboard" data-help="查看当前账号的运行状态、处理数量，并启动或停止定时草稿监控。"><span class="icon">📊</span><span>控制台</span><span class="status-dot" id="nav-status-dot"></span></a></li>
+      <li><a href="#" data-page="review" data-help="查看豆包候选，人工批准、不回复、重新生成或串行发送。"><span class="icon">✅</span><span>回复审核</span></a></li>
+      <li><a href="#" data-page="config" data-help="配置当前账号的 B站登录、豆包、草稿、请求间隔和日志参数。"><span class="icon">⚙️</span><span>配置</span></a></li>
+      <li><a href="#" data-page="login" data-help="为当前账号生成 B站登录二维码，扫码成功后自动保存登录状态。"><span class="icon">🔑</span><span>登录</span></a></li>
+      <li><a href="#" data-page="history" data-help="查看本工具记录的已发送回复历史。"><span class="icon">📝</span><span>历史记录</span></a></li>
+      <li><a href="#" data-page="logs" data-help="查看当前账号在本次程序运行期间产生的实时日志。"><span class="icon">📋</span><span>实时日志</span></a></li>
     </ul>
     <div class="sidebar-tools">
       <label class="form-label" for="account-select" style="margin:0">当前账号</label>
-      <select class="form-select" id="account-select" onchange="selectAccount(this.value)">
+      <select class="form-select" id="account-select" onchange="selectAccount(this.value)"
+        data-help="切换当前操作账号。若当前账号正在生成、重新生成或发送，程序会阻止切换。">
         <option value="">加载中...</option>
       </select>
-      <button class="btn btn-secondary" id="btn-add-account" onclick="createAccount()" style="display:none">＋ 添加账号</button>
-      <button class="btn btn-secondary" id="btn-import-account" onclick="importAccount()" style="display:none">导入旧账号</button>
+      <button class="btn btn-secondary" id="btn-add-account" onclick="createAccount()" style="display:none"
+        data-help="创建一个独立账号槽位并立即进入扫码登录。各账号的配置、草稿和历史彼此隔离。">＋ 添加账号</button>
+      <button class="btn btn-secondary" id="btn-import-account" onclick="importAccount()" style="display:none"
+        data-help="从旧版数据目录导入可识别的账号配置，不会修改或删除原文件。">导入旧账号</button>
       <label class="form-label" for="theme-select" style="margin:4px 0 0">界面主题</label>
-      <select class="form-select" id="theme-select" onchange="setThemePreference(this.value)">
+      <select class="form-select" id="theme-select" onchange="setThemePreference(this.value)"
+        data-help="切换界面日间、夜间或跟随系统主题。只改变显示，不影响任务和配置。">
         <option value="system">跟随系统</option>
         <option value="light">日间</option>
         <option value="dark">夜间</option>
@@ -307,10 +319,14 @@
       <div class="card">
         <div class="card-title">草稿监控</div>
         <div class="control-bar">
-          <button class="btn btn-success" id="btn-start" onclick="botStart()">▶ 启动草稿监控</button>
-          <button class="btn btn-danger" id="btn-stop" onclick="botStop()" disabled>⏹ 停止</button>
-          <button class="btn btn-secondary" onclick="verifyLogin()">🔍 验证登录状态</button>
-          <button class="btn btn-secondary legacy-config" onclick="clearCache()">🗑 清除视频缓存</button>
+          <button class="btn btn-success" id="btn-start" onclick="botStart()"
+            data-help="按配置的检查间隔在后台扫描最新评论并生成审核草稿。不会自动批准或发送回复。">▶ 启动草稿监控</button>
+          <button class="btn btn-danger" id="btn-stop" onclick="botStop()" disabled
+            data-help="停止之后的新一轮定时扫描。已经开始的单次请求会安全收尾，草稿和状态会保存。">⏹ 停止</button>
+          <button class="btn btn-secondary" onclick="verifyLogin()"
+            data-help="向 B站验证当前账号的登录凭据是否有效，并自动更新识别到的 UID 和昵称。">🔍 验证登录状态</button>
+          <button class="btn btn-secondary legacy-config" onclick="clearCache()"
+            data-help="清除基座的视频列表缓存；正常的创作中心最新评论审核流程不依赖此缓存。">🗑 清除视频缓存</button>
         </div>
         <div id="verify-result" style="margin-top:12px"></div>
       </div>
@@ -318,8 +334,10 @@
       <div class="alert alert-info" id="setup-guide" style="display:none;margin-bottom:20px">
         <strong>首次使用：</strong>
         <span id="setup-guide-text"></span>
-        <button class="btn btn-secondary" id="setup-login-button" onclick="navigateTo('login')" style="margin-left:10px;padding:5px 10px">去扫码登录</button>
-        <button class="btn btn-secondary" id="setup-ark-button" onclick="openConfigTab('tab-ark')" style="margin-left:6px;padding:5px 10px">配置豆包</button>
+        <button class="btn btn-secondary" id="setup-login-button" onclick="navigateTo('login')" style="margin-left:10px;padding:5px 10px"
+          data-help="打开登录页，为当前账号生成 B站扫码登录二维码。">去扫码登录</button>
+        <button class="btn btn-secondary" id="setup-ark-button" onclick="openConfigTab('tab-ark')" style="margin-left:6px;padding:5px 10px"
+          data-help="打开豆包配置页，填写 API Key、模型、提示词和请求参数。">配置豆包</button>
       </div>
 
       <div class="card">
@@ -438,12 +456,12 @@
     <div class="page" id="page-config">
       <div class="page-title"><span class="icon">⚙️</span>配置</div>
       <div class="tab-bar">
-        <button class="tab-btn active" data-tab="tab-bilibili">账号与 B站</button>
-        <button class="tab-btn" data-tab="tab-ark">豆包</button>
-        <button class="tab-btn" data-tab="tab-reply">草稿与发送</button>
-        <button class="tab-btn" data-tab="tab-rate">B站请求</button>
-        <button class="tab-btn legacy-config" data-tab="tab-cache">缓存</button>
-        <button class="tab-btn" data-tab="tab-logging">日志</button>
+        <button class="tab-btn active" data-tab="tab-bilibili" data-help="配置当前账号的 B站登录凭据和定时检查间隔。">账号与 B站</button>
+        <button class="tab-btn" data-tab="tab-ark" data-help="配置豆包 API、模型、推理力度、并发、重试和自定义提示词。">豆包</button>
+        <button class="tab-btn" data-tab="tab-reply" data-help="配置定时草稿开关、串行发送延迟和送豆包前的预筛选。">草稿与发送</button>
+        <button class="tab-btn" data-tab="tab-rate" data-help="配置访问 B站接口时的最小间隔和失败重试策略。">B站请求</button>
+        <button class="tab-btn legacy-config" data-tab="tab-cache" data-help="配置基座 GET 请求和视频列表缓存。">缓存</button>
+        <button class="tab-btn" data-tab="tab-logging" data-help="配置后台日志记录级别、文件位置和控制台输出。">日志</button>
       </div>
 
       <!-- B站 -->
@@ -460,7 +478,8 @@
             <div class="form-hint">已保存的 Refresh Token 不会回显；留空表示不修改。</div>
           </div>
           <div class="form-group">
-            <button class="btn btn-danger" type="button" onclick="clearStoredSecret('bilibili_login')">清除当前账号登录凭据</button>
+            <button class="btn btn-danger" type="button" onclick="clearStoredSecret('bilibili_login')"
+              data-help="清除当前账号已保存的 Cookie 和 Refresh Token。执行前会再次确认，不影响其他账号。">清除当前账号登录凭据</button>
           </div>
           <div class="form-row">
             <div class="form-group">
@@ -485,7 +504,8 @@
             </div>
           </div>
           <div class="form-group">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="开启后，程序会在 Refresh Token 可用时自动刷新即将失效的 B站 Cookie。">
               <input type="checkbox" id="cfg-bilibili-auto_refresh_cookie" checked>
               启用 Cookie 自动刷新
             </label>
@@ -502,7 +522,8 @@
             <div class="form-hint">已保存的 Key 不会回显；留空表示不修改。环境变量 ARK_API_KEY 优先于这里的配置。</div>
           </div>
           <div class="form-group">
-            <button class="btn btn-danger" type="button" onclick="clearStoredSecret('ark_api_key')">清除当前账号保存的 API Key</button>
+            <button class="btn btn-danger" type="button" onclick="clearStoredSecret('ark_api_key')"
+              data-help="清除当前账号保存在配置文件中的豆包 API Key。环境变量中的 Key 不会被修改。">清除当前账号保存的 API Key</button>
           </div>
           <div class="form-group">
             <label class="form-label">Responses API 地址</label>
@@ -522,7 +543,8 @@
           <div class="form-row">
             <div class="form-group">
               <label class="form-label">思考力度</label>
-              <select class="form-select" id="cfg-ark-reasoning_effort">
+              <select class="form-select" id="cfg-ark-reasoning_effort"
+                data-help="控制豆包对评论判断和草拟回复时的思考力度。越高通常越慢，也可能消耗更多 Token。">
                 <option value="low">low（更快）</option>
                 <option value="medium" selected>medium（均衡）</option>
                 <option value="high">high（更充分）</option>
@@ -559,31 +581,36 @@
       <div class="tab-panel" id="tab-reply">
         <div class="card">
           <div class="form-group">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="开启后，后台定时监控会扫描最新评论并生成草稿；草稿仍必须人工批准，绝不会自动发送。">
               <input type="checkbox" id="cfg-reply-enabled" checked>
               启用定时生成审核草稿（仍需人工批准）
             </label>
           </div>
           <div class="form-group legacy-config">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="仅处理尚未进入历史记录或草稿记录的评论，避免重复回复。">
               <input type="checkbox" id="cfg-reply-only_new" checked>
               只回复未处理过的评论
             </label>
           </div>
           <div class="form-group legacy-config">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="基座旧功能：发送回复后同时点赞该条评论。当前产品界面默认隐藏。">
               <input type="checkbox" id="cfg-reply-like_enabled">
               回复时同时点赞评论
             </label>
           </div>
           <div class="form-group legacy-config">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="基座旧功能：回复后尝试点赞评论用户的最新视频。当前产品界面默认隐藏。">
               <input type="checkbox" id="cfg-reply-like_user_video_enabled">
               回复后点赞评论用户的最新视频
             </label>
           </div>
           <div class="form-group legacy-config">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="基座旧功能：只对关注了你的用户执行视频点赞。当前产品界面默认隐藏。">
               <input type="checkbox" id="cfg-reply-like_user_video_only_followers">
               仅给粉丝视频点赞（仅点赞关注了你的用户的视频）
             </label>
@@ -594,7 +621,8 @@
           <div class="form-row legacy-config">
             <div class="form-group">
               <label class="form-label">最新评论扫描上限</label>
-              <select class="form-select" id="cfg-reply-max_process">
+              <select class="form-select" id="cfg-reply-max_process"
+                data-help="基座旧读取上限。当前产品统一使用回复审核页的“本次读取”，此选项默认隐藏。">
                 <option value="10">10 条</option>
                 <option value="20">20 条</option>
                 <option value="50">50 条</option>
@@ -627,7 +655,8 @@
             <div class="form-hint">生成回复时参考前 N 条评论作为上下文</div>
           </div>
           <div class="form-group legacy-config">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="基座旧功能：允许继续处理主评论下的子评论。当前最新评论流程会保留必要的两层上下文。">
               <input type="checkbox" id="cfg-reply-chained_reply_enabled" checked>
               启用链式回复（楼中楼）
             </label>
@@ -653,7 +682,8 @@
         <div class="card">
           <div class="card-title">🔍 送豆包前：关键词预筛选</div>
           <div class="form-group">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="开启后，只有通过关键词白名单且未命中黑名单的评论才会交给豆包。">
               <input type="checkbox" id="cfg-reply-keyword_filter-enabled">
               启用关键词预筛选
             </label>
@@ -671,13 +701,15 @@
           <div class="form-row">
             <div class="form-group">
               <label class="form-label">白名单匹配模式</label>
-              <select class="form-select" id="cfg-reply-keyword_filter-mode">
+              <select class="form-select" id="cfg-reply-keyword_filter-mode"
+                data-help="any 表示命中任一白名单词即可；all 表示必须同时命中全部白名单词。">
                 <option value="any">any（任一匹配）</option>
                 <option value="all">all（全部匹配）</option>
               </select>
             </div>
             <div class="form-group">
-              <label class="form-check" style="margin-top:28px">
+              <label class="form-check" style="margin-top:28px"
+                data-help="开启后，关键词匹配会区分英文字母大小写。">
                 <input type="checkbox" id="cfg-reply-keyword_filter-match_case">
                 区分大小写
               </label>
@@ -689,7 +721,8 @@
         <div class="card">
           <div class="card-title">📏 送豆包前：评论长度预筛选</div>
           <div class="form-group">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="开启后，过短或过长的评论会在调用豆包前被跳过。">
               <input type="checkbox" id="cfg-reply-length_filter-enabled">
               启用长度预筛选
             </label>
@@ -712,7 +745,8 @@
         <div class="card">
           <div class="card-title">👤 送豆包前：用户预筛选</div>
           <div class="form-group">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="开启后，按 UID 白名单和黑名单决定评论是否进入豆包生成流程。">
               <input type="checkbox" id="cfg-reply-user_filter-enabled">
               启用用户过滤
             </label>
@@ -766,7 +800,8 @@
             </div>
           </div>
           <div class="form-group">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="基座旧功能：缓存 GET 响应以减少重复请求。当前产品界面默认隐藏。">
               <input type="checkbox" id="cfg-cache-enabled" checked>
               启用 GET 响应缓存
             </label>
@@ -780,7 +815,8 @@
           <div class="form-row">
             <div class="form-group">
               <label class="form-label">日志级别</label>
-              <select class="form-select" id="cfg-logging-level">
+              <select class="form-select" id="cfg-logging-level"
+                data-help="设置写入后台日志的最低级别。INFO 适合日常使用，DEBUG 会记录更多诊断信息。">
                 <option value="DEBUG">DEBUG</option>
                 <option value="INFO" selected>INFO</option>
                 <option value="WARNING">WARNING</option>
@@ -793,7 +829,8 @@
             </div>
           </div>
           <div class="form-group">
-            <label class="form-check">
+            <label class="form-check"
+              data-help="控制后台日志是否同时写入启动器控制台输出，不影响网页实时日志和日志文件。">
               <input type="checkbox" id="cfg-logging-console" checked>
               输出到控制台
             </label>
@@ -802,8 +839,10 @@
       </div>
 
       <div style="display:flex;gap:12px;margin-top:8px">
-        <button class="btn btn-primary" onclick="saveConfig()">💾 保存配置</button>
-        <button class="btn btn-secondary" onclick="loadConfig()">🔄 重新加载</button>
+        <button class="btn btn-primary" onclick="saveConfig()"
+          data-help="保存当前账号的配置。若正在生成或发送，新配置会在当前任务结束后生效。">💾 保存配置</button>
+        <button class="btn btn-secondary" onclick="loadConfig()"
+          data-help="放弃页面中尚未保存的改动，重新读取当前账号已保存的配置。">🔄 重新加载</button>
       </div>
     </div>
 
@@ -815,7 +854,8 @@
         <p style="font-size:14px;color:var(--text2);margin-bottom:20px">
           使用 B站 App 扫码并在手机上确认。登录成功后会自动保存登录状态、绑定 UID，并显示该账号的 B站昵称。
         </p>
-        <button class="btn btn-primary" id="btn-gen-qr" onclick="generateQR()">📱 生成二维码</button>
+        <button class="btn btn-primary" id="btn-gen-qr" onclick="generateQR()"
+          data-help="向 B站申请当前账号的登录二维码。扫码并在手机确认后，登录状态会自动保存到当前账号。">📱 生成二维码</button>
         <div id="qr-container" style="margin-top:20px"></div>
       </div>
     </div>
@@ -826,7 +866,8 @@
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
           <span id="history-total" style="color:var(--text2);font-size:14px">共 0 条记录</span>
-          <button class="btn btn-danger" onclick="clearHistory()" style="padding:7px 14px;font-size:13px">🗑 清空历史</button>
+          <button class="btn btn-danger" onclick="clearHistory()" style="padding:7px 14px;font-size:13px"
+            data-help="清空当前账号在本工具中的回复历史记录。执行前会再次确认，不会删除 B站上的评论或回复。">🗑 清空历史</button>
         </div>
         <div class="table-wrap">
           <table>
@@ -851,10 +892,14 @@
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
           <div style="display:flex;gap:8px;align-items:center">
-            <label class="form-check" style="font-size:13px">
-              <input type="checkbox" id="log-auto-scroll" checked> 自动滚动
+            <label class="form-check" style="font-size:13px"
+              data-help="开启后，新日志到达时自动滚动到底部；关闭后会保留你当前查看的位置。"
+              title="控制新日志到达时是否自动滚动">
+              <input type="checkbox" id="log-auto-scroll" checked aria-label="日志自动滚动"> 自动滚动
             </label>
-            <select class="form-select" id="log-filter" style="width:120px;padding:5px 8px;font-size:13px" onchange="filterLogs()">
+            <select class="form-select" id="log-filter" style="width:120px;padding:5px 8px;font-size:13px" onchange="filterLogs()"
+              data-help="只改变当前显示的日志级别，不会删除后台日志。"
+              title="筛选当前显示的日志级别">
               <option value="">全部</option>
               <option value="INFO">INFO</option>
               <option value="WARNING">WARNING</option>
@@ -862,7 +907,9 @@
               <option value="DEBUG">DEBUG</option>
             </select>
           </div>
-          <button class="btn btn-secondary" onclick="clearLogs()" style="padding:7px 14px;font-size:13px">清空</button>
+          <button class="btn btn-secondary" onclick="clearLogs(this)" style="padding:7px 14px;font-size:13px"
+            data-help="清空当前账号在本次程序运行期间保存的日志，并同步清空当前页面。不会删除磁盘上的 launcher.log 文件。"
+            title="清空当前账号的实时日志">清空</button>
         </div>
         <div class="log-container" id="log-container"></div>
       </div>
@@ -1805,11 +1852,11 @@ function loadHistory(page) {
     const totalPages = Math.ceil(total / 20);
     const pg = document.getElementById('history-pagination');
     let pgHtml = '';
-    if (page > 1) pgHtml += `<button class="page-btn" onclick="loadHistory(${page-1})">‹</button>`;
+    if (page > 1) pgHtml += `<button class="page-btn" data-help="查看上一页回复历史。" onclick="loadHistory(${page-1})">‹</button>`;
     for (let i = Math.max(1,page-2); i <= Math.min(totalPages,page+2); i++) {
-      pgHtml += `<button class="page-btn ${i===page?'active':''}" onclick="loadHistory(${i})">${i}</button>`;
+      pgHtml += `<button class="page-btn ${i===page?'active':''}" data-help="查看第 ${i} 页回复历史。" onclick="loadHistory(${i})">${i}</button>`;
     }
-    if (page < totalPages) pgHtml += `<button class="page-btn" onclick="loadHistory(${page+1})">›</button>`;
+    if (page < totalPages) pgHtml += `<button class="page-btn" data-help="查看下一页回复历史。" onclick="loadHistory(${page+1})">›</button>`;
     pg.innerHTML = pgHtml;
   });
 }
@@ -1840,6 +1887,7 @@ function appendLog(entry) {
 function renderLogs() {
   const container = document.getElementById('log-container');
   const filter = document.getElementById('log-filter').value;
+  const previousScrollTop = container.scrollTop;
   container.innerHTML = '';
   allLogs.filter(e => !filter || e.level === filter).forEach(entry => {
     const div = document.createElement('div');
@@ -1847,10 +1895,29 @@ function renderLogs() {
     div.innerHTML = `<span class="log-time">${entry.time}</span><span class="log-level">[${entry.level}]</span> ${escHtml(entry.msg)}`;
     container.appendChild(div);
   });
-  container.scrollTop = container.scrollHeight;
+  container.scrollTop = document.getElementById('log-auto-scroll').checked
+    ? container.scrollHeight
+    : previousScrollTop;
 }
 function filterLogs() { renderLogs(); }
-function clearLogs() { allLogs = []; document.getElementById('log-container').innerHTML = ''; }
+function clearLogs(button) {
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = '清空中...';
+  fetch('/api/logs/clear', {method:'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok) throw new Error(d.message || '清空日志失败');
+      allLogs = [];
+      document.getElementById('log-container').innerHTML = '';
+      showToast('实时日志已清空', 'success');
+    })
+    .catch(error => showToast(`清空日志失败：${error.message || error}`, 'error'))
+    .finally(() => {
+      button.disabled = false;
+      button.textContent = originalText;
+    });
+}
 
 // ── Toast ──
 function showToast(msg, type='info') {

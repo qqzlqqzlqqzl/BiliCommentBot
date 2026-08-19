@@ -15,6 +15,7 @@ from pathlib import Path
 
 PRODUCT_ID = "BiliCommentReviewer"
 PRODUCT_NAME = "B站评论审核助手"
+DEFAULT_PRODUCT_PORT = 5000
 
 
 def product_data_root() -> Path:
@@ -67,7 +68,21 @@ def acquire_single_instance(root: Path):
         return None
 
 
-def choose_local_port() -> int:
+def local_port_is_available(port: int) -> bool:
+    if not 1 <= int(port) <= 65535:
+        return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", int(port)))
+        return True
+    except OSError:
+        return False
+
+
+def choose_local_port(previous_port: int = None) -> int:
+    for preferred in (DEFAULT_PRODUCT_PORT, previous_port):
+        if preferred and local_port_is_available(preferred):
+            return int(preferred)
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
@@ -165,7 +180,7 @@ def main():
             show_error("程序似乎已经在运行，但本地页面暂时无法连接。")
         return
 
-    port = choose_local_port()
+    port = choose_local_port(read_runtime_port(root))
     configure_environment(root, port)
     write_runtime(root, port)
     if os.environ.get("BILI_DISABLE_BROWSER", "").strip() != "1":
