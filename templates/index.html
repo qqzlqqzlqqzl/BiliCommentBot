@@ -196,10 +196,50 @@
 
   /* Responsive */
   @media (max-width: 768px) {
-    .sidebar { width: 60px; }
-    .sidebar-logo, .nav-list li a span:not(.icon) { display: none; }
-    .main { margin-left: 60px; padding: 16px; }
+    .app { display:block; }
+    .sidebar {
+      width:100%; min-height:0; height:auto; position:sticky; top:0; left:auto; bottom:auto;
+      padding:0; flex-direction:row; flex-wrap:wrap; z-index:1000;
+      border-right:none; border-bottom:1px solid var(--border);
+    }
+    .sidebar-logo { display:none; }
+    .nav-list {
+      order:1; display:flex; flex:1 1 100%; margin:0; overflow-x:auto;
+      scrollbar-width:none; border-bottom:1px solid var(--border);
+    }
+    .nav-list::-webkit-scrollbar { display:none; }
+    .nav-list li { flex:1 0 48px; }
+    .nav-list li a {
+      min-height:48px; padding:9px 10px; justify-content:center;
+      border-left:none; border-bottom:3px solid transparent;
+    }
+    .nav-list li a.active { border-left-color:transparent; border-bottom-color:var(--accent); }
+    .nav-list li a span:not(.icon), .status-dot { display:none; }
+    .sidebar-tools {
+      order:2; width:100%; padding:8px 12px; border-top:none;
+      display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+    }
+    .sidebar-tools .form-label { display:none; }
+    .sidebar-tools .form-select {
+      width:auto; min-width:120px; flex:1 1 140px; font-size:12px; padding:7px 8px;
+    }
+    .sidebar-tools .btn {
+      flex:1 1 120px; padding:7px 10px; justify-content:center; white-space:nowrap;
+    }
+    .main { margin-left:0; padding:16px; }
     .form-row, .form-row-3 { grid-template-columns: 1fr; }
+    .tab-bar { overflow-x:auto; white-space:nowrap; }
+    .tab-btn { flex:0 0 auto; }
+    #toast-container { left:12px; right:12px; top:112px; }
+    .toast { min-width:0; width:100%; }
+  }
+  @media (max-width: 480px) {
+    .main { padding:12px; }
+    .page-title { font-size:20px; margin-bottom:18px; }
+    .card { padding:16px; }
+    .stats-grid { grid-template-columns:1fr; }
+    .control-bar .btn { width:100%; justify-content:center; }
+    .sidebar-tools .form-select, .sidebar-tools .btn { flex-basis:calc(50% - 4px); min-width:0; }
   }
   .review-toolbar { display:grid; gap:12px; margin-bottom:16px; }
   .review-toolbar-row { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }

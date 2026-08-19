@@ -151,7 +151,9 @@ try {
         $page.Content -notmatch '按配置的检查间隔在后台扫描最新评论' -or
         $page.Content -notmatch '配置豆包 API、模型、推理力度' -or
         $page.Content -notmatch '向 B站申请当前账号的登录二维码' -or
-        $page.Content -notmatch '查看第 \$\{i\} 页回复历史'
+        $page.Content -notmatch '查看第 \$\{i\} 页回复历史' -or
+        $page.Content -notmatch 'position:sticky' -or
+        $page.Content -match '\.sidebar \{ width: 60px; \}'
     ) {
         throw "日间日志配色、日志交互或全局功能悬浮说明不正确"
     }

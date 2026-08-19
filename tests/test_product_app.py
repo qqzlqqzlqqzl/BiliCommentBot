@@ -122,6 +122,10 @@ class ProductAppTests(unittest.TestCase):
         self.assertIn("--log-bg: #f7f8fa", template)
         self.assertIn("fetch('/api/logs/clear'", template)
         self.assertIn("关闭后会保留你当前查看的位置", template)
+        self.assertIn(".sidebar {", template)
+        self.assertIn("position:sticky", template)
+        self.assertIn(".sidebar-tools .form-label { display:none; }", template)
+        self.assertNotIn(".sidebar { width: 60px; }", template)
         save_config_body = template.split(
             "function saveConfig()", 1
         )[1].split("function clearConfigSecret", 1)[0]
