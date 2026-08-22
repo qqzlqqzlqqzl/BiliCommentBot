@@ -317,6 +317,7 @@ class ReviewApiTests(unittest.TestCase):
                     "limit": 100,
                     "review_time_range": "24h",
                     "review_since": "不应保存的旧时间",
+                    "stop_after_empty_pages": False,
                 },
             )
 
@@ -324,7 +325,22 @@ class ReviewApiTests(unittest.TestCase):
         self.assertEqual(config["reply"]["max_process"], 100)
         self.assertEqual(config["reply"]["review_time_range"], "24h")
         self.assertEqual(config["reply"]["review_since"], "")
+        self.assertFalse(config["reply"]["stop_after_empty_pages"])
         save.assert_called_once_with(config)
+
+    def test_review_preferences_reject_non_boolean_empty_page_setting(self):
+        response = self.client.post(
+            "/api/review/preferences",
+            json={
+                "limit": 100,
+                "review_time_range": "",
+                "review_since": "",
+                "stop_after_empty_pages": "false",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("布尔值", response.get_json()["message"])
 
     def test_generate_defaults_to_five_hundred(self):
         response = self.client.post("/api/review/generate", json={})

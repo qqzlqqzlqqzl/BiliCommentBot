@@ -647,6 +647,30 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(sent_data["root"], "900")
         self.assertEqual(sent_data["parent"], "100")
 
+    def test_reply_comment_marks_closed_comment_area_as_permanent_failure(self):
+        reply_bot = BiliCommentBot.__new__(BiliCommentBot)
+        reply_bot.config = copy.deepcopy(DEFAULT_CONFIG)
+        reply_bot.logger = logging.getLogger("reply-closed-comment-area-test")
+        reply_bot.csrf_token = "csrf"
+        reply_bot.cookie_manager = Mock()
+        reply_bot.cookie_manager._get_csrf_from_cookie.return_value = "csrf"
+        reply_bot.cookie_manager.verify_cookie.return_value = (True, {})
+        reply_bot.bvid_to_aid = Mock(return_value="123")
+        response = Mock()
+        response.__bool__ = Mock(return_value=True)
+        response.json.return_value = {
+            "code": -404,
+            "message": "当前页面评论功能已关闭",
+        }
+        reply_bot.make_request_with_retry = Mock(return_value=response)
+
+        result = reply_bot.reply_comment("BV1test", "100", "豆包候选")
+
+        self.assertFalse(result.ok)
+        self.assertFalse(result.uncertain)
+        self.assertTrue(result.permanent)
+        self.assertEqual(result.message, "当前页面评论功能已关闭")
+
     def test_only_explicitly_approved_requested_draft_is_sent(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
         self.bot._review_drafts["2"] = self._draft("2", approved=False, status="pending")
@@ -740,6 +764,33 @@ class ReviewWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "待核对"):
             self.bot.set_review_approval("1", True)
 
+    def test_permanent_send_failure_is_marked_unavailable_and_not_retryable(self):
+        self.bot._review_drafts["1"] = self._draft(
+            "1",
+            approved=True,
+            status="approved",
+        )
+        self.bot.reply_comment = Mock(return_value=ReplyAttemptResult(
+            False,
+            False,
+            "当前页面评论功能已关闭",
+            True,
+        ))
+
+        result = self.bot.send_approved_drafts(comment_ids=["1"])
+
+        draft = self.bot._review_drafts["1"]
+        self.assertEqual(result, {"sent": 0, "failed": 1, "unknown": 0})
+        self.assertEqual(draft["status"], "unavailable")
+        self.assertFalse(draft["approved"])
+        self.assertFalse(draft["should_reply"])
+        self.assertEqual(draft["error"], "当前页面评论功能已关闭")
+        self.assertIn("unavailable_at", draft)
+        with self.assertRaisesRegex(ValueError, "不可回复"):
+            self.bot.set_review_approval("1", True)
+        with self.assertRaisesRegex(ValueError, "不可回复"):
+            self.bot.regenerate_review_draft("1")
+
     def test_second_send_request_is_rejected_while_first_is_active(self):
         self.bot._review_drafts["1"] = self._draft("1", approved=True, status="approved")
         entered = threading.Event()
@@ -786,6 +837,23 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertFalse(self.bot._review_drafts["1"]["approved"])
         self.assertEqual(self.bot._review_drafts["2"]["status"], "pending")
         self.assertFalse(self.bot._review_drafts["2"]["approved"])
+
+    def test_load_migrates_closed_comment_failure_to_unavailable(self):
+        failed = self._draft("1", approved=True, status="failed")
+        failed["error"] = "当前页面评论功能已关闭"
+        with open(self.drafts_file, "w", encoding="utf-8") as handle:
+            json.dump([failed], handle, ensure_ascii=False)
+
+        self.bot._review_drafts = {}
+        self.bot.load_review_drafts()
+
+        draft = self.bot._review_drafts["1"]
+        self.assertEqual(draft["status"], "unavailable")
+        self.assertFalse(draft["approved"])
+        self.assertFalse(draft["should_reply"])
+        self.assertIn("unavailable_at", draft)
+        with self.assertRaisesRegex(ValueError, "不可回复"):
+            self.bot.set_review_approval("1", True)
 
     def test_config_change_is_deferred_until_active_operation_finishes(self):
         old_config = copy.deepcopy(self.bot.config)
@@ -1043,6 +1111,33 @@ class ReviewWorkflowTests(unittest.TestCase):
 
         self.assertEqual(items, [])
         self.assertEqual(self.bot.make_request_with_retry.call_count, 3)
+
+    def test_creator_feed_can_disable_three_empty_page_stop(self):
+        pages = []
+        known_ids = set()
+        for page_number in range(1, 6):
+            rows = []
+            for offset in range(10):
+                comment_id = page_number * 100 + offset
+                known_ids.add(str(comment_id))
+                rows.append(self._creator_row(comment_id))
+            pages.append(
+                self._creator_page(
+                    rows,
+                    page_number=page_number,
+                    total=50,
+                )
+            )
+        self.bot.make_request_with_retry = Mock(side_effect=pages)
+
+        items = self.bot.get_creator_comment_feed(
+            limit=50,
+            skip_comment_ids=known_ids,
+            stop_after_empty_pages=False,
+        )
+
+        self.assertEqual(items, [])
+        self.assertEqual(self.bot.make_request_with_retry.call_count, 5)
 
     def test_creator_feed_new_candidate_resets_empty_page_counter(self):
         pages = []

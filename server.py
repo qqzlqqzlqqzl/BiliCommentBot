@@ -800,9 +800,19 @@ def api_review_preferences():
 
     cfg = load_config()
     reply_cfg = cfg.setdefault("reply", {})
+    stop_after_empty_pages = data.get(
+        "stop_after_empty_pages",
+        reply_cfg.get("stop_after_empty_pages", True),
+    )
+    if not isinstance(stop_after_empty_pages, bool):
+        return jsonify({
+            "ok": False,
+            "message": "连续无新增提前停止必须是布尔值",
+        }), 400
     reply_cfg["max_process"] = limit
     reply_cfg["review_time_range"] = review_time_range
     reply_cfg["review_since"] = review_since
+    reply_cfg["stop_after_empty_pages"] = stop_after_empty_pages
     if not save_config(cfg):
         return jsonify({"ok": False, "message": "保存读取偏好失败"}), 500
     applied = get_bot().reload_config(cfg)

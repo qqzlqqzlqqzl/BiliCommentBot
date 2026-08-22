@@ -36,6 +36,16 @@ REVIEW_DRAFTS_FILE = os.path.join(DATA_DIR, "review_drafts.json") if DATA_DIR el
 REVIEW_READ_DEFAULT = 500
 REVIEW_READ_MAX = 50000
 CREATOR_EMPTY_PAGE_STOP = 3
+PERMANENT_REPLY_FAILURE_MARKERS = (
+    "当前页面评论功能已关闭",
+    "评论功能已关闭",
+    "评论区已关闭",
+    "稿件已删除",
+    "稿件不存在",
+    "视频已失效",
+    "评论已被删除",
+    "评论不存在",
+)
 REVIEW_TIME_RANGE_SECONDS = {
     "24h": 24 * 60 * 60,
     "3d": 3 * 24 * 60 * 60,
@@ -109,6 +119,7 @@ DEFAULT_CONFIG = {
         "max_process": 500,
         "review_since": "",
         "review_time_range": "",
+        "stop_after_empty_pages": True,
         "reply_delay": 2,
         "like_enabled": False,
         "context_comments_count": 0,
@@ -342,6 +353,7 @@ class ReplyAttemptResult:
     ok: bool
     uncertain: bool = False
     message: str = ""
+    permanent: bool = False
 
     def __bool__(self):
         return self.ok
@@ -927,6 +939,7 @@ class BiliCommentBot:
         try:
             recovered_sending = 0
             recovered_regenerating = 0
+            recovered_unavailable = 0
             review_drafts_file = getattr(
                 self, "review_drafts_file", REVIEW_DRAFTS_FILE
             )
@@ -955,7 +968,25 @@ class BiliCommentBot:
                             )
                             draft["error"] = "程序在重新生成过程中退出，已保留退出前的候选回复"
                             recovered_regenerating += 1
-                    if recovered_sending or recovered_regenerating:
+                        elif (
+                            draft.get("status") == "failed"
+                            and self._is_permanent_reply_failure(
+                                draft.get("error", "")
+                            )
+                        ):
+                            draft["approved"] = False
+                            draft["should_reply"] = False
+                            draft["status"] = "unavailable"
+                            draft.setdefault(
+                                "unavailable_at",
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            )
+                            recovered_unavailable += 1
+                    if (
+                        recovered_sending
+                        or recovered_regenerating
+                        or recovered_unavailable
+                    ):
                         self._save_review_drafts()
             self.logger.info(f"加载审核草稿 {len(self._review_drafts)} 条")
             if recovered_sending:
@@ -967,6 +998,12 @@ class BiliCommentBot:
                 self.logger.warning(
                     "发现%s条上次退出时仍在重新生成的草稿，已恢复退出前候选并取消批准",
                     recovered_regenerating,
+                )
+            if recovered_unavailable:
+                self.logger.warning(
+                    "发现%s条历史失败草稿已被B站明确标记为不可回复，"
+                    "已永久跳过，不会再次生成或发送",
+                    recovered_unavailable,
                 )
         except Exception as e:
             self.logger.error(f"加载审核草稿失败: {e}")
@@ -1002,6 +1039,8 @@ class BiliCommentBot:
             draft = self._review_drafts.get(str(comment_id))
             if not draft:
                 raise KeyError("草稿不存在")
+            if draft.get("status") == "unavailable":
+                raise ValueError("B站已明确标记该评论不可回复")
             if not draft.get("should_reply"):
                 raise ValueError("豆包已判断该评论不建议回复")
             if draft.get("status") == "sent":
@@ -1033,6 +1072,8 @@ class BiliCommentBot:
             status = str(draft.get("status") or "")
             if status == "sent":
                 raise ValueError("该回复已经发送，不能设为人工不回复")
+            if status == "unavailable":
+                raise ValueError("B站已明确标记该评论不可回复")
             if status == "sending":
                 raise ValueError("该回复正在发送，不能设为人工不回复")
             if status == "regenerating":
@@ -1084,8 +1125,8 @@ class BiliCommentBot:
                     if not draft.get("should_reply") or not str(draft.get("reply") or "").strip():
                         raise ValueError(f"该评论没有可发送的候选回复: {comment_id}")
                     if draft.get("status") in {
-                        "sent", "skipped", "dismissed", "regenerating", "sending",
-                        "send_unknown"
+                        "sent", "skipped", "dismissed", "unavailable",
+                        "regenerating", "sending", "send_unknown"
                     }:
                         raise ValueError(
                             f"该回复当前不能更改批准状态: {comment_id}"
@@ -1111,6 +1152,8 @@ class BiliCommentBot:
                     raise KeyError("草稿不存在")
                 if current.get("status") == "sent":
                     raise ValueError("已发送的回复不能重新生成")
+                if current.get("status") == "unavailable":
+                    raise ValueError("B站已明确标记该评论不可回复")
                 if current.get("status") == "regenerating":
                     raise ValueError("该回复已经在重新生成")
                 if current.get("status") == "sending":
@@ -1512,8 +1555,9 @@ class BiliCommentBot:
         my_uid: str = "",
         skip_comment_ids=None,
         candidate_filter=None,
+        stop_after_empty_pages: bool = True,
     ) -> List[dict]:
-        """按时间线读取最新评论，并在本地候选连续三页无新增时停止。"""
+        """按时间线读取最新评论，可选连续三页无新增时提前停止。"""
         url = "https://api.bilibili.com/x/v2/reply/up/fulllist"
         page_size = 10
         limit = max(1, int(limit))
@@ -1636,15 +1680,19 @@ class BiliCommentBot:
 
             page = data.get("page") or {}
             total = int(page.get("total") or 0)
+            empty_page_progress = (
+                f"{empty_candidate_pages}/{CREATOR_EMPTY_PAGE_STOP}页"
+                if stop_after_empty_pages
+                else f"{empty_candidate_pages}页（提前停止已关闭）"
+            )
             self.logger.info(
                 "创作中心最新评论第%s页扫描%s条；本页新增待生成%s条，"
-                "连续无新增%s/%s页；累计扫描%s条，待生成%s条，"
+                "连续无新增%s；累计扫描%s条，待生成%s条，"
                 "排除自己的回复%s条、已回复%s条、已有记录%s条、过滤%s条",
                 pn,
                 page_scanned_count,
                 page_new_count,
-                empty_candidate_pages,
-                CREATOR_EMPTY_PAGE_STOP,
+                empty_page_progress,
                 scanned_count,
                 len(eligible_items),
                 self_count,
@@ -1658,7 +1706,10 @@ class BiliCommentBot:
                 stop_reason = "已到达所选时间范围"
             elif reached_raw_limit or scanned_count >= limit:
                 stop_reason = f"已达到本次读取上限 {limit} 条"
-            elif empty_candidate_pages >= CREATOR_EMPTY_PAGE_STOP:
+            elif (
+                stop_after_empty_pages
+                and empty_candidate_pages >= CREATOR_EMPTY_PAGE_STOP
+            ):
                 stop_reason = (
                     f"连续{CREATOR_EMPTY_PAGE_STOP}页没有新增待生成评论"
                 )
@@ -2136,6 +2187,14 @@ class BiliCommentBot:
             self.logger.error(f"检查粉丝关系异常: {e}", exc_info=True)
             return False
 
+    @staticmethod
+    def _is_permanent_reply_failure(message: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(message or ""))
+        return any(
+            marker in normalized
+            for marker in PERMANENT_REPLY_FAILURE_MARKERS
+        )
+
     def reply_comment(
         self,
         bvid: str,
@@ -2193,8 +2252,12 @@ class BiliCommentBot:
                 self.logger.info(f"回复成功: {comment_id} (类型: {reply_type})")
                 return ReplyAttemptResult(True)
             message = str(result.get("message") or "B站回复接口返回失败")
-            self.logger.error(f"回复失败: {message}")
-            return ReplyAttemptResult(False, False, message)
+            permanent = self._is_permanent_reply_failure(message)
+            if permanent:
+                self.logger.warning(f"回复不可用，已标记为永久跳过: {message}")
+            else:
+                self.logger.error(f"回复失败: {message}")
+            return ReplyAttemptResult(False, False, message, permanent)
         except Exception as e:
             self.logger.error(f"回复异常: {e}")
             return ReplyAttemptResult(
@@ -2238,6 +2301,9 @@ class BiliCommentBot:
             existing_ids = set(self._review_drafts)
 
         if not only_bvid:
+            stop_after_empty_pages = bool(
+                task_config["reply"].get("stop_after_empty_pages", True)
+            )
             effective_since = (
                 task_config["reply"].get("review_since", "")
                 if review_since is None
@@ -2253,22 +2319,22 @@ class BiliCommentBot:
                 effective_time_range,
             )
             if since_timestamp is None:
-                self.logger.info(
-                    "开始扫描创作中心最新评论：最多读取%s条，不限时间；"
-                    "连续%s页没有新增待生成评论则停止",
-                    limit,
-                    CREATOR_EMPTY_PAGE_STOP,
-                )
+                range_text = "不限时间"
             else:
-                self.logger.info(
-                    "开始扫描创作中心最新评论：最多读取%s条，时间下限%s；"
-                    "连续%s页没有新增待生成评论则停止",
-                    limit,
-                    datetime.fromtimestamp(since_timestamp).strftime(
-                        "%Y-%m-%d %H:%M:%S"
-                    ),
-                    CREATOR_EMPTY_PAGE_STOP,
-                )
+                range_text = "时间下限" + datetime.fromtimestamp(
+                    since_timestamp
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            stop_text = (
+                f"连续{CREATOR_EMPTY_PAGE_STOP}页没有新增待生成评论则停止"
+                if stop_after_empty_pages
+                else "连续无新增提前停止已关闭"
+            )
+            self.logger.info(
+                "开始扫描创作中心最新评论：最多读取%s条，%s；%s",
+                limit,
+                range_text,
+                stop_text,
+            )
             feed_items = self.get_creator_comment_feed(
                 limit,
                 since_timestamp,
@@ -2278,6 +2344,7 @@ class BiliCommentBot:
                     comment,
                     task_config,
                 )[0],
+                stop_after_empty_pages=stop_after_empty_pages,
             )
             for feed_item in feed_items:
                 if len(items) >= limit:
@@ -2593,10 +2660,12 @@ class BiliCommentBot:
                     ok = attempt.ok
                     uncertain = attempt.uncertain
                     error_message = attempt.message
+                    permanent = attempt.permanent
                 else:
                     ok = bool(attempt)
                     uncertain = False
                     error_message = "" if ok else "B站回复接口返回失败"
+                    permanent = False
 
                 history_comment = None
                 with self._review_lock:
@@ -2629,6 +2698,18 @@ class BiliCommentBot:
                             f"{error_message}；请先到B站创作中心核对，系统不会自动重发"
                         )
                         unknown += 1
+                    elif permanent:
+                        current["status"] = "unavailable"
+                        current["should_reply"] = False
+                        current["unavailable_at"] = datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        current["error"] = error_message
+                        failed += 1
+                        self.logger.warning(
+                            "comment_id=%s 已标记为不可回复，后续扫描和发送都会跳过",
+                            comment_id,
+                        )
                     else:
                         current["status"] = "failed"
                         current["error"] = (

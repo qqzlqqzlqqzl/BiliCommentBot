@@ -401,7 +401,7 @@
             <div class="review-toolbar-field">
               <label class="form-label" for="review-limit" style="margin:0">本次读取</label>
               <select class="form-select" id="review-limit" style="width:190px"
-                data-help="限制本次从创作中心最新评论时间线最多扫描多少条原始评论。达到数量上限、时间下限、连续 3 页无新增或列表末尾中的任一条件，就会停止。"
+                data-help="限制本次从创作中心最新评论时间线最多扫描多少条原始评论。达到数量上限、时间下限、列表末尾，或启用的连续 3 页无新增条件时停止。"
                 title="限制本次最多扫描的最新评论数量">
                 <option value="10">最近 10 条</option>
                 <option value="20">最近 20 条</option>
@@ -417,7 +417,13 @@
                 <option value="50000">尽可能读取（最多 50000 条）</option>
               </select>
             </div>
-            <span class="review-scan-hint">默认最多扫描 500 条原始评论；连续 3 页没有新增待生成评论会提前停止。</span>
+            <span class="review-scan-hint">默认最多扫描 500 条原始评论。</span>
+            <label class="form-check" style="font-size:13px"
+              data-help="开启后，连续 3 页没有发现新的待生成评论就提前停止。关闭后会继续扫描，直到数量、时间或列表末尾；适合前面多页都是旧记录、但更后面仍有漏处理评论的情况。"
+              title="控制是否连续三页无新增就提前停止">
+              <input type="checkbox" id="review-stop-after-empty-pages" checked>
+              连续 3 页无新增时提前停止
+            </label>
             <div class="review-toolbar-field">
               <label class="form-label" for="review-time-range" style="margin:0">时间范围</label>
               <select class="form-select" id="review-time-range" style="width:140px" onchange="updateReviewTimeRange()"
@@ -455,6 +461,7 @@
                 <option value="approved">已勾选</option>
                 <option value="sent">已发送</option>
                 <option value="failed">发送失败</option>
+                <option value="unavailable">B站已关闭/不可回复</option>
                 <option value="sending">发送中</option>
                 <option value="send_unknown">发送结果待核对</option>
                 <option value="all">全部</option>
@@ -1259,7 +1266,8 @@ function loadConfig() {
       restoreReviewPreferences(
         r.max_process,
         r.review_since,
-        r.review_time_range
+        r.review_time_range,
+        r.stop_after_empty_pages
       );
       reviewPreferencesLoaded = true;
     }
@@ -1423,6 +1431,7 @@ function reviewStatusLabel(item) {
     approved: '已勾选',
     skipped: '豆包建议跳过',
     dismissed: '人工不回复',
+    unavailable: 'B站已关闭/不可回复',
     regenerating: '豆包重写中',
     sending: '发送中',
     send_unknown: '发送结果待核对',
@@ -1434,7 +1443,7 @@ function reviewStatusLabel(item) {
 
 function reviewStatusBadge(item) {
   const cls = item.status === 'sent' ? 'badge-green'
-    : ['failed', 'send_unknown'].includes(item.status) ? 'badge-red'
+    : ['failed', 'send_unknown', 'unavailable'].includes(item.status) ? 'badge-red'
     : ['approved', 'sending'].includes(item.status) ? 'badge-blue'
     : '';
   return `<span class="badge ${cls}">${escHtml(reviewStatusLabel(item))}</span>`;
@@ -1500,9 +1509,9 @@ function loadReviewDrafts(retryOnNetworkError = true) {
     }
     tbody.innerHTML = visibleItems.map(item => {
       const canApprove = item.should_reply
-        && !['sent', 'skipped', 'dismissed', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
-      const canRegenerate = !['sent', 'dismissed', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
-      const canDismiss = !['sent', 'dismissed', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
+        && !['sent', 'skipped', 'dismissed', 'unavailable', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
+      const canRegenerate = !['sent', 'dismissed', 'unavailable', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
+      const canDismiss = !['sent', 'dismissed', 'unavailable', 'regenerating', 'sending', 'send_unknown'].includes(item.status);
       const canRestore = item.status === 'dismissed';
       const parent = item.parent_comment
         ? `<div class="review-parent">上级评论 · ${escHtml(item.parent_author || '')}<br>${escHtml(item.parent_comment)}</div>`
@@ -1607,6 +1616,9 @@ function reviewPreferencesPayload() {
     review_since: reviewTimeRange === 'custom'
       ? document.getElementById('review-since').value || ''
       : '',
+    stop_after_empty_pages: document.getElementById(
+      'review-stop-after-empty-pages'
+    ).checked,
   };
 }
 
@@ -1639,15 +1651,24 @@ function normalizeReviewLimit(value, fallback = 500) {
   return allowed.length ? allowed[allowed.length - 1] : 500;
 }
 
-function restoreReviewPreferences(defaultLimit, defaultSince, defaultRange) {
+function restoreReviewPreferences(
+  defaultLimit,
+  defaultSince,
+  defaultRange,
+  defaultStopAfterEmptyPages = true
+) {
   const timeRange = document.getElementById('review-time-range');
   const sinceInput = document.getElementById('review-since');
   const limitSelect = document.getElementById('review-limit');
+  const stopAfterEmptyPages = document.getElementById(
+    'review-stop-after-empty-pages'
+  );
   const preferredLimit = String(normalizeReviewLimit(defaultLimit || 500));
   limitSelect.value = preferredLimit;
   timeRange.value = defaultRange || (defaultSince ? 'custom' : '');
   sinceInput.value = defaultSince || '';
   sinceInput.style.display = timeRange.value === 'custom' ? '' : 'none';
+  stopAfterEmptyPages.checked = defaultStopAfterEmptyPages !== false;
 }
 
 function updateReviewTimeRange() {
@@ -2047,6 +2068,10 @@ function initHelpTooltips() {
   document.getElementById('review-since').addEventListener(
     'change',
     () => saveReviewPreferences().catch(() => {})
+  );
+  document.getElementById('review-stop-after-empty-pages').addEventListener(
+    'change',
+    () => saveReviewPreferences(true).catch(() => {})
   );
   loadAccounts().then(() => {
     loadConfig();

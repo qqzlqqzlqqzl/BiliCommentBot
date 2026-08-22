@@ -6,5 +6,5 @@ echo.
 echo Starting http://127.0.0.1:5000
 echo Keep this window open.
 echo.
-python launch_instance.py --port 5000 --account-slot 1
+python "%~dp0..\launch_instance.py" --port 5000 --account-slot 1
 pause

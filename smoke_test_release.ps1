@@ -106,12 +106,14 @@ try {
         throw "页面默认读取数量不是 500"
     }
     if (
-        $page.Content -notmatch '连续 3 页没有新增待生成评论' -or
+        $page.Content -notmatch 'id="review-stop-after-empty-pages"' -or
+        $page.Content -notmatch '连续 3 页无新增时提前停止' -or
+        $page.Content -notmatch 'B站已关闭/不可回复' -or
         $page.Content -notmatch 'review_time_range: reviewTimeRange' -or
         $page.Content -notmatch '\.\.\.reviewPreferencesPayload\(\)' -or
         $page.Content -notmatch '/api/review/preferences'
     ) {
-        throw "页面缺少三页停止、时间范围持久化或发送门禁参数"
+        throw "页面缺少可配置三页停止、不可回复状态、时间范围持久化或发送门禁参数"
     }
     if (
         $page.Content -notmatch 'id="btn-review-select-all"' -or
@@ -205,14 +207,16 @@ try {
         [double]$defaultConfig.config.rate_limit.min_request_interval -ne 10 -or
         [int]$defaultConfig.config.rate_limit.max_retries -ne 3 -or
         [int]$defaultConfig.config.rate_limit.retry_delay -ne 20 -or
-        [int]$defaultConfig.config.reply.max_process -ne 500
+        [int]$defaultConfig.config.reply.max_process -ne 500 -or
+        [bool]$defaultConfig.config.reply.stop_after_empty_pages -ne $true
     ) {
-        throw "发布 EXE 的默认参数未恢复为 500/600/10/3/20"
+        throw "发布 EXE 的默认参数未恢复为 500/600/10/3/20，或三页提前停止默认未开启"
     }
     $preferences = Post-Json "$baseUrl/api/review/preferences" @{
         limit = 100
         review_time_range = "24h"
         review_since = ""
+        stop_after_empty_pages = $false
     }
     if (-not $preferences.ok) {
         throw "审核读取偏好保存失败"
@@ -223,9 +227,10 @@ try {
     if (
         [int]$preferenceConfig.config.reply.max_process -ne 100 -or
         [string]$preferenceConfig.config.reply.review_time_range -ne "24h" -or
-        [string]$preferenceConfig.config.reply.review_since -ne ""
+        [string]$preferenceConfig.config.reply.review_since -ne "" -or
+        [bool]$preferenceConfig.config.reply.stop_after_empty_pages -ne $false
     ) {
-        throw "审核读取数量或24小时时间范围没有按账号持久化"
+        throw "审核读取数量、24小时时间范围或三页提前停止开关没有按账号持久化"
     }
     try {
         Post-Json "$baseUrl/api/review/send" @{

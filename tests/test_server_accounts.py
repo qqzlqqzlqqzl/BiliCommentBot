@@ -126,6 +126,7 @@ class ServerAccountApiTests(unittest.TestCase):
                 "limit": 100,
                 "review_time_range": "24h",
                 "review_since": "",
+                "stop_after_empty_pages": False,
             },
         )
         second_id = self.client.post(
@@ -138,6 +139,7 @@ class ServerAccountApiTests(unittest.TestCase):
                 "limit": 200,
                 "review_time_range": "7d",
                 "review_since": "",
+                "stop_after_empty_pages": True,
             },
         )
 
@@ -147,12 +149,20 @@ class ServerAccountApiTests(unittest.TestCase):
         self.assertEqual(first_save.status_code, 200)
         self.assertEqual(second_save.status_code, 200)
         self.assertEqual(
-            (first["max_process"], first["review_time_range"]),
-            (100, "24h"),
+            (
+                first["max_process"],
+                first["review_time_range"],
+                first["stop_after_empty_pages"],
+            ),
+            (100, "24h", False),
         )
         self.assertEqual(
-            (second["max_process"], second["review_time_range"]),
-            (200, "7d"),
+            (
+                second["max_process"],
+                second["review_time_range"],
+                second["stop_after_empty_pages"],
+            ),
+            (200, "7d", True),
         )
 
     def test_unknown_account_cannot_be_selected(self):

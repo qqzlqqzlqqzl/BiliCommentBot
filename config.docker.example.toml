@@ -68,6 +68,8 @@ only_new = true
 max_process = 500
 # 可选：只读取此时间之后的评论，留空表示仅按条数限制
 review_since = ""
+# 是否连续 3 页没有新增待生成评论时提前停止
+stop_after_empty_pages = true
 # 每批交给豆包判断的评论数
 review_batch_size = 8
 # 回复延迟（秒，避免频繁操作）
