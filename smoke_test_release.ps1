@@ -195,6 +195,13 @@ try {
     ) {
         throw "页面缺少按账号自动回复开关或多账号全局串行说明"
     }
+    if (
+        $page.Content -notmatch 'id="account-migration-card"' -or
+        $page.Content -notmatch "导出当前账号迁移包" -or
+        $page.Content -notmatch "/api/accounts/import-bundle"
+    ) {
+        throw "页面缺少跨电脑迁移入口"
+    }
     $socketClient = Invoke-WebRequest `
         -Uri "$baseUrl/static/socket.io.min.js" `
         -TimeoutSec 10
@@ -311,6 +318,46 @@ try {
     $monitorConfig = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
     if ([bool]$monitorConfig.config.bilibili.auto_start_monitor -ne $false) {
         throw "定时处理关闭状态没有持久化"
+    }
+
+    $firstAccountDir = Join-Path (Join-Path $testRoot "accounts") $firstId
+    $migrationHistoryPath = Join-Path $firstAccountDir "history.json"
+    $migrationBundlePath = Join-Path $testRoot "account-migration.zip"
+    Set-Content `
+        -LiteralPath $migrationHistoryPath `
+        -Value '[{"comment_id":"smoke-migrated","reply_content":"已回复"}]' `
+        -Encoding utf8
+    Invoke-WebRequest `
+        -Uri "$baseUrl/api/accounts/export" `
+        -OutFile $migrationBundlePath `
+        -TimeoutSec 10
+    if (
+        -not (Test-Path -LiteralPath $migrationBundlePath) -or
+        (Get-Item -LiteralPath $migrationBundlePath).Length -le 0
+    ) {
+        throw "正式 EXE 未生成账号迁移 ZIP"
+    }
+    Set-Content `
+        -LiteralPath $migrationHistoryPath `
+        -Value "[]" `
+        -Encoding utf8
+    $migrationImport = Invoke-RestMethod `
+        -Uri "$baseUrl/api/accounts/import-bundle" `
+        -Method Post `
+        -Form @{ file = Get-Item -LiteralPath $migrationBundlePath } `
+        -TimeoutSec 10
+    if (
+        -not $migrationImport.ok -or
+        [string]$migrationImport.account.mode -ne "merged" -or
+        [int]$migrationImport.account.history_added -ne 1
+    ) {
+        throw "同 UID 迁移包没有合并回复历史"
+    }
+    $migrationStatus = Invoke-RestMethod `
+        -Uri "$baseUrl/api/bot/status" `
+        -TimeoutSec 10
+    if ([int]$migrationStatus.processed_count -ne 1) {
+        throw "迁移后的回复历史没有重新进入评论去重集合"
     }
 
     $created = Post-Json "$baseUrl/api/accounts" @{ name = "烟测账号 2" }
@@ -466,6 +513,7 @@ try {
         AccountCount = $manifest.accounts.Count
         LocalSocketClient = $true
         SecretsRedacted = $true
+        MigrationHistoryRestored = $migrationStatus.processed_count
         LegacyImportFiles = $imported.account.imported_files.Count
         FirstAccountUid = $config1.config.bilibili.uid
         SecondAccountUid = $config2.config.bilibili.uid
