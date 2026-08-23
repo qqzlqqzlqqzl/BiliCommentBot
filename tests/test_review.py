@@ -535,13 +535,98 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertEqual(self.bot._collect_review_items.call_args.args[0], 500)
 
     def test_default_product_parameters_match_confirmed_values(self):
-        self.assertEqual(DEFAULT_CONFIG["bilibili"]["check_interval"], 600)
+        self.assertEqual(DEFAULT_CONFIG["bilibili"]["check_interval"], 3600)
         self.assertEqual(DEFAULT_CONFIG["rate_limit"]["min_request_interval"], 10.0)
         self.assertEqual(DEFAULT_CONFIG["rate_limit"]["max_retries"], 3)
         self.assertEqual(DEFAULT_CONFIG["rate_limit"]["retry_delay"], 20)
         self.assertEqual(DEFAULT_CONFIG["reply"]["max_process"], 500)
+        self.assertEqual(DEFAULT_CONFIG["reply"]["reply_delay"], 10)
+        self.assertFalse(DEFAULT_CONFIG["reply"]["auto_send_enabled"])
         self.assertIn("默认不要使用", DEFAULT_CONFIG["ark"]["system_prompt"])
         self.assertIn("哈哈哈", DEFAULT_CONFIG["ark"]["system_prompt"])
+
+    def test_monitor_manual_mode_only_generates_drafts(self):
+        self.bot.config["reply"]["enabled"] = True
+        self.bot.config["reply"]["auto_send_enabled"] = False
+        self.bot._running = True
+        self.bot.generate_review_drafts = Mock(return_value={
+            "generated": 1,
+            "replyable": 1,
+            "skipped": 0,
+            "replyable_ids": ["new"],
+            "auto_send_enabled": False,
+        })
+        self.bot.send_approved_drafts = Mock()
+
+        self.bot.process_comments()
+
+        self.bot.generate_review_drafts.assert_called_once_with(
+            include_generated_ids=True
+        )
+        self.bot.send_approved_drafts.assert_not_called()
+
+    def test_monitor_auto_mode_sends_only_current_round_replyable_ids(self):
+        self.bot.config["reply"]["enabled"] = True
+        self.bot.config["reply"]["auto_send_enabled"] = True
+        self.bot._running = True
+        self.bot.generate_review_drafts = Mock(return_value={
+            "generated": 3,
+            "replyable": 2,
+            "skipped": 1,
+            "replyable_ids": ["new-1", "new-2"],
+            "auto_send_enabled": True,
+        })
+        self.bot.send_approved_drafts = Mock(return_value={
+            "sent": 2,
+            "failed": 0,
+            "unknown": 0,
+        })
+
+        self.bot.process_comments()
+
+        self.bot.send_approved_drafts.assert_called_once_with(
+            comment_ids=["new-1", "new-2"],
+            auto_approve=True,
+        )
+
+    def test_monitor_stop_during_generation_leaves_new_drafts_pending(self):
+        self.bot.config["reply"]["enabled"] = True
+        self.bot.config["reply"]["auto_send_enabled"] = True
+        self.bot._running = False
+        self.bot.generate_review_drafts = Mock(return_value={
+            "generated": 1,
+            "replyable": 1,
+            "skipped": 0,
+            "replyable_ids": ["new"],
+            "auto_send_enabled": True,
+        })
+        self.bot.send_approved_drafts = Mock()
+
+        self.bot.process_comments()
+
+        self.bot.send_approved_drafts.assert_not_called()
+
+    def test_monitor_auto_send_busy_keeps_current_round_for_review(self):
+        self.bot.config["reply"]["enabled"] = True
+        self.bot.config["reply"]["auto_send_enabled"] = True
+        self.bot._running = True
+        self.bot.generate_review_drafts = Mock(return_value={
+            "generated": 1,
+            "replyable": 1,
+            "skipped": 0,
+            "replyable_ids": ["new"],
+            "auto_send_enabled": True,
+        })
+        self.bot.send_approved_drafts = Mock(
+            side_effect=ReviewOperationBusyError("已有发送任务")
+        )
+
+        self.bot.process_comments()
+
+        self.bot.send_approved_drafts.assert_called_once_with(
+            comment_ids=["new"],
+            auto_approve=True,
+        )
 
     def test_verify_login_updates_uid_and_persists_identity(self):
         self.bot.config["bilibili"]["uid"] = ""
@@ -617,6 +702,71 @@ class ReviewWorkflowTests(unittest.TestCase):
         result = self.bot.send_approved_drafts(comment_ids=[])
 
         self.assertEqual(result, {"sent": 0, "failed": 0, "unknown": 0})
+        self.bot.reply_comment.assert_not_called()
+
+    def test_auto_send_approves_only_explicit_new_pending_drafts(self):
+        self.bot.config["reply"]["reply_delay"] = 0
+        self.bot._review_drafts["new"] = self._draft(
+            "new",
+            approved=False,
+            status="pending",
+        )
+        self.bot._review_drafts["old"] = self._draft(
+            "old",
+            approved=True,
+            status="approved",
+        )
+
+        result = self.bot.send_approved_drafts(
+            comment_ids=["new"],
+            auto_approve=True,
+        )
+
+        self.assertEqual(result, {"sent": 1, "failed": 0, "unknown": 0})
+        self.bot.reply_comment.assert_called_once()
+        self.assertEqual(self.bot.reply_comment.call_args.args[1], "new")
+        self.assertEqual(self.bot._review_drafts["new"]["status"], "sent")
+        self.assertEqual(
+            self.bot._review_drafts["new"]["approval_source"],
+            "auto",
+        )
+        self.assertEqual(self.bot._review_drafts["old"]["status"], "approved")
+        self.assertTrue(self.bot._review_drafts["old"]["approved"])
+
+    def test_auto_send_does_not_approve_doubao_skipped_draft(self):
+        skipped = self._draft("skip", approved=False, status="skipped")
+        skipped["should_reply"] = False
+        skipped["reply"] = ""
+        self.bot._review_drafts["skip"] = skipped
+
+        result = self.bot.send_approved_drafts(
+            comment_ids=["skip"],
+            auto_approve=True,
+        )
+
+        self.assertEqual(result, {"sent": 0, "failed": 0, "unknown": 0})
+        self.bot.reply_comment.assert_not_called()
+        self.assertEqual(self.bot._review_drafts["skip"]["status"], "skipped")
+
+    def test_scan_and_send_share_one_bilibili_gate_per_account(self):
+        self.bot._ensure_review_operation_state()
+        self.bot._review_drafts["1"] = self._draft(
+            "1",
+            approved=True,
+            status="approved",
+        )
+
+        with self.bot._review_operation(
+            "generating",
+            gate=self.bot._review_generation_gate,
+            exclusive_gate=self.bot._review_bilibili_gate,
+        ):
+            with self.assertRaisesRegex(
+                ReviewOperationBusyError,
+                "扫描或发送任务",
+            ):
+                self.bot.send_approved_drafts(comment_ids=["1"])
+
         self.bot.reply_comment.assert_not_called()
 
     def test_reply_comment_sends_doubao_text_and_targets_current_comment(self):

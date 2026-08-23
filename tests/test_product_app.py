@@ -102,12 +102,15 @@ class ProductAppTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn('value="500" selected>最近 500 条（默认）', template)
-        self.assertIn('id="cfg-bilibili-check_interval" value="600"', template)
+        self.assertIn('id="cfg-bilibili-check_interval" value="3600"', template)
         self.assertIn(
             'id="cfg-rate_limit-min_request_interval" value="10"',
             template,
         )
         self.assertIn('id="cfg-rate_limit-retry_delay" value="20"', template)
+        self.assertIn('id="cfg-reply-auto_send_enabled"', template)
+        self.assertIn("历史草稿和手动生成的草稿不会自动发送", template)
+        self.assertIn("页面停留在账号 A 时", template)
         self.assertNotIn('id="cfg-bilibili-uid"', template)
         self.assertIn("review_time_range: reviewTimeRange", template)
         self.assertIn("function reviewDraftsUrl()", template)

@@ -188,6 +188,12 @@ try {
     ) {
         throw "页面仍展示手填 UID 或未经验证的安全功能"
     }
+    if (
+        $page.Content -notmatch 'id="cfg-reply-auto_send_enabled"' -or
+        $page.Content -notmatch "页面停留在账号 A 时"
+    ) {
+        throw "页面缺少按账号自动回复开关或多账号后台说明"
+    }
     $socketClient = Invoke-WebRequest `
         -Uri "$baseUrl/static/socket.io.min.js" `
         -TimeoutSec 10
@@ -202,15 +208,31 @@ try {
     $firstId = [string]$accounts.current_account_id
     $defaultConfig = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
     if (
-        [int]$defaultConfig.config.bilibili.check_interval -ne 600 -or
+        [int]$defaultConfig.config.bilibili.check_interval -ne 3600 -or
         [bool]$defaultConfig.config.bilibili.auto_start_monitor -ne $false -or
         [double]$defaultConfig.config.rate_limit.min_request_interval -ne 10 -or
         [int]$defaultConfig.config.rate_limit.max_retries -ne 3 -or
         [int]$defaultConfig.config.rate_limit.retry_delay -ne 20 -or
         [int]$defaultConfig.config.reply.max_process -ne 500 -or
+        [int]$defaultConfig.config.reply.reply_delay -ne 10 -or
+        [bool]$defaultConfig.config.reply.auto_send_enabled -ne $false -or
         [bool]$defaultConfig.config.reply.stop_after_empty_pages -ne $true
     ) {
-        throw "发布 EXE 的默认参数未恢复为 500/600/10/3/20，或三页提前停止默认未开启"
+        throw "发布 EXE 默认参数不是 500/3600/10/3/20/10，或自动发送默认未关闭"
+    }
+    try {
+        Post-Json "$baseUrl/api/config" @{
+            reply = @{ auto_send_enabled = "false" }
+        }
+        throw "配置接口接受了字符串形式的自动发送开关"
+    }
+    catch {
+        if (
+            -not $_.Exception.Response -or
+            [int]$_.Exception.Response.StatusCode -ne 400
+        ) {
+            throw
+        }
     }
     $preferences = Post-Json "$baseUrl/api/review/preferences" @{
         limit = 100
@@ -260,14 +282,17 @@ try {
             cookie = "SESSDATA=smoke-secret"
         }
         ark = @{ api_key = "smoke-ark-secret" }
-        reply = @{ enabled = $false }
+        reply = @{
+            enabled = $false
+            auto_send_enabled = $true
+        }
     }
     if (-not $saved.ok) {
         throw "账号 1 配置保存失败"
     }
     $monitorStart = Post-Json "$baseUrl/api/bot/start" @{}
     if (-not $monitorStart.ok) {
-        throw "草稿监控启动失败"
+        throw "定时处理启动失败"
     }
     $monitorConfig = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
     $monitorStatus = Invoke-RestMethod -Uri "$baseUrl/api/bot/status" -TimeoutSec 10
@@ -275,15 +300,15 @@ try {
         [bool]$monitorConfig.config.bilibili.auto_start_monitor -ne $true -or
         -not [bool]$monitorStatus.running
     ) {
-        throw "草稿监控开启状态没有持久化"
+        throw "定时处理开启状态没有持久化"
     }
     $monitorStop = Post-Json "$baseUrl/api/bot/stop" @{}
     if (-not $monitorStop.ok) {
-        throw "草稿监控停止失败"
+        throw "定时处理停止失败"
     }
     $monitorConfig = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
     if ([bool]$monitorConfig.config.bilibili.auto_start_monitor -ne $false) {
-        throw "草稿监控关闭状态没有持久化"
+        throw "定时处理关闭状态没有持久化"
     }
 
     $created = Post-Json "$baseUrl/api/accounts" @{ name = "烟测账号 2" }
@@ -295,8 +320,11 @@ try {
         throw "账号 2 配置保存失败"
     }
     $config2 = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
-    if ([string]$config2.config.bilibili.uid -ne "smoke-account-2") {
-        throw "账号 2 配置串号"
+    if (
+        [string]$config2.config.bilibili.uid -ne "smoke-account-2" -or
+        [bool]$config2.config.reply.auto_send_enabled -ne $false
+    ) {
+        throw "账号 2 配置串号，或继承了账号 1 的自动回复开关"
     }
 
     $selected = Post-Json "$baseUrl/api/accounts/select" @{
@@ -306,8 +334,11 @@ try {
         throw "切回账号 1 失败"
     }
     $config1 = Invoke-RestMethod -Uri "$baseUrl/api/config" -TimeoutSec 10
-    if ([string]$config1.config.bilibili.uid -ne "smoke-account-1") {
-        throw "账号 1 配置串号"
+    if (
+        [string]$config1.config.bilibili.uid -ne "smoke-account-1" -or
+        [bool]$config1.config.reply.auto_send_enabled -ne $true
+    ) {
+        throw "账号 1 配置串号，或自动回复开关未按账号保存"
     }
     if (
         $config1.config.bilibili.PSObject.Properties.Name -contains "cookie" -or
@@ -377,6 +408,8 @@ try {
         SendRangeGate = $true
         ManualDismissal = $true
         MonitorPreferencePersisted = $true
+        AutoReplyDefaultOff = $true
+        AutoReplyAccountIsolation = $true
         AccountCount = $manifest.accounts.Count
         LocalSocketClient = $true
         SecretsRedacted = $true

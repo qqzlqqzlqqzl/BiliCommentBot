@@ -214,6 +214,86 @@ def preserve_blank_sensitive_updates(data: dict) -> dict:
     return safe_data
 
 
+def validate_config_update(data: dict):
+    """只校验当前产品会直接执行的高风险配置。"""
+    if not isinstance(data, dict):
+        raise ValueError("配置必须是对象")
+    reply_cfg = data.get("reply")
+    if isinstance(reply_cfg, dict) and "auto_send_enabled" in reply_cfg:
+        if not isinstance(reply_cfg["auto_send_enabled"], bool):
+            raise ValueError("自动发送开关必须是布尔值")
+
+    numeric_rules = (
+        ("bilibili", "check_interval", 1, "检查评论间隔"),
+        ("rate_limit", "min_request_interval", 0, "B站最小请求间隔"),
+        ("reply", "reply_delay", 0, "回复发送间隔"),
+    )
+    for section, key, minimum, label in numeric_rules:
+        section_cfg = data.get(section)
+        if not isinstance(section_cfg, dict) or key not in section_cfg:
+            continue
+        value = section_cfg[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{label}必须是数字")
+        if value < minimum:
+            raise ValueError(f"{label}不能小于 {minimum}")
+
+
+def restore_product_account_monitors(manager: AccountManager = None) -> dict:
+    """恢复所有账号自己的后台监控，不依赖前端当前选中账号。"""
+    manager = manager or get_account_manager()
+    result = {"started": [], "already_running": [], "skipped": [], "failed": []}
+    environment_api_key = (
+        os.environ.get("ARK_API_KEY")
+        or os.environ.get("VOLCENGINE_ARK_API_KEY")
+        or ""
+    )
+    for account in manager.list_accounts():
+        account_id = account["id"]
+        account_name = account.get("name") or account_id
+        try:
+            cfg = load_config(account_id)
+            if not bool(
+                cfg.get("bilibili", {}).get("auto_start_monitor", False)
+            ):
+                result["skipped"].append({
+                    "account_id": account_id,
+                    "reason": "monitor_disabled",
+                })
+                continue
+            cookie = str(cfg.get("bilibili", {}).get("cookie") or "").strip()
+            api_key = str(
+                environment_api_key or cfg.get("ark", {}).get("api_key") or ""
+            ).strip()
+            if not cookie or not api_key:
+                missing = []
+                if not cookie:
+                    missing.append("B站登录")
+                if not api_key:
+                    missing.append("豆包 API Key")
+                reason = "、".join(missing)
+                print(f"[WARNING] 账号 {account_name} 未启动定时处理：缺少{reason}")
+                result["skipped"].append({
+                    "account_id": account_id,
+                    "reason": "missing_credentials",
+                })
+                continue
+            bot = manager.get_bot(account_id)
+            bot.reload_config(cfg)
+            if bot.start():
+                print(f"[INFO] 已恢复账号 {account_name} 的后台定时处理")
+                result["started"].append(account_id)
+            else:
+                result["already_running"].append(account_id)
+        except Exception as exc:
+            print(f"[WARNING] 账号 {account_name} 后台恢复失败：{exc}")
+            result["failed"].append({
+                "account_id": account_id,
+                "message": str(exc),
+            })
+    return result
+
+
 # ─────────────────────────────────────────────
 #  日志设置
 # ─────────────────────────────────────────────
@@ -574,6 +654,10 @@ def api_save_config():
     data = request.get_json()
     if not data:
         return jsonify({"ok": False, "message": "无效数据"})
+    try:
+        validate_config_update(data)
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
     data = preserve_blank_sensitive_updates(data)
     cfg = load_config()
 
@@ -633,13 +717,18 @@ def api_bot_start():
     bot = get_bot()
     applied = bot.reload_config(cfg)
     started = bot.start()
+    if started:
+        mode = (
+            "自动回复"
+            if cfg.get("reply", {}).get("auto_send_enabled", False)
+            else "人工审核"
+        )
+        message = f"{mode}定时处理已启动，重启程序后仍会自动恢复"
+    else:
+        message = "定时处理已在运行，重启程序后仍会自动恢复"
     return jsonify({
         "ok": True,
-        "message": (
-            "草稿监控已启动，重启程序后仍会自动恢复"
-            if started
-            else "草稿监控已在运行，重启程序后仍会自动恢复"
-        ),
+        "message": message,
         "deferred": not applied,
     })
 
@@ -656,7 +745,7 @@ def api_bot_stop():
     if not result:
         return jsonify({
             "ok": True,
-            "message": "草稿监控已保持停止，重启程序后不会自动启动",
+            "message": "定时处理已保持停止，重启程序后不会自动启动",
             "deferred": not applied,
         })
     operations = bot.get_review_operation_status()["active"]
@@ -670,9 +759,9 @@ def api_bot_stop():
         if count
     ]
     message = (
-        f"草稿监控已停止；当前{'、'.join(active)}任务继续完成"
+        f"定时处理已停止；当前{'、'.join(active)}任务继续完成"
         if active
-        else "草稿监控已停止"
+        else "定时处理已停止"
     )
     return jsonify({
         "ok": True,
@@ -1112,7 +1201,7 @@ def main():
 ║  按 Ctrl+C 停止服务                      ║
 ╚══════════════════════════════════════════╝
 """)
-    # 初始化机器人（预加载）
+    # 初始化当前账号，产品模式随后会恢复所有启用监控的账号。
     bot = get_bot()
 
     # 检测配置是否完整，自动启动机器人
@@ -1134,17 +1223,27 @@ def main():
         except Exception as exc:
             print(f"⚠️  B站账号身份识别失败: {exc}")
 
-    auto_start_monitor = should_auto_start_monitor(cfg)
-    if cookie and api_key and auto_start_monitor:
-        print("检测到有效配置，自动启动机器人...")
-        if bot.start():
-            print("✓ 机器人已自动启动")
-        else:
-            print("✗ 机器人启动失败")
-    elif cookie and api_key:
-        print("Web 服务已启动；草稿监控保持停止，请在页面中手动启动")
+    if is_product_mode():
+        restored = restore_product_account_monitors(get_account_manager())
+        print(
+            "多账号后台恢复完成："
+            f"启动{len(restored['started'])}个，"
+            f"已运行{len(restored['already_running'])}个，"
+            f"跳过{len(restored['skipped'])}个，"
+            f"失败{len(restored['failed'])}个"
+        )
     else:
-        print("提示: 请在 Web UI 中完成配置后启动")
+        auto_start_monitor = should_auto_start_monitor(cfg)
+        if cookie and api_key and auto_start_monitor:
+            print("检测到有效配置，自动启动机器人...")
+            if bot.start():
+                print("✓ 机器人已自动启动")
+            else:
+                print("✗ 机器人启动失败")
+        elif cookie and api_key:
+            print("Web 服务已启动；定时处理保持停止，请在页面中手动启动")
+        else:
+            print("提示: 请在 Web UI 中完成配置后启动")
 
     # 延迟打开浏览器（Docker 环境下不打开）
     if (

@@ -118,6 +118,38 @@ class ServerAccountApiTests(unittest.TestCase):
         self.assertEqual(first_after["bilibili"]["uid"], "111")
         self.assertNotEqual(first_id, second_id)
 
+    def test_auto_reply_setting_is_isolated_per_account(self):
+        first_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+        first_save = self.client.post(
+            "/api/config",
+            json={"reply": {"auto_send_enabled": True}},
+        )
+        second_id = self.client.post(
+            "/api/accounts",
+            json={"name": "第二个账号"},
+        ).get_json()["account"]["id"]
+
+        second_config = self.client.get("/api/config").get_json()["config"]
+        self.client.post(
+            "/api/accounts/select",
+            json={"account_id": first_id},
+        )
+        first_config = self.client.get("/api/config").get_json()["config"]
+
+        self.assertEqual(first_save.status_code, 200)
+        self.assertFalse(second_config["reply"]["auto_send_enabled"])
+        self.assertTrue(first_config["reply"]["auto_send_enabled"])
+        self.assertNotEqual(first_id, second_id)
+
+    def test_config_rejects_string_auto_send_boolean(self):
+        response = self.client.post(
+            "/api/config",
+            json={"reply": {"auto_send_enabled": "false"}},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("布尔值", response.get_json()["message"])
+
     def test_review_preferences_are_persisted_per_account(self):
         first_id = self.client.get("/api/accounts").get_json()["current_account_id"]
         first_save = self.client.post(

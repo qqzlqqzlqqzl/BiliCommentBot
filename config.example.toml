@@ -9,7 +9,7 @@ refresh_token = ""
 # B站用户ID（扫码或验证登录后自动识别并写入，无需手填）
 uid = ""
 # 检查评论的间隔时间（秒）
-check_interval = 600
+check_interval = 3600
 # 是否启用Cookie自动刷新
 auto_refresh_cookie = true
 # Cookie刷新检查间隔（分钟）
@@ -57,8 +57,10 @@ system_prompt = "你是B站UP主的评论回复助手。只回复语境清楚、
 
 # 回复配置
 [reply]
-# 是否启用后台自动生成审核草稿。无论此项是否开启，都不会自动发送。
+# 是否启用当前账号的后台定时处理
 enabled = true
+# 是否只对后台定时轮次本轮新生成、豆包判断可回复的评论自动发送
+auto_send_enabled = false
 # 回复前缀
 prefix = "🤖 "
 # 是否只回复未处理的评论
@@ -72,7 +74,7 @@ stop_after_empty_pages = true
 # 每批交给豆包判断的评论数。为保证 JSON 稳定，程序实际最多按 4 条串行处理。
 review_batch_size = 4
 # 回复延迟（秒，避免频繁操作）
-reply_delay = 2
+reply_delay = 10
 # 生成回复时使用前N条评论作为上下文（0表示不使用上下文）
 context_comments_count = 10
 # 仅回复指定视频（留空则回复所有视频，填写BVID如BV1xx411c7mD则仅回复该视频）

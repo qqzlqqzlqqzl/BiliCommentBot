@@ -303,7 +303,7 @@
       <div class="logo-sub">B站评论人工审核回复</div>
     </div>
     <ul class="nav-list">
-      <li><a href="#" class="active" data-page="dashboard" data-help="查看当前账号的运行状态、处理数量，并启动或停止定时草稿监控。"><span class="icon">📊</span><span>控制台</span><span class="status-dot" id="nav-status-dot"></span></a></li>
+      <li><a href="#" class="active" data-page="dashboard" data-help="查看当前账号的运行状态、处理数量，并启动或停止该账号自己的后台定时处理。"><span class="icon">📊</span><span>控制台</span><span class="status-dot" id="nav-status-dot"></span></a></li>
       <li><a href="#" data-page="review" data-help="查看豆包候选，人工批准、不回复、重新生成或串行发送。"><span class="icon">✅</span><span>回复审核</span></a></li>
       <li><a href="#" data-page="config" data-help="配置当前账号的 B站登录、豆包、草稿、请求间隔和日志参数。"><span class="icon">⚙️</span><span>配置</span></a></li>
       <li><a href="#" data-page="login" data-help="为当前账号生成 B站登录二维码，扫码成功后自动保存登录状态。"><span class="icon">🔑</span><span>登录</span></a></li>
@@ -357,16 +357,19 @@
       </div>
 
       <div class="card">
-        <div class="card-title">草稿监控</div>
+        <div class="card-title">后台定时处理</div>
         <div class="control-bar">
           <button class="btn btn-success" id="btn-start" onclick="botStart()"
-            data-help="按配置的检查间隔在后台扫描最新评论并生成审核草稿。不会自动批准或发送回复。">▶ 启动草稿监控</button>
+            data-help="启动当前账号自己的后台定时处理。人工审核模式只生成草稿；自动回复模式只发送每轮新生成且豆包判断可回复的候选。">▶ 启动定时处理</button>
           <button class="btn btn-danger" id="btn-stop" onclick="botStop()" disabled
             data-help="停止之后的新一轮定时扫描。已经开始的单次请求会安全收尾，草稿和状态会保存。">⏹ 停止</button>
           <button class="btn btn-secondary" onclick="verifyLogin()"
             data-help="向 B站验证当前账号的登录凭据是否有效，并自动更新识别到的 UID 和昵称。">🔍 验证登录状态</button>
           <button class="btn btn-secondary legacy-config" onclick="clearCache()"
             data-help="清除基座的视频列表缓存；正常的创作中心最新评论审核流程不依赖此缓存。">🗑 清除视频缓存</button>
+        </div>
+        <div class="alert alert-info" id="monitor-mode-notice" style="margin-top:14px;margin-bottom:0">
+          当前账号：人工审核模式。后台只生成草稿，必须人工勾选后发送。
         </div>
         <div id="verify-result" style="margin-top:12px"></div>
       </div>
@@ -393,7 +396,7 @@
     <div class="page" id="page-review">
       <div class="page-title"><span class="icon">✅</span>回复审核</div>
       <div class="card">
-        <div class="alert alert-info" style="margin-bottom:16px">
+        <div class="alert alert-info" id="review-mode-notice" style="margin-bottom:16px">
           豆包只生成候选回复，不会自动发送。只有你勾选批准并再次确认的内容，才会原样发到 B站。
         </div>
         <div class="review-toolbar">
@@ -531,7 +534,8 @@
           <div class="form-row">
             <div class="form-group">
               <label class="form-label">检查评论间隔（秒）</label>
-              <input class="form-input" type="number" id="cfg-bilibili-check_interval" value="600">
+              <input class="form-input" type="number" min="1" id="cfg-bilibili-check_interval" value="3600"
+                data-help="当前账号两轮后台扫描之间的等待时间。默认 3600 秒，也就是 1 小时。">
             </div>
             <div class="form-group">
               <label class="form-label">Cookie 刷新间隔（分钟）</label>
@@ -629,10 +633,19 @@
         <div class="card">
           <div class="form-group">
             <label class="form-check"
-              data-help="开启后，后台定时监控会扫描最新评论并生成草稿；草稿仍必须人工批准，绝不会自动发送。">
+              data-help="开启后，当前账号的后台线程会按检查间隔扫描最新评论。是否自动发送由下面的自动回复开关决定。">
               <input type="checkbox" id="cfg-reply-enabled" checked>
-              启用定时生成审核草稿（仍需人工批准）
+              启用后台定时处理
             </label>
+          </div>
+          <div class="form-group">
+            <label class="form-check"
+              data-help="只影响当前账号的后台定时轮次：豆包本轮新判断为可回复的候选会直接走串行发送。历史待审核、历史已勾选和手动生成的草稿不会自动发送。">
+              <input type="checkbox" id="cfg-reply-auto_send_enabled"
+                onchange="confirmAutoSendToggle(this)">
+              自动发送豆包本轮判断可回复的新评论
+            </label>
+            <div class="form-hint">默认关闭。每个账号独立保存；页面停留在账号 A 时，已开启监控的账号 B 仍会按 B 自己的配置运行。</div>
           </div>
           <div class="form-group legacy-config">
             <label class="form-check"
@@ -1160,7 +1173,38 @@ function updateStats(d) {
   document.getElementById('stat-videos').textContent = d.cached_videos || 0;
   document.getElementById('info-start').textContent = d.start_time || '-';
   document.getElementById('info-check').textContent = d.last_check || '-';
+  if (typeof d.auto_send_enabled === 'boolean') {
+    configData.reply = configData.reply || {};
+    configData.reply.auto_send_enabled = d.auto_send_enabled;
+    updateMonitorMode();
+  }
   updateBotStatus(d.running);
+}
+
+function updateMonitorMode() {
+  const autoSend = !!(configData.reply || {}).auto_send_enabled;
+  const monitorNotice = document.getElementById('monitor-mode-notice');
+  const reviewNotice = document.getElementById('review-mode-notice');
+  if (autoSend) {
+    monitorNotice.textContent =
+      '当前账号：自动回复模式。后台每轮只发送本轮新生成、且豆包判断可回复的候选；历史草稿不会被顺带发送。';
+    reviewNotice.textContent =
+      '当前账号已开启自动回复：后台定时轮次会发送本轮新低风险候选。手动点击“生成最近评论草稿”仍然只生成草稿，不会自动发送。';
+  } else {
+    monitorNotice.textContent =
+      '当前账号：人工审核模式。后台只生成草稿，必须人工勾选后发送。';
+    reviewNotice.textContent =
+      '豆包只生成候选回复，不会自动发送。只有你勾选批准并再次确认的内容，才会原样发到 B站。';
+  }
+}
+
+function confirmAutoSendToggle(checkbox) {
+  if (!checkbox.checked) return;
+  const confirmed = confirm(
+    '开启后，当前账号的后台定时轮次会自动发送豆包本轮判断可回复的新评论。' +
+    '历史草稿和手动生成的草稿不会自动发送。确认开启？'
+  );
+  if (!confirmed) checkbox.checked = false;
 }
 function updateBotStatus(running) {
   const dot = document.getElementById('nav-status-dot');
@@ -1256,6 +1300,7 @@ function loadConfig() {
 
     const r = cfg.reply || {};
     set('cfg-reply-enabled', r.enabled);
+    set('cfg-reply-auto_send_enabled', r.auto_send_enabled);
     set('cfg-reply-only_new', r.only_new);
     set('cfg-reply-like_enabled', r.like_enabled);
     set('cfg-reply-like_user_video_enabled', r.like_user_video_enabled);
@@ -1277,6 +1322,7 @@ function loadConfig() {
     set('cfg-reply-max_reply_depth', r.max_reply_depth);
     set('cfg-reply-prefix', r.prefix);
     set('cfg-reply-only_bvid', r.only_bvid);
+    updateMonitorMode();
 
     // 关键词过滤
     const kf = r.keyword_filter || {};
@@ -1346,6 +1392,7 @@ function saveConfig() {
     },
     reply: {
       enabled: get('cfg-reply-enabled'),
+      auto_send_enabled: get('cfg-reply-auto_send_enabled'),
       only_new: get('cfg-reply-only_new'),
       like_enabled: get('cfg-reply-like_enabled'),
       like_user_video_enabled: get('cfg-reply-like_user_video_enabled'),

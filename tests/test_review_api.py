@@ -271,6 +271,20 @@ class ReviewApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.fake_bot.generate_review_drafts.assert_not_called()
 
+    def test_manual_generate_never_uses_auto_send_path(self):
+        response = self.client.post(
+            "/api/review/generate",
+            json={"limit": 10},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.fake_bot.generate_review_drafts.assert_called_once_with(
+            limit=10,
+            review_since=None,
+            review_time_range=None,
+        )
+        self.fake_bot.send_approved_drafts.assert_not_called()
+
     def test_monitor_start_persists_restart_preference(self):
         config = {"bilibili": {"auto_start_monitor": False}}
         with (

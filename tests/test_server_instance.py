@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import server
 
@@ -52,6 +52,96 @@ class ServerInstanceTests(unittest.TestCase):
             clear=True,
         ):
             self.assertFalse(server.should_auto_start_monitor(config))
+
+    def test_product_restore_starts_every_enabled_account_independently(self):
+        accounts = [
+            {"id": "account-a", "name": "账号 A"},
+            {"id": "account-b", "name": "账号 B"},
+            {"id": "account-c", "name": "账号 C"},
+        ]
+        configs = {
+            "account-a": {
+                "bilibili": {
+                    "auto_start_monitor": True,
+                    "cookie": "SESSDATA=a",
+                },
+                "ark": {"api_key": "ark-a"},
+            },
+            "account-b": {
+                "bilibili": {
+                    "auto_start_monitor": True,
+                    "cookie": "SESSDATA=b",
+                },
+                "ark": {"api_key": "ark-b"},
+            },
+            "account-c": {
+                "bilibili": {
+                    "auto_start_monitor": False,
+                    "cookie": "SESSDATA=c",
+                },
+                "ark": {"api_key": "ark-c"},
+            },
+        }
+        bots = {
+            account["id"]: Mock(
+                reload_config=Mock(return_value=True),
+                start=Mock(return_value=True),
+            )
+            for account in accounts
+        }
+        manager = Mock()
+        manager.list_accounts.return_value = accounts
+        manager.get_bot.side_effect = lambda account_id: bots[account_id]
+
+        with (
+            patch.object(
+                server,
+                "load_config",
+                side_effect=lambda account_id: configs[account_id],
+            ),
+            patch.dict(os.environ, {}, clear=True),
+        ):
+            result = server.restore_product_account_monitors(manager)
+
+        self.assertEqual(result["started"], ["account-a", "account-b"])
+        bots["account-a"].start.assert_called_once_with()
+        bots["account-b"].start.assert_called_once_with()
+        bots["account-c"].start.assert_not_called()
+
+    def test_product_restore_failure_does_not_block_other_account(self):
+        accounts = [
+            {"id": "broken", "name": "坏账号"},
+            {"id": "healthy", "name": "正常账号"},
+        ]
+        config = {
+            "bilibili": {
+                "auto_start_monitor": True,
+                "cookie": "SESSDATA=value",
+            },
+            "ark": {"api_key": "ark"},
+        }
+        healthy_bot = Mock(
+            reload_config=Mock(return_value=True),
+            start=Mock(return_value=True),
+        )
+        manager = Mock()
+        manager.list_accounts.return_value = accounts
+
+        def get_bot(account_id):
+            if account_id == "broken":
+                raise RuntimeError("配置损坏")
+            return healthy_bot
+
+        manager.get_bot.side_effect = get_bot
+        with (
+            patch.object(server, "load_config", return_value=config),
+            patch.dict(os.environ, {}, clear=True),
+        ):
+            result = server.restore_product_account_monitors(manager)
+
+        self.assertEqual(result["started"], ["healthy"])
+        self.assertEqual(result["failed"][0]["account_id"], "broken")
+        healthy_bot.start.assert_called_once_with()
 
 
 if __name__ == "__main__":
