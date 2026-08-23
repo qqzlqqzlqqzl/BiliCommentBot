@@ -80,7 +80,7 @@ if (-not (Test-Path -LiteralPath $stagedExe)) {
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedExe).Hash
 $releaseDir = Join-Path $projectRoot "release"
 New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-$archive = Join-Path $releaseDir "BiliCommentReviewer-0.1.0-windows-x64.zip"
+$archive = Join-Path $releaseDir "BiliCommentReviewer-0.2.0-windows-x64.zip"
 $checksumFile = "$archive.sha256"
 Move-FileToRecycleBin $archive
 Move-FileToRecycleBin $checksumFile
