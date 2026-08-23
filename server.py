@@ -748,7 +748,23 @@ def api_bot_start():
         return jsonify({"ok": False, "message": "保存自动监控状态失败"}), 500
     bot = get_bot()
     applied = bot.reload_config(cfg)
-    started = bot.start()
+    try:
+        started = bot.start()
+    except ReviewOperationBusyError as exc:
+        cfg.setdefault("bilibili", {})["auto_start_monitor"] = False
+        rolled_back = save_config(cfg)
+        bot.reload_config(cfg)
+        if not rolled_back:
+            return jsonify({
+                "ok": False,
+                "message": (
+                    f"{exc}；同时无法保存停止状态，请关闭程序后检查配置文件"
+                ),
+            }), 500
+        return jsonify({
+            "ok": False,
+            "message": f"{exc}；本次启动未生效，重启程序后也不会自动启动",
+        }), 409
     if started:
         mode = (
             "自动回复"

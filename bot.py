@@ -557,6 +557,8 @@ class BiliCommentBot:
 
     def _apply_config(self, config: dict):
         self.config = copy.deepcopy(config)
+        if not self.config.get("reply", {}).get("auto_send_enabled", False):
+            self._auto_send_rounds.clear()
         self.cookie_refresh_interval = config["bilibili"].get("cookie_refresh_interval", 30) * 60
         self.auto_refresh_cookie = config["bilibili"].get("auto_refresh_cookie", True)
         rl = config.get("rate_limit", {})
@@ -672,13 +674,23 @@ class BiliCommentBot:
         with self._review_operation_lock:
             if self._running:
                 return False
+            if self._thread is not None and self._thread.is_alive():
+                raise ReviewOperationBusyError(
+                    "上一次定时处理仍在收尾，请稍后再启动"
+                )
             self._running = True
             self._stop_event.clear()
             self.stats["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self._thread = threading.Thread(target=self._run_loop, daemon=True)
-            self._thread.start()
-        self.logger.info("机器人已启动")
-        self._emit("bot_status", {"running": True})
+            try:
+                self._thread.start()
+            except Exception:
+                self._running = False
+                self._stop_event.set()
+                self._thread = None
+                raise
+            self.logger.info("机器人已启动")
+            self._emit("bot_status", {"running": True})
         return True
 
     def stop(self):
@@ -691,23 +703,23 @@ class BiliCommentBot:
             operation_status = {
                 "active": dict(self._active_review_operations),
             }
-        active = [
-            {
-                "generating": "生成",
-                "regenerating": "重新生成",
-                "sending": "发送",
-            }.get(name, name)
-            for name, count in operation_status["active"].items()
-            if count
-        ]
-        if active:
-            self.logger.info(
-                "定时处理已停止，不再开始下一轮；当前%s任务继续完成",
-                "、".join(active),
-            )
-        else:
-            self.logger.info("机器人已停止")
-        self._emit("bot_status", {"running": False})
+            active = [
+                {
+                    "generating": "生成",
+                    "regenerating": "重新生成",
+                    "sending": "发送",
+                }.get(name, name)
+                for name, count in operation_status["active"].items()
+                if count
+            ]
+            if active:
+                self.logger.info(
+                    "定时处理已停止，不再开始下一轮；当前%s任务继续完成",
+                    "、".join(active),
+                )
+            else:
+                self.logger.info("机器人已停止")
+            self._emit("bot_status", {"running": False})
         # 刷出历史记录和 Cookie
         self._flush_history()
         cookie_manager = getattr(self, "cookie_manager", None)
@@ -785,17 +797,26 @@ class BiliCommentBot:
         return idle
 
     def _run_loop(self):
-        while self._running:
-            self.stats["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            try:
-                self.process_comments()
-            except Exception as e:
-                self.logger.error(f"处理评论异常: {e}", exc_info=True)
-            self._emit("stats", self.get_stats())
-            interval = max(1, int(self.config["bilibili"].get("check_interval", 3600)))
-            self.logger.info(f"等待 {interval} 秒后进行下次检查")
-            # 使用 Event.wait() 可被停止信号立即唤醒，避免循环 sleep
-            self._stop_event.wait(timeout=interval)
+        worker = threading.current_thread()
+        try:
+            while self._running:
+                self.stats["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    self.process_comments()
+                except Exception as e:
+                    self.logger.error(f"处理评论异常: {e}", exc_info=True)
+                self._emit("stats", self.get_stats())
+                interval = max(
+                    1,
+                    int(self.config["bilibili"].get("check_interval", 3600)),
+                )
+                self.logger.info(f"等待 {interval} 秒后进行下次检查")
+                # 使用 Event.wait() 可被停止信号立即唤醒，避免循环 sleep
+                self._stop_event.wait(timeout=interval)
+        finally:
+            with self._review_operation_lock:
+                if self._thread is worker:
+                    self._thread = None
 
     def update_headers(self):
         self.session.headers.update({
@@ -1022,6 +1043,7 @@ class BiliCommentBot:
         try:
             recovered_sending = 0
             recovered_regenerating = 0
+            recovered_auto_approved = 0
             recovered_unavailable = 0
             review_drafts_file = getattr(
                 self, "review_drafts_file", REVIEW_DRAFTS_FILE
@@ -1052,6 +1074,19 @@ class BiliCommentBot:
                             draft["error"] = "程序在重新生成过程中退出，已保留退出前的候选回复"
                             recovered_regenerating += 1
                         elif (
+                            draft.get("status") == "approved"
+                            and draft.get("approval_source") == "auto"
+                        ):
+                            draft["approved"] = False
+                            draft["status"] = "pending"
+                            draft["error"] = (
+                                "上次自动发送尚未开始，已恢复待审核，系统不会自动重发"
+                            )
+                            draft.pop("approval_source", None)
+                            draft.pop("approved_at", None)
+                            draft.pop("auto_generation_id", None)
+                            recovered_auto_approved += 1
+                        elif (
                             draft.get("status") == "failed"
                             and self._is_permanent_reply_failure(
                                 draft.get("error", "")
@@ -1068,6 +1103,7 @@ class BiliCommentBot:
                     if (
                         recovered_sending
                         or recovered_regenerating
+                        or recovered_auto_approved
                         or recovered_unavailable
                     ):
                         self._save_review_drafts()
@@ -1081,6 +1117,12 @@ class BiliCommentBot:
                 self.logger.warning(
                     "发现%s条上次退出时仍在重新生成的草稿，已恢复退出前候选并取消批准",
                     recovered_regenerating,
+                )
+            if recovered_auto_approved:
+                self.logger.warning(
+                    "发现%s条上次自动批准但尚未开始发送的草稿，"
+                    "已恢复待审核，不会自动重发",
+                    recovered_auto_approved,
                 )
             if recovered_unavailable:
                 self.logger.warning(
@@ -2664,7 +2706,14 @@ class BiliCommentBot:
         if include_generated_ids:
             with self._review_operation_lock:
                 self._auto_send_rounds.clear()
-                if replyable_ids:
+                if (
+                    replyable_ids
+                    and self._running
+                    and self.config.get("reply", {}).get(
+                        "auto_send_enabled",
+                        False,
+                    )
+                ):
                     self._auto_send_rounds[generation_id] = set(replyable_ids)
 
         self.logger.info(
@@ -2746,6 +2795,7 @@ class BiliCommentBot:
         ) as task_config:
             with self._review_lock:
                 auto_approved = 0
+                auto_approval_snapshots = {}
                 if auto_approve:
                     now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     for comment_id in requested:
@@ -2759,13 +2809,26 @@ class BiliCommentBot:
                             != str(auto_generation_id)
                         ):
                             continue
+                        auto_approval_snapshots[comment_id] = dict(draft)
                         draft["approved"] = True
                         draft["status"] = "approved"
                         draft["approval_source"] = "auto"
                         draft["approved_at"] = now_text
                         auto_approved += 1
                     if auto_approved:
-                        self._save_review_drafts()
+                        try:
+                            self._save_review_drafts()
+                        except Exception:
+                            for comment_id, snapshot in auto_approval_snapshots.items():
+                                self._review_drafts[comment_id] = snapshot
+                            try:
+                                self._save_review_drafts()
+                            except Exception:
+                                self.logger.exception(
+                                    "自动批准落盘失败，内存已回滚待审核；"
+                                    "磁盘状态将在下次启动时再次校正"
+                                )
+                            raise
                         self.logger.info(
                             "自动模式已批准本轮%s条低风险候选，准备串行发送",
                             auto_approved,
@@ -2841,13 +2904,34 @@ class BiliCommentBot:
                         or current.get("status") != "approved"
                     ):
                         continue
+                    before_sending = dict(current)
                     current["approved"] = False
                     current["status"] = "sending"
                     current["sending_started_at"] = datetime.now().strftime(
                         "%Y-%m-%d %H:%M:%S"
                     )
                     current.pop("error", None)
-                    self._save_review_drafts()
+                    try:
+                        self._save_review_drafts()
+                    except Exception:
+                        if auto_approve:
+                            before_sending["approved"] = False
+                            before_sending["status"] = "pending"
+                            before_sending["error"] = (
+                                "发送前保存状态失败，已恢复待审核，系统没有调用B站回复接口"
+                            )
+                            before_sending.pop("approval_source", None)
+                            before_sending.pop("approved_at", None)
+                            before_sending.pop("auto_generation_id", None)
+                        self._review_drafts[comment_id] = before_sending
+                        try:
+                            self._save_review_drafts()
+                        except Exception:
+                            self.logger.exception(
+                                "发送前状态落盘失败，内存已回滚；"
+                                "磁盘状态将在下次启动时再次校正"
+                            )
+                        raise
                     draft = dict(current)
 
                 self.logger.info(

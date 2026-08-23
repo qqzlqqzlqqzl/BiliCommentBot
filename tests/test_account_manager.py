@@ -109,6 +109,20 @@ class AccountManagerTests(unittest.TestCase):
 
         self.assertEqual(self.manager.current_account_id(), first_id)
 
+    def test_switch_is_allowed_while_current_monitor_is_waiting(self):
+        first_id = self.manager.current_account_id()
+        second = self.manager.create_account("第二个账号")
+        self.manager.select_account(first_id)
+        first_bot = self.manager.get_bot(first_id)
+        first_bot.running = True
+        first_bot.busy = False
+
+        selected = self.manager.select_account(second["id"])
+
+        self.assertEqual(selected["id"], second["id"])
+        self.assertEqual(self.manager.current_account_id(), second["id"])
+        self.assertTrue(first_bot.is_running())
+
     def test_create_is_blocked_while_current_account_is_busy(self):
         first_id = self.manager.current_account_id()
         self.manager.get_bot(first_id).busy = True

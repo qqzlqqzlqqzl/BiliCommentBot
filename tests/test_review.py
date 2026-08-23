@@ -32,7 +32,12 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.bot._review_lock = threading.Lock()
         self.bot._review_drafts = {}
         self.bot.processed_comments = set()
-        self.bot.stats = {"total_replied": 0}
+        self.bot.stats = {
+            "total_replied": 0,
+            "start_time": None,
+            "last_check": None,
+        }
+        self.bot.cached_videos = {}
         self.bot._running = False
         self.bot.socketio = None
         self.bot.save_history = Mock()
@@ -807,6 +812,46 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.bot.reply_comment.assert_not_called()
         self.assertEqual(self.bot._review_drafts["new"]["status"], "pending")
 
+    def test_auto_send_does_not_call_bilibili_when_sending_state_save_fails(self):
+        self.bot.config["reply"]["auto_send_enabled"] = True
+        self.bot._running = True
+        draft = self._draft("new", approved=False, status="pending")
+        draft["auto_generation_id"] = "round-save-failure"
+        self.bot._review_drafts["new"] = draft
+        self.bot._ensure_review_operation_state()
+        self.bot._auto_send_rounds["round-save-failure"] = {"new"}
+        original_save = self.bot._save_review_drafts
+        save_calls = 0
+
+        def fail_second_save():
+            nonlocal save_calls
+            save_calls += 1
+            if save_calls == 2:
+                raise OSError("模拟发送前落盘失败")
+            return original_save()
+
+        with patch.object(
+            self.bot,
+            "_save_review_drafts",
+            side_effect=fail_second_save,
+        ):
+            with self.assertRaisesRegex(OSError, "模拟发送前落盘失败"):
+                self.bot.send_approved_drafts(
+                    comment_ids=["new"],
+                    auto_approve=True,
+                    auto_generation_id="round-save-failure",
+                )
+
+        self.bot.reply_comment.assert_not_called()
+        current = self.bot._review_drafts["new"]
+        self.assertEqual(current["status"], "pending")
+        self.assertFalse(current["approved"])
+        self.assertNotIn("approval_source", current)
+        with open(self.drafts_file, "r", encoding="utf-8") as handle:
+            persisted = json.load(handle)[0]
+        self.assertEqual(persisted["status"], "pending")
+        self.assertFalse(persisted["approved"])
+
     def test_auto_send_rejects_old_pending_draft_not_tagged_for_round(self):
         self.bot.config["reply"]["auto_send_enabled"] = True
         self.bot._running = True
@@ -1097,6 +1142,42 @@ class ReviewWorkflowTests(unittest.TestCase):
         )
         self.assertEqual(reply_calls, ["1"])
 
+    def test_stop_then_immediate_start_waits_for_previous_worker_cleanup(self):
+        entered = threading.Event()
+        release = threading.Event()
+        emitted_statuses = []
+
+        def blocking_process():
+            entered.set()
+            release.wait(timeout=2)
+
+        def record_emit(event, data):
+            if event == "bot_status":
+                emitted_statuses.append(bool(data["running"]))
+
+        self.bot.process_comments = blocking_process
+        self.bot._emit = record_emit
+        worker = None
+
+        try:
+            self.assertTrue(self.bot.start())
+            worker = self.bot._thread
+            self.assertTrue(entered.wait(timeout=1))
+            self.assertTrue(self.bot.stop())
+            with self.assertRaisesRegex(
+                ReviewOperationBusyError,
+                "上一次定时处理仍在收尾",
+            ):
+                self.bot.start()
+        finally:
+            release.set()
+            if worker is not None:
+                worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertIsNone(self.bot._thread)
+        self.assertEqual(emitted_statuses, [True, False])
+
     def test_load_recovers_interrupted_sending_and_regeneration(self):
         sending = self._draft("1", approved=False, status="sending")
         regenerating = self._draft("2", approved=False, status="regenerating")
@@ -1110,6 +1191,27 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertFalse(self.bot._review_drafts["1"]["approved"])
         self.assertEqual(self.bot._review_drafts["2"]["status"], "pending")
         self.assertFalse(self.bot._review_drafts["2"]["approved"])
+
+    def test_load_recovers_auto_approved_draft_without_resending(self):
+        approved = self._draft("1", approved=True, status="approved")
+        approved.update({
+            "approval_source": "auto",
+            "approved_at": "2026-08-23 12:00:00",
+            "auto_generation_id": "old-round",
+        })
+        with open(self.drafts_file, "w", encoding="utf-8") as handle:
+            json.dump([approved], handle, ensure_ascii=False)
+
+        self.bot._review_drafts = {}
+        self.bot.load_review_drafts()
+
+        draft = self.bot._review_drafts["1"]
+        self.assertEqual(draft["status"], "pending")
+        self.assertFalse(draft["approved"])
+        self.assertNotIn("approval_source", draft)
+        self.assertNotIn("approved_at", draft)
+        self.assertNotIn("auto_generation_id", draft)
+        self.assertIn("不会自动重发", draft["error"])
 
     def test_load_migrates_closed_comment_failure_to_unavailable(self):
         failed = self._draft("1", approved=True, status="failed")

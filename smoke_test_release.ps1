@@ -326,6 +326,19 @@ try {
     ) {
         throw "账号 2 配置串号，或继承了账号 1 的自动回复开关"
     }
+    $saved = Post-Json "$baseUrl/api/config" @{
+        reply = @{
+            enabled = $false
+            auto_send_enabled = $true
+        }
+    }
+    if (-not $saved.ok) {
+        throw "账号 2 自动回复隔离配置保存失败"
+    }
+    $monitorBStart = Post-Json "$baseUrl/api/bot/start" @{}
+    if (-not $monitorBStart.ok) {
+        throw "账号 2 后台定时处理启动失败"
+    }
 
     $selected = Post-Json "$baseUrl/api/accounts/select" @{
         account_id = $firstId
@@ -340,11 +353,48 @@ try {
     ) {
         throw "账号 1 配置串号，或自动回复开关未按账号保存"
     }
+    $monitorAStart = Post-Json "$baseUrl/api/bot/start" @{}
+    if (-not $monitorAStart.ok) {
+        throw "账号 1 后台定时处理再次启动失败"
+    }
+    $concurrentAccounts = Invoke-RestMethod `
+        -Uri "$baseUrl/api/accounts" `
+        -TimeoutSec 10
+    $runningAccounts = @(
+        $concurrentAccounts.accounts |
+            Where-Object { [bool]$_.running }
+    )
+    if (
+        [string]$concurrentAccounts.current_account_id -ne $firstId -or
+        $runningAccounts.Count -ne 2
+    ) {
+        throw "前端停留账号 1 时，两个账号没有同时保持独立后台运行"
+    }
     if (
         $config1.config.bilibili.PSObject.Properties.Name -contains "cookie" -or
         $config1.config.ark.PSObject.Properties.Name -contains "api_key"
     ) {
         throw "保存的凭据被重新暴露给浏览器"
+    }
+    $monitorAStop = Post-Json "$baseUrl/api/bot/stop" @{}
+    if (-not $monitorAStop.ok) {
+        throw "账号 1 后台定时处理停止失败"
+    }
+    $selected = Post-Json "$baseUrl/api/accounts/select" @{
+        account_id = $secondId
+    }
+    if (-not $selected.ok) {
+        throw "切换到账号 2 停止后台任务失败"
+    }
+    $monitorBStop = Post-Json "$baseUrl/api/bot/stop" @{}
+    if (-not $monitorBStop.ok) {
+        throw "账号 2 后台定时处理停止失败"
+    }
+    $selected = Post-Json "$baseUrl/api/accounts/select" @{
+        account_id = $firstId
+    }
+    if (-not $selected.ok) {
+        throw "双账号后台烟测后切回账号 1 失败"
     }
 
     Set-Content `
@@ -410,6 +460,7 @@ try {
         MonitorPreferencePersisted = $true
         AutoReplyDefaultOff = $true
         AutoReplyAccountIsolation = $true
+        ConcurrentAccountMonitors = $runningAccounts.Count
         AccountCount = $manifest.accounts.Count
         LocalSocketClient = $true
         SecretsRedacted = $true

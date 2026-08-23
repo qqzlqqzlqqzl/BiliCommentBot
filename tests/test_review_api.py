@@ -299,6 +299,31 @@ class ReviewApiTests(unittest.TestCase):
         self.fake_bot.reload_config.assert_called_once_with(config)
         self.fake_bot.start.assert_called_once_with()
 
+    def test_monitor_start_busy_rolls_back_restart_preference(self):
+        config = {"bilibili": {"auto_start_monitor": False}}
+        saved_states = []
+        self.fake_bot.start.side_effect = ReviewOperationBusyError(
+            "上一次定时处理仍在收尾，请稍后再启动"
+        )
+
+        def save_config(cfg):
+            saved_states.append(
+                bool(cfg["bilibili"]["auto_start_monitor"])
+            )
+            return True
+
+        with (
+            patch.object(server, "load_config", return_value=config),
+            patch.object(server, "save_config", side_effect=save_config),
+        ):
+            response = self.client.post("/api/bot/start")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(saved_states, [True, False])
+        self.assertFalse(config["bilibili"]["auto_start_monitor"])
+        self.assertEqual(self.fake_bot.reload_config.call_count, 2)
+        self.assertIn("不会自动启动", response.get_json()["message"])
+
     def test_monitor_stop_persists_restart_preference_even_if_already_stopped(self):
         config = {"bilibili": {"auto_start_monitor": True}}
         self.fake_bot.stop.return_value = False
