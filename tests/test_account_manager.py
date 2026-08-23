@@ -4,12 +4,15 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
+from io import BytesIO
 
 from account_manager import (
     AccountBusyError,
     AccountManager,
     AccountNotFoundError,
     AutomaticRoundCoordinator,
+    MIGRATION_MANIFEST_FILE,
 )
 
 
@@ -257,6 +260,168 @@ class AccountManagerTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(destination, "history.json")))
             self.assertTrue(os.path.isfile(config_path))
             self.assertTrue(os.path.isfile(history_path))
+
+    def test_exports_complete_sensitive_account_migration_bundle(self):
+        account_id = self.manager.current_account_id()
+        account_dir = self.manager.account_dir(account_id)
+        with open(os.path.join(account_dir, "config.toml"), "w", encoding="utf-8") as f:
+            f.write(
+                '[bilibili]\nuid = "123"\n'
+                '[ark]\napi_key = "secret-key"\n'
+            )
+        with open(os.path.join(account_dir, "bilibili_cookie.json"), "w", encoding="utf-8") as f:
+            json.dump({"cookie": {"SESSDATA": "secret-cookie"}}, f)
+        with open(os.path.join(account_dir, "history.json"), "w", encoding="utf-8") as f:
+            json.dump([{"comment_id": "c1"}], f)
+        with open(os.path.join(account_dir, "review_drafts.json"), "w", encoding="utf-8") as f:
+            json.dump({"c2": {"comment": "待审核"}}, f)
+
+        bundle = self.manager.export_account_bundle(account_id)
+
+        with zipfile.ZipFile(BytesIO(bundle["content"])) as archive:
+            self.assertEqual(
+                set(archive.namelist()),
+                {
+                    MIGRATION_MANIFEST_FILE,
+                    "config.toml",
+                    "bilibili_cookie.json",
+                    "history.json",
+                    "review_drafts.json",
+                },
+            )
+            manifest = json.loads(archive.read(MIGRATION_MANIFEST_FILE))
+            self.assertEqual(manifest["uid"], "123")
+            self.assertTrue(manifest["contains_sensitive_data"])
+            self.assertIn(b"secret-key", archive.read("config.toml"))
+            self.assertIn(b"secret-cookie", archive.read("bilibili_cookie.json"))
+
+    def test_import_bundle_creates_account_on_new_computer(self):
+        source_id = self.manager.current_account_id()
+        source_dir = self.manager.account_dir(source_id)
+        self.manager.rename_account(source_id, "来源账号")
+        with open(os.path.join(source_dir, "config.toml"), "w", encoding="utf-8") as f:
+            f.write('[bilibili]\nuid = "source-uid"\n')
+        with open(os.path.join(source_dir, "history.json"), "w", encoding="utf-8") as f:
+            json.dump([{"comment_id": "already-replied"}], f)
+        bundle = self.manager.export_account_bundle(source_id)
+
+        with tempfile.TemporaryDirectory() as target_root:
+            target = AccountManager(target_root, lambda account: FakeBot(account))
+            imported = target.import_account_bundle(bundle["content"])
+            imported_dir = target.account_dir(imported["id"])
+
+            self.assertEqual(imported["mode"], "created")
+            self.assertEqual(imported["name"], "来源账号")
+            self.assertEqual(target.current_account_id(), imported["id"])
+            with open(os.path.join(imported_dir, "history.json"), encoding="utf-8") as f:
+                self.assertEqual(
+                    json.load(f)[0]["comment_id"],
+                    "already-replied",
+                )
+
+    def test_same_uid_import_merges_history_without_overwriting_target_config(self):
+        source_id = self.manager.current_account_id()
+        source_dir = self.manager.account_dir(source_id)
+        with open(os.path.join(source_dir, "config.toml"), "w", encoding="utf-8") as f:
+            f.write(
+                '[bilibili]\nuid = "same-uid"\n'
+                '[ark]\napi_key = "source-secret"\n'
+            )
+        with open(os.path.join(source_dir, "history.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                [
+                    {"comment_id": "remote", "reply_content": "远端"},
+                    {"comment_id": "duplicate", "reply_content": "远端旧值"},
+                ],
+                f,
+            )
+        with open(os.path.join(source_dir, "review_drafts.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "remote": {"comment": "不应保留"},
+                    "pending": {"comment": "应保留"},
+                },
+                f,
+            )
+        bundle = self.manager.export_account_bundle(source_id)
+
+        with tempfile.TemporaryDirectory() as target_root:
+            target = AccountManager(target_root, lambda account: FakeBot(account))
+            target_id = target.current_account_id()
+            target_dir = target.account_dir(target_id)
+            with open(os.path.join(target_dir, "config.toml"), "w", encoding="utf-8") as f:
+                f.write(
+                    '[bilibili]\nuid = "same-uid"\n'
+                    '[ark]\napi_key = "target-secret"\n'
+                )
+            with open(os.path.join(target_dir, "history.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    [
+                        {"comment_id": "local", "reply_content": "本机"},
+                        {"comment_id": "duplicate", "reply_content": "本机新值"},
+                    ],
+                    f,
+                )
+            with open(os.path.join(target_dir, "review_drafts.json"), "w", encoding="utf-8") as f:
+                json.dump({"local": {"comment": "不应保留"}}, f)
+
+            imported = target.import_account_bundle(bundle["content"])
+
+            self.assertEqual(imported["mode"], "merged")
+            self.assertEqual(imported["id"], target_id)
+            self.assertEqual(imported["history_added"], 1)
+            with open(os.path.join(target_dir, "config.toml"), encoding="utf-8") as f:
+                target_config = f.read()
+            self.assertIn("target-secret", target_config)
+            self.assertNotIn("source-secret", target_config)
+            with open(os.path.join(target_dir, "history.json"), encoding="utf-8") as f:
+                merged_history = json.load(f)
+            history_by_id = {
+                item["comment_id"]: item for item in merged_history
+            }
+            self.assertEqual(
+                set(history_by_id),
+                {"remote", "duplicate", "local"},
+            )
+            self.assertEqual(
+                history_by_id["duplicate"]["reply_content"],
+                "本机新值",
+            )
+            with open(os.path.join(target_dir, "review_drafts.json"), encoding="utf-8") as f:
+                merged_drafts = json.load(f)
+            self.assertEqual(set(merged_drafts), {"pending"})
+
+    def test_running_account_cannot_be_exported_or_merged(self):
+        account_id = self.manager.current_account_id()
+        account_dir = self.manager.account_dir(account_id)
+        with open(os.path.join(account_dir, "config.toml"), "w", encoding="utf-8") as f:
+            f.write('[bilibili]\nuid = "busy-uid"\n')
+        bundle = self.manager.export_account_bundle(account_id)
+        bot = self.manager.get_bot(account_id)
+        bot.running = True
+
+        with self.assertRaises(AccountBusyError):
+            self.manager.export_account_bundle(account_id)
+        with self.assertRaises(AccountBusyError):
+            self.manager.import_account_bundle(bundle["content"])
+
+    def test_import_cannot_switch_away_from_busy_current_account(self):
+        source_id = self.manager.current_account_id()
+        source_dir = self.manager.account_dir(source_id)
+        with open(os.path.join(source_dir, "config.toml"), "w", encoding="utf-8") as f:
+            f.write('[bilibili]\nuid = "incoming-uid"\n')
+        bundle = self.manager.export_account_bundle(source_id)
+
+        busy_account = self.manager.create_account("忙碌账号")
+        busy_bot = self.manager.get_bot(busy_account["id"])
+        busy_bot.busy = True
+
+        with self.assertRaises(AccountBusyError):
+            self.manager.import_account_bundle(bundle["content"])
+        self.assertEqual(
+            self.manager.current_account_id(),
+            busy_account["id"],
+        )
 
     def test_rejects_unknown_or_path_like_account_id(self):
         with self.assertRaises(AccountNotFoundError):

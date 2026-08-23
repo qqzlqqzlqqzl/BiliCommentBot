@@ -923,6 +923,25 @@
     <!-- History -->
     <div class="page" id="page-history">
       <div class="page-title"><span class="icon">📝</span>回复历史</div>
+      <div class="card" id="account-migration-card" style="display:none">
+        <div class="card-title">跨电脑迁移</div>
+        <p style="font-size:14px;color:var(--text2);margin-bottom:14px">
+          回复历史同时是防止重复生成、重复回复的去重依据。换电脑前导出当前账号迁移包，
+          在新电脑导入后会继续识别已经处理过的评论。
+        </p>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn btn-secondary" id="btn-export-bundle" onclick="exportAccountBundle()"
+            data-help="下载当前账号的完整迁移 ZIP，包含配置、登录状态、豆包 Key、回复历史和审核草稿。账号运行中不可导出。">导出当前账号迁移包</button>
+          <button class="btn btn-secondary" id="btn-import-bundle" onclick="chooseAccountBundle()"
+            data-help="选择另一台电脑导出的迁移 ZIP。同 UID 会合并回复历史；没有同 UID 会创建账号。">导入迁移包</button>
+          <input type="file" id="account-bundle-file" accept=".zip,application/zip" style="display:none"
+            onchange="importAccountBundle(this)">
+        </div>
+        <div class="form-hint" style="margin-top:12px">
+          迁移包包含 B站登录 Cookie 和豆包 API Key，按密码文件保管，不要上传到网盘公开链接或发给别人。
+          同一账号不要在两台电脑上同时开启自动回复。
+        </div>
+      </div>
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
           <span id="history-total" style="color:var(--text2);font-size:14px">共 0 条记录</span>
@@ -1024,6 +1043,7 @@ function loadAccounts() {
     if (current) document.getElementById('sidebar-account-name').textContent = current.name;
     document.getElementById('btn-add-account').style.display = d.product_mode ? '' : 'none';
     document.getElementById('btn-import-account').style.display = d.product_mode ? '' : 'none';
+    document.getElementById('account-migration-card').style.display = d.product_mode ? '' : 'none';
     return d;
   });
 }
@@ -1083,6 +1103,74 @@ function importAccount() {
     showToast(`已复制 ${data.account.imported_files.length} 个旧数据文件，原目录未改动`, 'success');
     setTimeout(() => location.reload(), 500);
   }).catch(error => showToast(error.message, 'error'));
+}
+
+async function exportAccountBundle() {
+  const btn = document.getElementById('btn-export-bundle');
+  if (btn.disabled) return;
+  if (!confirm('迁移包包含 B站登录 Cookie 和豆包 API Key。确认下载并按密码文件保管吗？')) return;
+  btn.disabled = true;
+  try {
+    const response = await fetch('/api/accounts/export');
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.message || '导出迁移包失败');
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    const filename = match ? match[1] : 'BiliCommentReviewer-account.zip';
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    showToast('迁移包已下载，请妥善保管', 'success');
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function chooseAccountBundle() {
+  document.getElementById('account-bundle-file').click();
+}
+
+async function importAccountBundle(input) {
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const btn = document.getElementById('btn-import-bundle');
+  if (!confirm(`准备导入 ${file.name}。同 UID 会合并历史，没有同 UID 会创建账号。继续吗？`)) {
+    input.value = '';
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const form = new FormData();
+    form.append('file', file);
+    const response = await fetch('/api/accounts/import-bundle', {
+      method: 'POST',
+      body: form,
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.message || '导入迁移包失败');
+    const account = data.account || {};
+    if (account.mode === 'merged') {
+      showToast(`已合并到同 UID 账号，新增 ${account.history_added || 0} 条回复历史`, 'success');
+    } else {
+      showToast(`已创建迁移账号 ${account.name || ''}，导入 ${account.history_added || 0} 条回复历史`, 'success');
+    }
+    setTimeout(() => location.reload(), 700);
+  } catch (error) {
+    showToast(error.message, 'error');
+  } finally {
+    input.value = '';
+    btn.disabled = false;
+  }
 }
 
 // ── Socket 事件 ──

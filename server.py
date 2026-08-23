@@ -23,10 +23,15 @@ import requests
 import toml
 import tomli_w
 
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, send_file
 from flask_socketio import SocketIO, emit
 
-from account_manager import AccountBusyError, AccountManager, AccountNotFoundError
+from account_manager import (
+    AccountBusyError,
+    AccountManager,
+    AccountNotFoundError,
+    MIGRATION_ARCHIVE_MAX_BYTES,
+)
 from bot import (
     BiliCommentBot,
     DEFAULT_CONFIG,
@@ -641,6 +646,46 @@ def api_account_import():
     except AccountBusyError as exc:
         return jsonify({"ok": False, "message": str(exc)}), 409
     except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return jsonify({"ok": False, "message": f"导入失败：{exc}"}), 400
+
+
+@app.route("/api/accounts/export", methods=["GET"])
+def api_account_export():
+    if not is_product_mode():
+        return jsonify({"ok": False, "message": "当前启动方式不支持账号迁移"}), 409
+    try:
+        bundle = get_account_manager().export_account_bundle(
+            request.args.get("account_id")
+        )
+        return send_file(
+            io.BytesIO(bundle["content"]),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=bundle["filename"],
+            max_age=0,
+        )
+    except AccountBusyError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 409
+    except (OSError, ValueError, AccountNotFoundError) as exc:
+        return jsonify({"ok": False, "message": f"导出失败：{exc}"}), 400
+
+
+@app.route("/api/accounts/import-bundle", methods=["POST"])
+def api_account_import_bundle():
+    if not is_product_mode():
+        return jsonify({"ok": False, "message": "当前启动方式不支持账号迁移"}), 409
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return jsonify({"ok": False, "message": "请选择迁移 ZIP"}), 400
+    content = upload.read(MIGRATION_ARCHIVE_MAX_BYTES + 1)
+    if len(content) > MIGRATION_ARCHIVE_MAX_BYTES:
+        return jsonify({"ok": False, "message": "迁移包超过 64 MB 上限"}), 413
+    try:
+        account = get_account_manager().import_account_bundle(content)
+        return jsonify({"ok": True, "account": account})
+    except AccountBusyError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 409
+    except (OSError, ValueError, AccountNotFoundError) as exc:
         return jsonify({"ok": False, "message": f"导入失败：{exc}"}), 400
 
 

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """单进程多账号的目录、清单和机器人实例管理。"""
 import copy
+import io
 import json
 import os
 import re
@@ -9,6 +10,7 @@ import threading
 import time
 import tomllib
 import uuid
+import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -22,6 +24,17 @@ LEGACY_ACCOUNT_FILES = (
     "review_drafts.json",
     "video_cache.json",
 )
+MIGRATION_ACCOUNT_FILES = (
+    "config.toml",
+    "bilibili_cookie.json",
+    "history.json",
+    "review_drafts.json",
+)
+MIGRATION_MANIFEST_FILE = "migration.json"
+MIGRATION_FORMAT = "BiliCommentReviewer.account-backup"
+MIGRATION_VERSION = 1
+MIGRATION_ARCHIVE_MAX_BYTES = 64 * 1024 * 1024
+MIGRATION_UNCOMPRESSED_MAX_BYTES = 128 * 1024 * 1024
 
 
 class AccountNotFoundError(KeyError):
@@ -306,6 +319,337 @@ class AccountManager:
         while f"{base_name} {suffix}" in existing_names:
             suffix += 1
         return f"{base_name} {suffix}"
+
+    def _unique_account_name(self, name: str) -> str:
+        existing_names = {
+            str(account.get("name") or "").strip()
+            for account in self._manifest["accounts"]
+        }
+        base_name = str(name or "").strip() or "迁移账号"
+        if len(base_name) > 40:
+            base_name = base_name[:40].rstrip()
+        if base_name not in existing_names:
+            return base_name
+        suffix = 2
+        while True:
+            suffix_text = f" {suffix}"
+            candidate = f"{base_name[:40 - len(suffix_text)].rstrip()}{suffix_text}"
+            if candidate not in existing_names:
+                return candidate
+            suffix += 1
+
+    def _assert_account_migration_idle(self, account_id: str):
+        bot = self._bots.get(account_id)
+        if bot is None:
+            return
+        running_state = getattr(bot, "is_running", False)
+        running = bool(
+            running_state() if callable(running_state) else running_state
+        )
+        operations = bot.get_review_operation_status()
+        busy = any(operations.get("active", {}).values())
+        if running or busy:
+            raise AccountBusyError(
+                "账号正在定时处理、生成或发送，停止任务后再迁移"
+            )
+
+    @staticmethod
+    def _load_account_uid(directory: str) -> str:
+        config_file = os.path.join(directory, "config.toml")
+        if not os.path.isfile(config_file):
+            return ""
+        with open(config_file, "rb") as f:
+            config = tomllib.load(f)
+        return str(config.get("bilibili", {}).get("uid") or "").strip()
+
+    @staticmethod
+    def _write_bytes_atomic(path: str, content: bytes):
+        temp_file = f"{path}.migration.tmp"
+        with open(temp_file, "wb") as f:
+            f.write(content)
+        os.replace(temp_file, path)
+
+    @staticmethod
+    def _load_json_bytes(content: bytes, label: str, expected_type):
+        try:
+            value = json.loads(content.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"{label} 不是有效 JSON") from exc
+        if not isinstance(value, expected_type):
+            raise ValueError(f"{label} 数据结构不正确")
+        return value
+
+    def export_account_bundle(self, account_id: str = None) -> dict:
+        account_id = self.resolve_account_id(account_id)
+        with self._lock:
+            self._assert_account_migration_idle(account_id)
+            account = next(
+                copy.deepcopy(item)
+                for item in self._manifest["accounts"]
+                if item["id"] == account_id
+            )
+            source_dir = self.account_dir(account_id)
+            existing_files = [
+                filename
+                for filename in MIGRATION_ACCOUNT_FILES
+                if os.path.isfile(os.path.join(source_dir, filename))
+            ]
+            if "config.toml" not in existing_files:
+                raise ValueError("当前账号尚未保存配置，无法生成迁移包")
+            uid = self._load_account_uid(source_dir)
+            manifest = {
+                "format": MIGRATION_FORMAT,
+                "version": MIGRATION_VERSION,
+                "exported_at": self._now(),
+                "account_name": account.get("name") or "迁移账号",
+                "uid": uid,
+                "files": existing_files,
+                "contains_sensitive_data": True,
+            }
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(
+                buffer,
+                mode="w",
+                compression=zipfile.ZIP_DEFLATED,
+            ) as archive:
+                archive.writestr(
+                    MIGRATION_MANIFEST_FILE,
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                )
+                for filename in existing_files:
+                    archive.write(
+                        os.path.join(source_dir, filename),
+                        arcname=filename,
+                    )
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            return {
+                "content": buffer.getvalue(),
+                "filename": f"BiliCommentReviewer-account-{stamp}.zip",
+                "account_id": account_id,
+                "account_name": account.get("name") or "",
+                "uid": uid,
+                "files": existing_files,
+            }
+
+    def import_account_bundle(self, content: bytes) -> dict:
+        if not content:
+            raise ValueError("迁移包为空")
+        if len(content) > MIGRATION_ARCHIVE_MAX_BYTES:
+            raise ValueError("迁移包超过 64 MB 上限")
+        try:
+            with zipfile.ZipFile(io.BytesIO(content), mode="r") as archive:
+                members = [item for item in archive.infolist() if not item.is_dir()]
+                allowed_names = {
+                    MIGRATION_MANIFEST_FILE,
+                    *MIGRATION_ACCOUNT_FILES,
+                }
+                names = [item.filename for item in members]
+                if len(names) != len(set(names)):
+                    raise ValueError("迁移包包含重复文件")
+                if any(
+                    name not in allowed_names
+                    or name != os.path.basename(name)
+                    for name in names
+                ):
+                    raise ValueError("迁移包包含不允许的文件")
+                if sum(item.file_size for item in members) > MIGRATION_UNCOMPRESSED_MAX_BYTES:
+                    raise ValueError("迁移包解压后超过 128 MB 上限")
+                if MIGRATION_MANIFEST_FILE not in names:
+                    raise ValueError("迁移包缺少 migration.json")
+                files = {
+                    item.filename: archive.read(item)
+                    for item in members
+                }
+        except zipfile.BadZipFile as exc:
+            raise ValueError("文件不是有效的迁移 ZIP") from exc
+
+        manifest = self._load_json_bytes(
+            files[MIGRATION_MANIFEST_FILE],
+            MIGRATION_MANIFEST_FILE,
+            dict,
+        )
+        if manifest.get("format") != MIGRATION_FORMAT:
+            raise ValueError("不是 BiliCommentReviewer 账号迁移包")
+        if manifest.get("version") != MIGRATION_VERSION:
+            raise ValueError("迁移包版本不受支持")
+        declared_files = manifest.get("files")
+        if not isinstance(declared_files, list):
+            raise ValueError("迁移包文件清单不正确")
+        if len(declared_files) != len(set(declared_files)):
+            raise ValueError("迁移包文件清单包含重复项")
+        actual_account_files = [
+            name for name in names if name in MIGRATION_ACCOUNT_FILES
+        ]
+        if set(declared_files) != set(actual_account_files):
+            raise ValueError("迁移包文件清单与实际内容不一致")
+        if "config.toml" not in files:
+            raise ValueError("迁移包缺少 config.toml")
+
+        try:
+            imported_config = tomllib.loads(
+                files["config.toml"].decode("utf-8-sig")
+            )
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            raise ValueError("迁移包中的 config.toml 无效") from exc
+        imported_uid = str(
+            imported_config.get("bilibili", {}).get("uid") or ""
+        ).strip()
+        imported_history = self._load_json_bytes(
+            files.get("history.json", b"[]"),
+            "history.json",
+            list,
+        )
+        imported_drafts = self._load_json_bytes(
+            files.get("review_drafts.json", b"{}"),
+            "review_drafts.json",
+            dict,
+        )
+        if "bilibili_cookie.json" in files:
+            self._load_json_bytes(
+                files["bilibili_cookie.json"],
+                "bilibili_cookie.json",
+                dict,
+            )
+
+        with self._lock:
+            self._assert_current_idle()
+            matching_account = None
+            if imported_uid:
+                for account in self._manifest["accounts"]:
+                    try:
+                        account_uid = self._load_account_uid(
+                            self.account_dir(account["id"])
+                        )
+                    except (OSError, ValueError, tomllib.TOMLDecodeError):
+                        continue
+                    if account_uid == imported_uid:
+                        matching_account = account
+                        break
+
+            if matching_account is None:
+                account = {
+                    "id": self._new_account_id(),
+                    "name": self._unique_account_name(
+                        manifest.get("account_name") or "迁移账号"
+                    ),
+                    "created_at": self._now(),
+                    "imported_at": self._now(),
+                }
+                destination = os.path.abspath(
+                    os.path.join(self.accounts_dir, account["id"])
+                )
+                if not self._is_path_within(self.accounts_dir, destination):
+                    raise ValueError("导入目标目录非法")
+                os.makedirs(destination, exist_ok=False)
+                for filename in actual_account_files:
+                    self._write_bytes_atomic(
+                        os.path.join(destination, filename),
+                        files[filename],
+                    )
+                self._manifest["accounts"].append(account)
+                self._manifest["current_account_id"] = account["id"]
+                self._save_manifest()
+                result = copy.deepcopy(account)
+                result.update({
+                    "mode": "created",
+                    "uid": imported_uid,
+                    "imported_files": actual_account_files,
+                    "history_added": len(imported_history),
+                })
+                return result
+
+            account_id = matching_account["id"]
+            self._assert_account_migration_idle(account_id)
+            destination = self.account_dir(account_id)
+            history_file = os.path.join(destination, "history.json")
+            drafts_file = os.path.join(destination, "review_drafts.json")
+            try:
+                with open(history_file, "r", encoding="utf-8") as f:
+                    local_history = json.load(f)
+            except FileNotFoundError:
+                local_history = []
+            if not isinstance(local_history, list):
+                raise ValueError("目标账号 history.json 数据结构不正确")
+            try:
+                with open(drafts_file, "r", encoding="utf-8") as f:
+                    local_drafts = json.load(f)
+            except FileNotFoundError:
+                local_drafts = {}
+            if not isinstance(local_drafts, dict):
+                raise ValueError("目标账号 review_drafts.json 数据结构不正确")
+
+            merged_by_id = {}
+            ordered_ids = []
+            unkeyed_items = []
+            for item in [*imported_history, *local_history]:
+                if not isinstance(item, dict):
+                    raise ValueError("history.json 包含无效记录")
+                comment_id = str(item.get("comment_id") or "").strip()
+                if not comment_id:
+                    unkeyed_items.append(item)
+                    continue
+                if comment_id not in merged_by_id:
+                    ordered_ids.append(comment_id)
+                merged_by_id[comment_id] = item
+            merged_history = [
+                merged_by_id[comment_id] for comment_id in ordered_ids
+            ]
+            merged_history.extend(unkeyed_items)
+            local_ids = {
+                str(item.get("comment_id") or "").strip()
+                for item in local_history
+                if isinstance(item, dict) and item.get("comment_id")
+            }
+            imported_ids = {
+                str(item.get("comment_id") or "").strip()
+                for item in imported_history
+                if isinstance(item, dict) and item.get("comment_id")
+            }
+
+            merged_drafts = {
+                str(comment_id): draft
+                for comment_id, draft in imported_drafts.items()
+            }
+            merged_drafts.update({
+                str(comment_id): draft
+                for comment_id, draft in local_drafts.items()
+            })
+            processed_ids = set(merged_by_id)
+            for comment_id in processed_ids:
+                merged_drafts.pop(comment_id, None)
+
+            self._write_bytes_atomic(
+                history_file,
+                json.dumps(
+                    merged_history,
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8"),
+            )
+            self._write_bytes_atomic(
+                drafts_file,
+                json.dumps(
+                    merged_drafts,
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8"),
+            )
+            matching_account["imported_at"] = self._now()
+            self._manifest["current_account_id"] = account_id
+            self._save_manifest()
+            self._bots.pop(account_id, None)
+            result = copy.deepcopy(matching_account)
+            result.update({
+                "mode": "merged",
+                "uid": imported_uid,
+                "imported_files": [
+                    "history.json",
+                    "review_drafts.json",
+                ],
+                "history_added": len(imported_ids - local_ids),
+                "history_total": len(merged_history),
+            })
+            return result
 
     def create_account(self, name: str) -> dict:
         clean_name = str(name or "").strip()

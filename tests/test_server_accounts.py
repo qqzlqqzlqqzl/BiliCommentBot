@@ -1,6 +1,8 @@
 import os
 import tempfile
 import unittest
+import json
+from io import BytesIO
 from unittest.mock import patch
 
 import server
@@ -88,6 +90,33 @@ class ServerAccountApiTests(unittest.TestCase):
         self.assertEqual(
             server.load_config()["bilibili"]["uid"],
             "legacy-uid",
+        )
+
+    def test_exports_and_reimports_current_account_bundle(self):
+        account_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+        account_dir = server.get_account_manager().account_dir(account_id)
+        with open(os.path.join(account_dir, "config.toml"), "w", encoding="utf-8") as f:
+            f.write('[bilibili]\nuid = "portable-uid"\n')
+        with open(os.path.join(account_dir, "history.json"), "w", encoding="utf-8") as f:
+            json.dump([{"comment_id": "portable-comment"}], f)
+
+        exported = self.client.get("/api/accounts/export")
+        imported = self.client.post(
+            "/api/accounts/import-bundle",
+            data={"file": (BytesIO(exported.data), "account.zip")},
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(exported.status_code, 200)
+        self.assertEqual(exported.mimetype, "application/zip")
+        self.assertIn("attachment", exported.headers["Content-Disposition"])
+        self.assertEqual(imported.status_code, 200)
+        payload = imported.get_json()
+        self.assertEqual(payload["account"]["mode"], "merged")
+        self.assertEqual(payload["account"]["history_total"], 1)
+        self.assertIn(
+            "portable-comment",
+            server.get_bot().processed_comments,
         )
 
     def test_account_configs_are_isolated(self):
