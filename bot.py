@@ -111,7 +111,7 @@ DEFAULT_CONFIG = {
         "max_concurrency": 16,
         "max_retries": 5,
         "retry_base_seconds": 2.0,
-        "system_prompt": "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实。默认不要使用“哈哈”“哈哈哈”“笑死”“绷不住”等幼稚或重复的口头禅；只有观众原话明确在开玩笑，而且确实需要接梗时，才可以偶尔使用一次。",
+        "system_prompt": "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实。默认不要使用“哈哈”“哈哈哈”“笑死”“绷不住”等幼稚或重复的口头禅；只有观众原话明确在开玩笑，而且确实需要接梗时，才可以偶尔使用一次。观众质问或询问回复者是不是AI、机器人或自动回复时，直接判断为不回复并跳过。",
     },
     "reply": {
         "enabled": True,
@@ -425,6 +425,7 @@ class BiliCommentBot:
         }
         self._auto_send_rounds = {}
         self._pending_config: Optional[dict] = None
+        self._automatic_round_context_factory = None
 
         self.session = requests.Session()
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=Retry(total=0))
@@ -554,6 +555,12 @@ class BiliCommentBot:
             self._auto_send_rounds = {}
         if not hasattr(self, "_pending_config"):
             self._pending_config = None
+        if not hasattr(self, "_automatic_round_context_factory"):
+            self._automatic_round_context_factory = None
+
+    def set_automatic_round_context(self, context_factory):
+        """注入产品级多账号后台轮次协调器；人工操作不经过这里。"""
+        self._automatic_round_context_factory = context_factory
 
     def _apply_config(self, config: dict):
         self.config = copy.deepcopy(config)
@@ -802,7 +809,7 @@ class BiliCommentBot:
             while self._running:
                 self.stats["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 try:
-                    self.process_comments()
+                    self._process_scheduled_round()
                 except Exception as e:
                     self.logger.error(f"处理评论异常: {e}", exc_info=True)
                 self._emit("stats", self.get_stats())
@@ -817,6 +824,27 @@ class BiliCommentBot:
             with self._review_operation_lock:
                 if self._thread is worker:
                     self._thread = None
+
+    def _process_scheduled_round(self):
+        self._ensure_review_operation_state()
+        context_factory = self._automatic_round_context_factory
+        if (
+            context_factory is None
+            or not self.config.get("reply", {}).get("enabled", True)
+        ):
+            self.process_comments()
+            return
+
+        with context_factory(
+            self._stop_event,
+            self.logger,
+            lambda: (
+                self._running
+                and self.config.get("reply", {}).get("enabled", True)
+            ),
+        ) as allowed:
+            if allowed:
+                self.process_comments()
 
     def update_headers(self):
         self.session.headers.update({
@@ -2035,6 +2063,7 @@ class BiliCommentBot:
 7. 不要编造视频和评论里没有的事实。
 8. regenerate=true 表示用户不满意旧回复。必须重新组织表达，不能与 previous_reply 或 avoid_replies 中的内容相同，也不能只替换标点、语气词或少量近义词。
 9. 风格硬约束：默认不要使用“哈哈”“哈哈哈”“笑死”“绷不住”等幼稚或重复口头禅。只有观众原话明确在开玩笑且回复确实需要接梗时，才可以偶尔使用一次；拿不准就不用。
+10. 观众质问或询问回复者是不是AI、机器人或自动回复时，必须 should_reply=false，直接跳过，不要解释或否认。
 
 只输出严格 JSON 数组：
 [{{"id":"评论id","should_reply":true,"reply":"直接回复正文","reason":"简短判断"}}]

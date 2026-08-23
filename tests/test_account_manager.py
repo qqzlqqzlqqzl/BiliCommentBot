@@ -1,12 +1,15 @@
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 
 from account_manager import (
     AccountBusyError,
     AccountManager,
     AccountNotFoundError,
+    AutomaticRoundCoordinator,
 )
 
 
@@ -16,6 +19,7 @@ class FakeBot:
         self.running = False
         self.busy = False
         self.shutdown_calls = 0
+        self.automatic_round_context = None
 
     def is_running(self):
         return self.running
@@ -32,6 +36,9 @@ class FakeBot:
 
     def prepare_shutdown(self):
         self.shutdown_calls += 1
+
+    def set_automatic_round_context(self, context_factory):
+        self.automatic_round_context = context_factory
 
 
 class AccountManagerTests(unittest.TestCase):
@@ -74,6 +81,101 @@ class AccountManagerTests(unittest.TestCase):
             os.path.normcase(first_bot.account["data_dir"]),
             os.path.normcase(second_bot.account["data_dir"]),
         )
+        self.assertIsNotNone(first_bot.automatic_round_context)
+        self.assertIsNotNone(second_bot.automatic_round_context)
+
+    def test_automatic_rounds_are_global_serial_with_account_gap(self):
+        coordinator = AutomaticRoundCoordinator(gap_seconds=0.12)
+        release_first = threading.Event()
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        timeline = {}
+        allowed = {}
+
+        def run_first():
+            with coordinator.turn(
+                "account-a",
+                "账号 A",
+                threading.Event(),
+            ) as acquired:
+                allowed["a"] = acquired
+                timeline["a_start"] = time.monotonic()
+                first_entered.set()
+                release_first.wait(timeout=2)
+                timeline["a_end"] = time.monotonic()
+
+        def run_second():
+            with coordinator.turn(
+                "account-b",
+                "账号 B",
+                threading.Event(),
+            ) as acquired:
+                allowed["b"] = acquired
+                timeline["b_start"] = time.monotonic()
+                second_entered.set()
+
+        first = threading.Thread(target=run_first)
+        second = threading.Thread(target=run_second)
+        first.start()
+        self.assertTrue(first_entered.wait(timeout=1))
+        second.start()
+        self.assertFalse(second_entered.wait(timeout=0.04))
+
+        release_first.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(allowed, {"a": True, "b": True})
+        self.assertGreaterEqual(
+            timeline["b_start"] - timeline["a_end"],
+            0.08,
+        )
+
+    def test_waiting_automatic_round_can_be_cancelled(self):
+        coordinator = AutomaticRoundCoordinator(gap_seconds=600)
+        stop_event = threading.Event()
+        stop_event.set()
+
+        with coordinator.turn(
+            "account-b",
+            "账号 B",
+            stop_event,
+        ) as acquired:
+            self.assertFalse(acquired)
+
+    def test_disabled_account_leaves_automatic_round_queue(self):
+        coordinator = AutomaticRoundCoordinator(gap_seconds=600)
+
+        with coordinator.turn(
+            "account-b",
+            "账号 B",
+            threading.Event(),
+            should_continue=lambda: False,
+        ) as acquired:
+            self.assertFalse(acquired)
+
+    def test_same_account_does_not_receive_inter_account_gap(self):
+        coordinator = AutomaticRoundCoordinator(gap_seconds=600)
+        stop_event = threading.Event()
+
+        with coordinator.turn(
+            "account-a",
+            "账号 A",
+            stop_event,
+        ) as first:
+            self.assertTrue(first)
+
+        started_at = time.monotonic()
+        with coordinator.turn(
+            "account-a",
+            "账号 A",
+            stop_event,
+        ) as second:
+            self.assertTrue(second)
+
+        self.assertLess(time.monotonic() - started_at, 0.1)
 
     def test_empty_account_name_creates_unique_pending_login_names(self):
         first_pending = self.manager.create_account("")

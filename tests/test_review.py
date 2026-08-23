@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 import bot as bot_module
@@ -172,6 +173,7 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertIn('"is_follow_up": true', prompt)
         self.assertIn("纯“谢谢/收到/哈哈”", prompt)
         self.assertIn("风格硬约束", prompt)
+        self.assertIn("是不是AI", prompt)
         self.assertFalse(result[0]["should_reply"])
 
     def test_regenerate_prompt_contains_previous_reply_and_requires_difference(self):
@@ -551,6 +553,36 @@ class ReviewWorkflowTests(unittest.TestCase):
         self.assertFalse(DEFAULT_CONFIG["reply"]["auto_send_enabled"])
         self.assertIn("默认不要使用", DEFAULT_CONFIG["ark"]["system_prompt"])
         self.assertIn("哈哈哈", DEFAULT_CONFIG["ark"]["system_prompt"])
+        self.assertIn("是不是AI", DEFAULT_CONFIG["ark"]["system_prompt"])
+
+    def test_scheduled_round_uses_product_account_coordinator(self):
+        events = []
+
+        @contextmanager
+        def coordinated(_stop_event, _logger, _should_continue):
+            events.append("enter")
+            yield True
+            events.append("exit")
+
+        self.bot.set_automatic_round_context(coordinated)
+        self.bot.process_comments = Mock()
+
+        self.bot._process_scheduled_round()
+
+        self.bot.process_comments.assert_called_once_with()
+        self.assertEqual(events, ["enter", "exit"])
+
+    def test_cancelled_scheduled_round_does_not_process_comments(self):
+        @contextmanager
+        def cancelled(_stop_event, _logger, _should_continue):
+            yield False
+
+        self.bot.set_automatic_round_context(cancelled)
+        self.bot.process_comments = Mock()
+
+        self.bot._process_scheduled_round()
+
+        self.bot.process_comments.assert_not_called()
 
     def test_monitor_manual_mode_only_generates_drafts(self):
         self.bot.config["reply"]["enabled"] = True

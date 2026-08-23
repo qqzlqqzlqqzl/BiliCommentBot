@@ -190,9 +190,10 @@ try {
     }
     if (
         $page.Content -notmatch 'id="cfg-reply-auto_send_enabled"' -or
-        $page.Content -notmatch "页面停留在账号 A 时"
+        $page.Content -notmatch "页面停留在账号 A 时" -or
+        $page.Content -notmatch "至少等待 10 分钟"
     ) {
-        throw "页面缺少按账号自动回复开关或多账号后台说明"
+        throw "页面缺少按账号自动回复开关或多账号全局串行说明"
     }
     $socketClient = Invoke-WebRequest `
         -Uri "$baseUrl/static/socket.io.min.js" `
@@ -272,7 +273,8 @@ try {
     }
     if (
         [string]$defaultConfig.config.ark.system_prompt -notmatch "默认不要使用" -or
-        [string]$defaultConfig.config.ark.system_prompt -notmatch "哈哈哈"
+        [string]$defaultConfig.config.ark.system_prompt -notmatch "哈哈哈" -or
+        [string]$defaultConfig.config.ark.system_prompt -notmatch "是不是AI"
     ) {
         throw "发布 EXE 的默认豆包提示词缺少已确认约束"
     }

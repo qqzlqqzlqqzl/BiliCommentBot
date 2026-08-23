@@ -6,8 +6,10 @@ import os
 import re
 import shutil
 import threading
+import time
 import tomllib
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -30,12 +32,132 @@ class AccountBusyError(RuntimeError):
     pass
 
 
+class AutomaticRoundCoordinator:
+    """把多个账号的后台自动轮次排成单队列，并在账号间保留冷却时间。"""
+
+    def __init__(self, gap_seconds: float = 600.0):
+        self.gap_seconds = max(0.0, float(gap_seconds))
+        self._condition = threading.Condition()
+        self._queue = []
+        self._next_ticket = 0
+        self._active_account_id = None
+        self._last_account_id = None
+        self._next_allowed_at = 0.0
+
+    @contextmanager
+    def turn(
+        self,
+        account_id: str,
+        account_name: str,
+        stop_event: threading.Event,
+        logger=None,
+        should_continue=None,
+    ):
+        account_id = str(account_id)
+        account_name = str(account_name or account_id)
+        acquired = False
+        ticket = None
+        announced_wait = False
+
+        try:
+            with self._condition:
+                ticket = self._next_ticket
+                self._next_ticket += 1
+                self._queue.append((ticket, account_id))
+
+                while True:
+                    if (
+                        stop_event.is_set()
+                        or (
+                            should_continue is not None
+                            and not should_continue()
+                        )
+                    ):
+                        break
+
+                    now = time.monotonic()
+                    is_first = bool(
+                        self._queue
+                        and self._queue[0] == (ticket, account_id)
+                    )
+                    cooldown = (
+                        max(0.0, self._next_allowed_at - now)
+                        if (
+                            self._last_account_id is not None
+                            and self._last_account_id != account_id
+                        )
+                        else 0.0
+                    )
+                    if (
+                        self._active_account_id is None
+                        and is_first
+                        and cooldown <= 0
+                    ):
+                        self._queue.pop(0)
+                        self._active_account_id = account_id
+                        acquired = True
+                        if logger:
+                            logger.info(
+                                "多账号自动任务获得执行权：账号%s开始本轮；"
+                                "同一时间只运行一个账号",
+                                account_name,
+                            )
+                        break
+
+                    if logger and not announced_wait:
+                        logger.info(
+                            "多账号自动任务排队：账号%s等待前序账号完成，"
+                            "账号之间至少间隔%s秒",
+                            account_name,
+                            int(self.gap_seconds),
+                        )
+                        announced_wait = True
+
+                    wait_seconds = 0.5
+                    if cooldown > 0:
+                        wait_seconds = min(wait_seconds, cooldown)
+                    self._condition.wait(timeout=max(0.01, wait_seconds))
+
+                if not acquired:
+                    self._queue = [
+                        item for item in self._queue
+                        if item != (ticket, account_id)
+                    ]
+                    self._condition.notify_all()
+
+            yield acquired
+        finally:
+            if acquired:
+                with self._condition:
+                    if self._active_account_id == account_id:
+                        self._active_account_id = None
+                        self._last_account_id = account_id
+                        self._next_allowed_at = (
+                            time.monotonic() + self.gap_seconds
+                        )
+                        self._condition.notify_all()
+                if logger:
+                    logger.info(
+                        "账号%s本轮自动任务结束；下一个账号最早%s秒后开始",
+                        account_name,
+                        int(self.gap_seconds),
+                    )
+
+
 class AccountManager:
-    def __init__(self, root_dir: str, bot_factory: Callable[[dict], object]):
+    def __init__(
+        self,
+        root_dir: str,
+        bot_factory: Callable[[dict], object],
+        automatic_round_gap_seconds: float = 600.0,
+    ):
         self.root_dir = os.path.abspath(root_dir)
         self.accounts_dir = os.path.join(self.root_dir, "accounts")
         self.manifest_file = os.path.join(self.root_dir, "accounts.json")
         self.bot_factory = bot_factory
+        self.automatic_round_coordinator = AutomaticRoundCoordinator(
+            automatic_round_gap_seconds
+        )
         self._lock = threading.RLock()
         self._bots = {}
         os.makedirs(self.accounts_dir, exist_ok=True)
@@ -299,6 +421,28 @@ class AccountManager:
                 )
                 account["data_dir"] = self.account_dir(account_id)
                 bot = self.bot_factory(account)
+                set_context = getattr(
+                    bot,
+                    "set_automatic_round_context",
+                    None,
+                )
+                if callable(set_context):
+                    def automatic_round_context(
+                        stop_event,
+                        logger,
+                        should_continue=None,
+                        aid=account_id,
+                        name=account.get("name", account_id),
+                    ):
+                        return self.automatic_round_coordinator.turn(
+                            aid,
+                            name,
+                            stop_event,
+                            logger,
+                            should_continue,
+                        )
+
+                    set_context(automatic_round_context)
                 self._bots[account_id] = bot
             return bot
 

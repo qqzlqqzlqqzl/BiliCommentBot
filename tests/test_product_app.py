@@ -112,6 +112,7 @@ class ProductAppTests(unittest.TestCase):
         self.assertIn('id="cfg-reply-auto_send_enabled"', template)
         self.assertIn("历史草稿和手动生成的草稿不会自动发送", template)
         self.assertIn("页面停留在账号 A 时", template)
+        self.assertIn("至少等待 10 分钟", template)
         self.assertNotIn('id="cfg-bilibili-uid"', template)
         self.assertIn("review_time_range: reviewTimeRange", template)
         self.assertIn("function reviewDraftsUrl()", template)
