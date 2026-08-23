@@ -239,6 +239,34 @@ def validate_config_update(data: dict):
             raise ValueError(f"{label}不能小于 {minimum}")
 
 
+def account_has_bilibili_login(
+    manager: AccountManager,
+    account_id: str,
+    cfg: dict,
+) -> bool:
+    """与机器人初始化路径一致：配置 Cookie 或账号 Cookie 文件任一有效即可。"""
+    configured_cookie = str(
+        cfg.get("bilibili", {}).get("cookie") or ""
+    ).strip()
+    if configured_cookie:
+        return True
+
+    cookie_file = os.path.join(
+        manager.account_dir(account_id),
+        "bilibili_cookie.json",
+    )
+    try:
+        with open(cookie_file, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return False
+    cookies = saved.get("cookie") if isinstance(saved, dict) else None
+    return bool(
+        isinstance(cookies, dict)
+        and any(str(value or "").strip() for value in cookies.values())
+    )
+
+
 def restore_product_account_monitors(manager: AccountManager = None) -> dict:
     """恢复所有账号自己的后台监控，不依赖前端当前选中账号。"""
     manager = manager or get_account_manager()
@@ -261,13 +289,17 @@ def restore_product_account_monitors(manager: AccountManager = None) -> dict:
                     "reason": "monitor_disabled",
                 })
                 continue
-            cookie = str(cfg.get("bilibili", {}).get("cookie") or "").strip()
+            has_bilibili_login = account_has_bilibili_login(
+                manager,
+                account_id,
+                cfg,
+            )
             api_key = str(
                 environment_api_key or cfg.get("ark", {}).get("api_key") or ""
             ).strip()
-            if not cookie or not api_key:
+            if not has_bilibili_login or not api_key:
                 missing = []
-                if not cookie:
+                if not has_bilibili_login:
                     missing.append("B站登录")
                 if not api_key:
                     missing.append("豆包 API Key")

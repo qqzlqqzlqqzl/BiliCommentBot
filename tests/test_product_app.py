@@ -107,6 +107,7 @@ class ProductAppTests(unittest.TestCase):
             'id="cfg-rate_limit-min_request_interval" value="10"',
             template,
         )
+        self.assertIn('id="cfg-reply-reply_delay" value="10"', template)
         self.assertIn('id="cfg-rate_limit-retry_delay" value="20"', template)
         self.assertIn('id="cfg-reply-auto_send_enabled"', template)
         self.assertIn("历史草稿和手动生成的草稿不会自动发送", template)

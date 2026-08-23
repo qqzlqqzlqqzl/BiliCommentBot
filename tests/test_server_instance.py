@@ -1,4 +1,6 @@
+import json
 import os
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
@@ -142,6 +144,42 @@ class ServerInstanceTests(unittest.TestCase):
         self.assertEqual(result["started"], ["healthy"])
         self.assertEqual(result["failed"][0]["account_id"], "broken")
         healthy_bot.start.assert_called_once_with()
+
+    def test_product_restore_accepts_account_cookie_file(self):
+        with tempfile.TemporaryDirectory() as account_dir:
+            cookie_file = os.path.join(account_dir, "bilibili_cookie.json")
+            with open(cookie_file, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"cookie": {"SESSDATA": "saved-session"}},
+                    f,
+                )
+
+            bot = Mock(
+                reload_config=Mock(return_value=True),
+                start=Mock(return_value=True),
+            )
+            manager = Mock()
+            manager.list_accounts.return_value = [
+                {"id": "legacy", "name": "旧账号"},
+            ]
+            manager.account_dir.return_value = account_dir
+            manager.get_bot.return_value = bot
+            config = {
+                "bilibili": {
+                    "auto_start_monitor": True,
+                    "cookie": "",
+                },
+                "ark": {"api_key": "ark"},
+            }
+
+            with (
+                patch.object(server, "load_config", return_value=config),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                result = server.restore_product_account_monitors(manager)
+
+        self.assertEqual(result["started"], ["legacy"])
+        bot.start.assert_called_once_with()
 
 
 if __name__ == "__main__":

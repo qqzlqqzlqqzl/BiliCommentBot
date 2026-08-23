@@ -13,10 +13,11 @@ import urllib.parse
 import re
 import random
 import copy
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import Callable, List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
 import requests
@@ -349,6 +350,10 @@ class ReviewOperationBusyError(RuntimeError):
     """同一实例已有同类审核操作正在执行。"""
 
 
+class AutoSendBlockedError(RuntimeError):
+    """自动发送在原子门禁处被停止状态或最新配置阻止。"""
+
+
 @dataclass
 class ReplyAttemptResult:
     ok: bool
@@ -418,6 +423,7 @@ class BiliCommentBot:
             "regenerating": 0,
             "sending": 0,
         }
+        self._auto_send_rounds = {}
         self._pending_config: Optional[dict] = None
 
         self.session = requests.Session()
@@ -526,6 +532,12 @@ class BiliCommentBot:
         """兼容测试中绕过 __init__ 构造的实例。"""
         if not hasattr(self, "_review_operation_lock"):
             self._review_operation_lock = threading.RLock()
+        if not hasattr(self, "_running"):
+            self._running = False
+        if not hasattr(self, "_stop_event"):
+            self._stop_event = threading.Event()
+        if not hasattr(self, "_thread"):
+            self._thread = None
         if not hasattr(self, "_review_generation_gate"):
             self._review_generation_gate = threading.Lock()
         if not hasattr(self, "_review_send_gate"):
@@ -538,6 +550,8 @@ class BiliCommentBot:
                 "regenerating": 0,
                 "sending": 0,
             }
+        if not hasattr(self, "_auto_send_rounds"):
+            self._auto_send_rounds = {}
         if not hasattr(self, "_pending_config"):
             self._pending_config = None
 
@@ -588,6 +602,7 @@ class BiliCommentBot:
         name: str,
         gate: threading.Lock = None,
         exclusive_gate: threading.Lock = None,
+        start_guard: Callable[[dict], None] = None,
     ):
         self._ensure_review_operation_state()
         if gate is not None and not gate.acquire(blocking=False):
@@ -600,11 +615,20 @@ class BiliCommentBot:
                 "当前账号已有扫描或发送任务正在执行，请等待当前任务完成"
             )
 
-        with self._review_operation_lock:
-            self._active_review_operations[name] = (
-                self._active_review_operations.get(name, 0) + 1
-            )
-            config_snapshot = copy.deepcopy(self.config)
+        try:
+            with self._review_operation_lock:
+                if start_guard is not None:
+                    start_guard(self.config)
+                self._active_review_operations[name] = (
+                    self._active_review_operations.get(name, 0) + 1
+                )
+                config_snapshot = copy.deepcopy(self.config)
+        except Exception:
+            if exclusive_gate is not None:
+                exclusive_gate.release()
+            if gate is not None:
+                gate.release()
+            raise
 
         try:
             yield config_snapshot
@@ -644,23 +668,29 @@ class BiliCommentBot:
         return self._running
 
     def start(self):
-        if self._running:
-            return False
-        self._running = True
-        self._stop_event.clear()
-        self.stats["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            if self._running:
+                return False
+            self._running = True
+            self._stop_event.clear()
+            self.stats["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            self._thread.start()
         self.logger.info("机器人已启动")
         self._emit("bot_status", {"running": True})
         return True
 
     def stop(self):
-        if not self._running:
-            return False
-        self._running = False
-        self._stop_event.set()
-        operation_status = self.get_review_operation_status()
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            if not self._running:
+                return False
+            self._running = False
+            self._stop_event.set()
+            operation_status = {
+                "active": dict(self._active_review_operations),
+            }
         active = [
             {
                 "generating": "生成",
@@ -680,17 +710,43 @@ class BiliCommentBot:
         self._emit("bot_status", {"running": False})
         # 刷出历史记录和 Cookie
         self._flush_history()
-        if self.cookie_manager:
+        cookie_manager = getattr(self, "cookie_manager", None)
+        if cookie_manager:
             try:
-                self.cookie_manager.save_to_file(self.cookie_file)
+                cookie_manager.save_to_file(self.cookie_file)
             except Exception:
                 pass
         return True
 
-    def prepare_shutdown(self):
-        """服务退出前落盘；无法确认的在途发送绝不自动重发。"""
-        self._running = False
-        self._stop_event.set()
+    def prepare_shutdown(self, wait_timeout: float = 20.0):
+        """服务退出前给当前请求有限收尾时间，无法确认的发送绝不自动重发。"""
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            self._running = False
+            self._stop_event.set()
+            worker = self._thread
+
+        deadline = time.monotonic() + max(0.0, float(wait_timeout))
+        if (
+            worker is not None
+            and worker is not threading.current_thread()
+            and worker.is_alive()
+        ):
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        while time.monotonic() < deadline:
+            with self._review_operation_lock:
+                if not any(self._active_review_operations.values()):
+                    break
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+        with self._review_operation_lock:
+            idle = not any(self._active_review_operations.values())
+        if not idle:
+            self.logger.warning(
+                "退出等待已到上限，仍在执行的请求将按结果未知处理"
+            )
+
         changed = False
         with self._review_lock:
             for draft in self._review_drafts.values():
@@ -702,6 +758,14 @@ class BiliCommentBot:
                         "请先到创作中心核对，系统不会自动重发"
                     )
                     changed = True
+                elif (
+                    draft.get("status") == "approved"
+                    and draft.get("approval_source") == "auto"
+                ):
+                    draft["approved"] = False
+                    draft["status"] = "pending"
+                    draft["error"] = "程序退出，尚未开始发送的自动候选已恢复待审核"
+                    changed = True
                 elif draft.get("status") == "regenerating":
                     draft["approved"] = False
                     draft["status"] = (
@@ -712,11 +776,13 @@ class BiliCommentBot:
             if changed:
                 self._save_review_drafts()
         self._flush_history()
-        if self.cookie_manager:
+        cookie_manager = getattr(self, "cookie_manager", None)
+        if cookie_manager:
             try:
-                self.cookie_manager.save_to_file(self.cookie_file)
+                cookie_manager.save_to_file(self.cookie_file)
             except Exception:
                 pass
+        return idle
 
     def _run_loop(self):
         while self._running:
@@ -2456,10 +2522,6 @@ class BiliCommentBot:
                 config_snapshot=task_config,
                 include_generated_ids=include_generated_ids,
             )
-            if include_generated_ids:
-                result["auto_send_enabled"] = bool(
-                    task_config.get("reply", {}).get("auto_send_enabled", False)
-                )
             return result
 
     def _generate_review_drafts(
@@ -2468,10 +2530,17 @@ class BiliCommentBot:
         config_snapshot: dict = None,
         include_generated_ids: bool = False,
     ) -> dict:
+        generation_id = uuid.uuid4().hex if include_generated_ids else ""
         if not items:
             result = {"generated": 0, "replyable": 0, "skipped": 0}
             if include_generated_ids:
-                result.update({"generated_ids": [], "replyable_ids": []})
+                with self._review_operation_lock:
+                    self._auto_send_rounds.clear()
+                result.update({
+                    "generation_id": generation_id,
+                    "generated_ids": [],
+                    "replyable_ids": [],
+                })
             return result
 
         task_config = copy.deepcopy(config_snapshot or self.config)
@@ -2580,6 +2649,8 @@ class BiliCommentBot:
                     "status": "pending" if should_reply else "skipped",
                     "created_at": now_text,
                 }
+                if include_generated_ids:
+                    draft["auto_generation_id"] = generation_id
                 self._review_drafts[str(comment.comment_id)] = draft
                 generated_ids.append(str(comment.comment_id))
                 generated += 1
@@ -2589,6 +2660,12 @@ class BiliCommentBot:
                 else:
                     skipped += 1
             self._save_review_drafts()
+
+        if include_generated_ids:
+            with self._review_operation_lock:
+                self._auto_send_rounds.clear()
+                if replyable_ids:
+                    self._auto_send_rounds[generation_id] = set(replyable_ids)
 
         self.logger.info(
             "豆包生成完成：新增%s条草稿，可回复%s条，建议跳过%s条",
@@ -2604,6 +2681,7 @@ class BiliCommentBot:
         result = {"generated": generated, "replyable": replyable, "skipped": skipped}
         if include_generated_ids:
             result.update({
+                "generation_id": generation_id,
                 "generated_ids": generated_ids,
                 "replyable_ids": replyable_ids,
             })
@@ -2614,18 +2692,58 @@ class BiliCommentBot:
         comment_ids: List[str] = None,
         since_timestamp: int = None,
         auto_approve: bool = False,
+        auto_generation_id: str = None,
     ) -> dict:
         self._ensure_review_operation_state()
+        requested = None if comment_ids is None else {
+            str(value) for value in comment_ids
+        }
+        if auto_approve and requested is None:
+            raise ValueError("自动发送必须明确指定本轮新生成的 comment_id")
+        if auto_approve and not str(auto_generation_id or "").strip():
+            raise ValueError("自动发送必须携带本轮生成令牌")
+
+        def guard_auto_send(current_config: dict):
+            if not auto_approve:
+                return
+            reply_config = current_config.get("reply", {})
+            if (
+                not self._running
+                or not reply_config.get("enabled", True)
+                or not reply_config.get("auto_send_enabled", False)
+            ):
+                raise AutoSendBlockedError(
+                    "定时处理已停止或自动回复已关闭，本轮候选保留待审核"
+                )
+            generation_id = str(auto_generation_id)
+            allowed_ids = self._auto_send_rounds.get(generation_id)
+            if allowed_ids is None or requested != allowed_ids:
+                raise ValueError(
+                    "自动发送的评论 ID 与本轮豆包生成结果不一致"
+                )
+            with self._review_lock:
+                tagged_ids = {
+                    comment_id
+                    for comment_id in requested
+                    if (
+                        self._review_drafts.get(comment_id, {}).get(
+                            "auto_generation_id"
+                        )
+                        == generation_id
+                    )
+                }
+            if tagged_ids != requested:
+                raise ValueError(
+                    "自动发送的草稿不属于本轮豆包生成结果"
+                )
+            self._auto_send_rounds.pop(generation_id, None)
+
         with self._review_operation(
             "sending",
             gate=self._review_send_gate,
             exclusive_gate=self._review_bilibili_gate,
+            start_guard=guard_auto_send,
         ) as task_config:
-            requested = None if comment_ids is None else {
-                str(value) for value in comment_ids
-            }
-            if auto_approve and requested is None:
-                raise ValueError("自动发送必须明确指定本轮新生成的 comment_id")
             with self._review_lock:
                 auto_approved = 0
                 if auto_approve:
@@ -2637,6 +2755,8 @@ class BiliCommentBot:
                             or draft.get("status") != "pending"
                             or not draft.get("should_reply")
                             or not str(draft.get("reply") or "").strip()
+                            or draft.get("auto_generation_id")
+                            != str(auto_generation_id)
                         ):
                             continue
                         draft["approved"] = True
@@ -2686,6 +2806,33 @@ class BiliCommentBot:
             total = len(draft_ids)
             self.logger.info("开始串行发送：共%s条已批准回复", total)
             for index, comment_id in enumerate(draft_ids, start=1):
+                if auto_approve:
+                    with self._review_operation_lock:
+                        auto_send_still_running = self._running
+                    if not auto_send_still_running:
+                        remaining_ids = draft_ids[index - 1:]
+                        with self._review_lock:
+                            reverted = 0
+                            for remaining_id in remaining_ids:
+                                remaining = self._review_drafts.get(remaining_id)
+                                if (
+                                    remaining
+                                    and remaining.get("status") == "approved"
+                                    and remaining.get("approval_source") == "auto"
+                                ):
+                                    remaining["approved"] = False
+                                    remaining["status"] = "pending"
+                                    remaining["error"] = (
+                                        "定时处理已停止，尚未开始发送，已恢复待审核"
+                                    )
+                                    reverted += 1
+                            if reverted:
+                                self._save_review_drafts()
+                        self.logger.info(
+                            "定时处理已停止，剩余%s条自动候选恢复待审核",
+                            reverted,
+                        )
+                        break
                 with self._review_lock:
                     current = self._review_drafts.get(comment_id)
                     if (
@@ -2815,6 +2962,7 @@ class BiliCommentBot:
 
     def process_comments(self):
         """后台轮询生成草稿；自动模式只发送本轮新生成的可回复候选。"""
+        self._ensure_review_operation_state()
         if not self.config["reply"].get("enabled", True):
             return
         try:
@@ -2828,25 +2976,34 @@ class BiliCommentBot:
             result["replyable"],
             result["skipped"],
         )
-        if not result.get("auto_send_enabled"):
+        with self._review_operation_lock:
+            auto_send_enabled = bool(
+                self._running
+                and self.config.get("reply", {}).get("enabled", True)
+                and self.config.get("reply", {}).get(
+                    "auto_send_enabled",
+                    False,
+                )
+            )
+        if not auto_send_enabled:
             return
         replyable_ids = [
             str(comment_id) for comment_id in result.get("replyable_ids", [])
         ]
         if not replyable_ids:
-            self.logger.info("自动回复已开启，本轮没有豆包判断为可回复的新评论")
-            return
-        if not getattr(self, "_running", True):
             self.logger.info(
-                "定时监控已停止，本轮%s条新候选保留待审核，不再开始自动发送",
-                len(replyable_ids),
+                "自动回复已开启，本轮没有豆包判断为可回复的新评论"
             )
             return
         try:
             send_result = self.send_approved_drafts(
                 comment_ids=replyable_ids,
                 auto_approve=True,
+                auto_generation_id=result.get("generation_id"),
             )
+        except AutoSendBlockedError as exc:
+            self.logger.info("%s：%s条新候选未发送", exc, len(replyable_ids))
+            return
         except ReviewOperationBusyError:
             self.logger.info(
                 "当前账号已有发送任务，本轮%s条新候选保留待审核",
