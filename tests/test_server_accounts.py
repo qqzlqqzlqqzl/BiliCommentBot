@@ -1,0 +1,438 @@
+import os
+import tempfile
+import unittest
+import json
+from io import BytesIO
+from unittest.mock import patch
+
+import server
+
+
+class ServerAccountApiTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.env_patch = patch.dict(
+            os.environ,
+            {
+                "BILI_PRODUCT_DATA_DIR": self.temp_dir.name,
+                "BILI_AUTO_START_MONITOR": "0",
+            },
+            clear=False,
+        )
+        self.env_patch.start()
+        server._account_manager = None
+        server._account_log_handlers.clear()
+        self.client = server.app.test_client()
+
+    def tearDown(self):
+        if server._account_manager is not None:
+            server._account_manager.shutdown_all()
+        server._account_manager = None
+        server._account_log_handlers.clear()
+        self.env_patch.stop()
+        self.temp_dir.cleanup()
+
+    def test_creates_and_selects_accounts_through_api(self):
+        initial = self.client.get("/api/accounts").get_json()
+        first_id = initial["current_account_id"]
+
+        created = self.client.post(
+            "/api/accounts",
+            json={"name": "第二个账号"},
+        )
+        second_id = created.get_json()["account"]["id"]
+
+        self.assertEqual(created.status_code, 200)
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(
+            self.client.get("/api/accounts").get_json()["current_account_id"],
+            second_id,
+        )
+
+        selected = self.client.post(
+            "/api/accounts/select",
+            json={"account_id": first_id},
+        )
+        self.assertEqual(selected.status_code, 200)
+        self.assertEqual(
+            self.client.get("/api/accounts").get_json()["current_account_id"],
+            first_id,
+        )
+
+    def test_creates_pending_login_account_without_manual_name(self):
+        response = self.client.post("/api/accounts", json={})
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["account"]["name"], "待登录账号")
+        self.assertEqual(
+            self.client.get("/api/accounts").get_json()["current_account_id"],
+            payload["account"]["id"],
+        )
+
+    def test_imports_legacy_account_through_api(self):
+        with tempfile.TemporaryDirectory() as source_dir:
+            with open(
+                os.path.join(source_dir, "config.toml"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                f.write('[bilibili]\nuid = "legacy-uid"\n')
+
+            response = self.client.post(
+                "/api/accounts/import",
+                json={"name": "旧账号", "source_dir": source_dir},
+            )
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["account"]["name"], "旧账号")
+        self.assertEqual(
+            server.load_config()["bilibili"]["uid"],
+            "legacy-uid",
+        )
+
+    def test_exports_and_reimports_current_account_bundle(self):
+        account_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+        account_dir = server.get_account_manager().account_dir(account_id)
+        with open(os.path.join(account_dir, "config.toml"), "w", encoding="utf-8") as f:
+            f.write('[bilibili]\nuid = "portable-uid"\n')
+        with open(os.path.join(account_dir, "history.json"), "w", encoding="utf-8") as f:
+            json.dump([{"comment_id": "portable-comment"}], f)
+
+        exported = self.client.get("/api/accounts/export")
+        imported = self.client.post(
+            "/api/accounts/import-bundle",
+            data={"file": (BytesIO(exported.data), "account.zip")},
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(exported.status_code, 200)
+        self.assertEqual(exported.mimetype, "application/zip")
+        self.assertIn("attachment", exported.headers["Content-Disposition"])
+        self.assertEqual(imported.status_code, 200)
+        payload = imported.get_json()
+        self.assertEqual(payload["account"]["mode"], "merged")
+        self.assertEqual(payload["account"]["history_total"], 1)
+        self.assertIn(
+            "portable-comment",
+            server.get_bot().processed_comments,
+        )
+
+    def test_account_configs_are_isolated(self):
+        first_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+        first_save = self.client.post(
+            "/api/config",
+            json={"bilibili": {"uid": "111"}},
+        )
+        second_id = self.client.post(
+            "/api/accounts",
+            json={"name": "第二个账号"},
+        ).get_json()["account"]["id"]
+
+        second_before = self.client.get("/api/config").get_json()["config"]
+        second_save = self.client.post(
+            "/api/config",
+            json={"bilibili": {"uid": "222"}},
+        )
+        self.client.post(
+            "/api/accounts/select",
+            json={"account_id": first_id},
+        )
+        first_after = self.client.get("/api/config").get_json()["config"]
+
+        self.assertEqual(first_save.status_code, 200)
+        self.assertEqual(second_save.status_code, 200)
+        self.assertEqual(second_before["bilibili"]["uid"], "")
+        self.assertEqual(first_after["bilibili"]["uid"], "111")
+        self.assertNotEqual(first_id, second_id)
+
+    def test_auto_reply_setting_is_isolated_per_account(self):
+        first_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+        first_save = self.client.post(
+            "/api/config",
+            json={"reply": {"auto_send_enabled": True}},
+        )
+        second_id = self.client.post(
+            "/api/accounts",
+            json={"name": "第二个账号"},
+        ).get_json()["account"]["id"]
+
+        second_config = self.client.get("/api/config").get_json()["config"]
+        self.client.post(
+            "/api/accounts/select",
+            json={"account_id": first_id},
+        )
+        first_config = self.client.get("/api/config").get_json()["config"]
+
+        self.assertEqual(first_save.status_code, 200)
+        self.assertFalse(second_config["reply"]["auto_send_enabled"])
+        self.assertTrue(first_config["reply"]["auto_send_enabled"])
+        self.assertNotEqual(first_id, second_id)
+
+    def test_config_rejects_string_auto_send_boolean(self):
+        response = self.client.post(
+            "/api/config",
+            json={"reply": {"auto_send_enabled": "false"}},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("布尔值", response.get_json()["message"])
+
+    def test_review_preferences_are_persisted_per_account(self):
+        first_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+        first_save = self.client.post(
+            "/api/review/preferences",
+            json={
+                "limit": 100,
+                "review_time_range": "24h",
+                "review_since": "",
+                "stop_after_empty_pages": False,
+            },
+        )
+        second_id = self.client.post(
+            "/api/accounts",
+            json={"name": "第二个账号"},
+        ).get_json()["account"]["id"]
+        second_save = self.client.post(
+            "/api/review/preferences",
+            json={
+                "limit": 200,
+                "review_time_range": "7d",
+                "review_since": "",
+                "stop_after_empty_pages": True,
+            },
+        )
+
+        first = server.load_config(first_id)["reply"]
+        second = server.load_config(second_id)["reply"]
+
+        self.assertEqual(first_save.status_code, 200)
+        self.assertEqual(second_save.status_code, 200)
+        self.assertEqual(
+            (
+                first["max_process"],
+                first["review_time_range"],
+                first["stop_after_empty_pages"],
+            ),
+            (100, "24h", False),
+        )
+        self.assertEqual(
+            (
+                second["max_process"],
+                second["review_time_range"],
+                second["stop_after_empty_pages"],
+            ),
+            (200, "7d", True),
+        )
+
+    def test_unknown_account_cannot_be_selected(self):
+        response = self.client.post(
+            "/api/accounts/select",
+            json={"account_id": "missing"},
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_realtime_logs_have_single_prefix_and_can_be_cleared(self):
+        account_id = self.client.get("/api/accounts").get_json()[
+            "current_account_id"
+        ]
+        bot = server.get_bot(account_id)
+        handler = server._account_log_handlers[account_id]
+
+        bot.logger.info("一条测试日志")
+
+        self.assertEqual(handler.log_buffer[-1]["msg"], "一条测试日志")
+        response = self.client.post("/api/logs/clear")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        self.assertEqual(handler.log_buffer, [])
+
+    def test_qr_cookie_is_saved_only_to_target_account(self):
+        first_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+        second_id = self.client.post(
+            "/api/accounts",
+            json={"name": "第二个账号"},
+        ).get_json()["account"]["id"]
+
+        server._persist_qr_cookie(
+            second_id,
+            "SESSDATA=second; bili_jct=csrf-second",
+        )
+
+        self.assertEqual(
+            server.load_config(first_id)["bilibili"]["cookie"],
+            "",
+        )
+        self.assertEqual(
+            server.load_config(second_id)["bilibili"]["cookie"],
+            "SESSDATA=second; bili_jct=csrf-second",
+        )
+
+    def test_detected_identity_updates_uid_and_account_name(self):
+        account_id = self.client.get("/api/accounts").get_json()["current_account_id"]
+
+        server._save_identity(
+            "3546589337487797",
+            "喵酱第一",
+            account_id,
+        )
+
+        self.assertEqual(
+            server.load_config(account_id)["bilibili"]["uid"],
+            "3546589337487797",
+        )
+        account = next(
+            item
+            for item in self.client.get("/api/accounts").get_json()["accounts"]
+            if item["id"] == account_id
+        )
+        self.assertEqual(account["name"], "喵酱第一")
+
+    def test_qr_login_pipeline_saves_cookie_uid_and_detected_name(self):
+        account = self.client.post("/api/accounts", json={}).get_json()["account"]
+        emitted = []
+
+        class FakeResponse:
+            @staticmethod
+            def json():
+                return {
+                    "data": {
+                        "code": 0,
+                        "url": "https://passport.bilibili.com/?bili_jct=csrf-token",
+                    }
+                }
+
+        class FakeSession:
+            cookies = {"SESSDATA": "session-token"}
+
+            @staticmethod
+            def get(*args, **kwargs):
+                return FakeResponse()
+
+        class FakeBot:
+            @staticmethod
+            def verify_login():
+                server._save_identity(
+                    "3546589337487797",
+                    "扫码识别昵称",
+                    account["id"],
+                )
+                return {"valid": True, "user_info": {"mid": "3546589337487797"}}
+
+        with (
+            patch.object(server, "get_bot", return_value=FakeBot()),
+            patch.object(
+                server,
+                "_emit_qr",
+                side_effect=lambda event, account_id, payload: emitted.append(
+                    (event, account_id, payload)
+                ),
+            ),
+        ):
+            server._poll_qr_login(account["id"], "qr-key", FakeSession())
+
+        config = server.load_config(account["id"])
+        saved_account = next(
+            item
+            for item in self.client.get("/api/accounts").get_json()["accounts"]
+            if item["id"] == account["id"]
+        )
+        self.assertIn("SESSDATA=session-token", config["bilibili"]["cookie"])
+        self.assertIn("bili_jct=csrf-token", config["bilibili"]["cookie"])
+        self.assertEqual(config["bilibili"]["uid"], "3546589337487797")
+        self.assertEqual(saved_account["name"], "扫码识别昵称")
+        self.assertEqual(emitted[-1][0], "qr_cookie")
+        self.assertEqual(emitted[-1][1], account["id"])
+
+    def test_config_get_does_not_return_saved_secrets(self):
+        self.client.post(
+            "/api/config",
+            json={
+                "bilibili": {
+                    "cookie": "SESSDATA=secret",
+                    "refresh_token": "refresh-secret",
+                },
+                "ark": {"api_key": "ark-secret"},
+                "auth": {"password": "password-hash"},
+            },
+        )
+
+        payload = self.client.get("/api/config").get_json()
+
+        self.assertNotIn("cookie", payload["config"]["bilibili"])
+        self.assertNotIn("refresh_token", payload["config"]["bilibili"])
+        self.assertNotIn("api_key", payload["config"]["ark"])
+        self.assertNotIn("password", payload["config"]["auth"])
+        self.assertTrue(payload["capabilities"]["bilibili_cookie_configured"])
+        self.assertTrue(payload["capabilities"]["ark_api_key_configured"])
+
+    def test_blank_secret_fields_preserve_existing_values(self):
+        self.client.post(
+            "/api/config",
+            json={
+                "bilibili": {
+                    "cookie": "SESSDATA=secret",
+                    "refresh_token": "refresh-secret",
+                },
+                "ark": {"api_key": "ark-secret"},
+            },
+        )
+
+        self.client.post(
+            "/api/config",
+            json={
+                "bilibili": {"cookie": "", "refresh_token": "", "uid": "123"},
+                "ark": {"api_key": "", "model": "model-test"},
+            },
+        )
+        stored = server.load_config()
+
+        self.assertEqual(stored["bilibili"]["cookie"], "SESSDATA=secret")
+        self.assertEqual(stored["bilibili"]["refresh_token"], "refresh-secret")
+        self.assertEqual(stored["ark"]["api_key"], "ark-secret")
+        self.assertEqual(stored["bilibili"]["uid"], "123")
+
+    def test_saved_secrets_require_explicit_clear_action(self):
+        self.client.post(
+            "/api/config",
+            json={
+                "bilibili": {
+                    "cookie": "SESSDATA=secret",
+                    "refresh_token": "refresh-secret",
+                },
+                "ark": {"api_key": "ark-secret"},
+            },
+        )
+
+        login_result = self.client.post(
+            "/api/config/secrets/clear",
+            json={"secret": "bilibili_login"},
+        )
+        ark_result = self.client.post(
+            "/api/config/secrets/clear",
+            json={"secret": "ark_api_key"},
+        )
+        stored = server.load_config()
+
+        self.assertEqual(login_result.status_code, 200)
+        self.assertEqual(ark_result.status_code, 200)
+        self.assertEqual(stored["bilibili"]["cookie"], "")
+        self.assertEqual(stored["bilibili"]["refresh_token"], "")
+        self.assertEqual(stored["ark"]["api_key"], "")
+
+    def test_rendered_product_page_uses_debug_cap_without_removing_full_options(self):
+        with patch.dict(
+            os.environ,
+            {"BILI_REVIEW_HARD_LIMIT": "110"},
+            clear=False,
+        ):
+            html = self.client.get("/").get_data(as_text=True)
+
+        self.assertIn("const REVIEW_HARD_LIMIT = Number(110)", html)
+        self.assertIn('<option value="50000">', html)
+
+
+if __name__ == "__main__":
+    unittest.main()

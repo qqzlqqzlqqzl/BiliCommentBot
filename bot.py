@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-B站评论自动回复机器人 — 机器人核心逻辑
+B站评论人工审核回复工具 — 机器人核心逻辑
 """
 import os
 import time
@@ -13,8 +13,11 @@ import urllib.parse
 import re
 import random
 import copy
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
+from typing import Callable, List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
 import requests
@@ -29,6 +32,46 @@ CONFIG_FILE = os.path.join(DATA_DIR, "config.toml") if DATA_DIR else "config.tom
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json") if DATA_DIR else "history.json"
 COOKIE_FILE = os.path.join(DATA_DIR, "bilibili_cookie.json") if DATA_DIR else "bilibili_cookie.json"
 VIDEO_CACHE_FILE = os.path.join(DATA_DIR, "video_cache.json") if DATA_DIR else "video_cache.json"
+REVIEW_DRAFTS_FILE = os.path.join(DATA_DIR, "review_drafts.json") if DATA_DIR else "review_drafts.json"
+
+REVIEW_READ_DEFAULT = 500
+REVIEW_READ_MAX = 50000
+CREATOR_EMPTY_PAGE_STOP = 3
+PERMANENT_REPLY_FAILURE_MARKERS = (
+    "当前页面评论功能已关闭",
+    "评论功能已关闭",
+    "评论区已关闭",
+    "稿件已删除",
+    "稿件不存在",
+    "视频已失效",
+    "评论已被删除",
+    "评论不存在",
+)
+REVIEW_TIME_RANGE_SECONDS = {
+    "24h": 24 * 60 * 60,
+    "3d": 3 * 24 * 60 * 60,
+    "7d": 7 * 24 * 60 * 60,
+}
+
+
+def get_review_read_max() -> int:
+    """产品默认保留完整范围；调试时可用环境变量临时收紧。"""
+    raw_value = os.environ.get("BILI_REVIEW_HARD_LIMIT", str(REVIEW_READ_MAX))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = REVIEW_READ_MAX
+    return max(1, min(value, REVIEW_READ_MAX))
+
+
+def normalize_review_read_limit(value, default: int = REVIEW_READ_DEFAULT) -> int:
+    """把审核读取数量限制在低成本、安全范围内。"""
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        limit = default
+    return max(1, min(limit, get_review_read_max()))
+
 
 # ─────────────────────────────────────────────
 #  默认配置
@@ -38,16 +81,17 @@ DEFAULT_CONFIG = {
         "cookie": "",
         "refresh_token": "",
         "uid": "",
-        "check_interval": 60,
+        "check_interval": 3600,
+        "auto_start_monitor": False,
         "auto_refresh_cookie": True,
         "cookie_refresh_interval": 30,
         "max_comment_pages": 10,
         "max_video_pages": 10,
     },
     "rate_limit": {
-        "min_request_interval": 3.0,
+        "min_request_interval": 10.0,
         "max_retries": 3,
-        "retry_delay": 5,
+        "retry_delay": 20,
     },
     "cache": {
         "expire_time": 300,
@@ -57,20 +101,28 @@ DEFAULT_CONFIG = {
         "expire_time": 43200,
         "cache_file": "video_cache.json",
     },
-    "deepseek": {
+    "ark": {
         "api_key": "",
-        "base_url": "https://api.deepseek.com",
-        "model": "deepseek-v4-flash",
-        "max_tokens": 200,
-        "temperature": 0.7,
-        "system_prompt": "你是一个友善的B站UP主，请对评论做出自然、友好的回复。回复要简洁明了，控制在100字以内。",
+        "base_url": "https://ark.cn-beijing.volces.com/api/v3/responses",
+        "model": "doubao-seed-2-1-turbo-260628",
+        "max_tokens": 128000,
+        "reasoning_effort": "medium",
+        "request_interval_seconds": 0.15,
+        "max_concurrency": 16,
+        "max_retries": 5,
+        "retry_base_seconds": 2.0,
+        "system_prompt": "你是B站UP主的评论回复助手。只回复语境清楚、有互动价值、低误判风险的评论；回复要自然、简短、具体，不要客服腔，不要编造事实。默认不要使用“哈哈”“哈哈哈”“笑死”“绷不住”等幼稚或重复的口头禅；只有观众原话明确在开玩笑，而且确实需要接梗时，才可以偶尔使用一次。观众质问或询问回复者是不是AI、机器人或自动回复时，直接判断为不回复并跳过。",
     },
     "reply": {
         "enabled": True,
+        "auto_send_enabled": False,
         "prefix": "",
         "only_new": True,
-        "max_process": 10,
-        "reply_delay": 2,
+        "max_process": 500,
+        "review_since": "",
+        "review_time_range": "",
+        "stop_after_empty_pages": True,
+        "reply_delay": 10,
         "like_enabled": False,
         "context_comments_count": 0,
         "only_bvid": "",
@@ -78,6 +130,7 @@ DEFAULT_CONFIG = {
         "like_user_video_only_followers": False,
         "chained_reply_enabled": True,
         "max_reply_depth": 3,
+        "review_batch_size": 4,
         "keyword_filter": {
             "enabled": False,
             "whitelist": "",
@@ -100,10 +153,6 @@ DEFAULT_CONFIG = {
         "level": "INFO",
         "file": "logs/bot.log",
         "console": True,
-    },
-    "auth": {
-        "enabled": False,
-        "password": "",
     },
 }
 
@@ -289,6 +338,33 @@ class BilibiliCookieManager:
             return False
 
 
+class ArkEmptyOutputError(RuntimeError):
+    """方舟请求成功，但响应中没有可用的 output_text。"""
+
+
+class ArkTransientError(RuntimeError):
+    """方舟限流、服务端错误或网络异常在重试后仍未恢复。"""
+
+
+class ReviewOperationBusyError(RuntimeError):
+    """同一实例已有同类审核操作正在执行。"""
+
+
+class AutoSendBlockedError(RuntimeError):
+    """自动发送在原子门禁处被停止状态或最新配置阻止。"""
+
+
+@dataclass
+class ReplyAttemptResult:
+    ok: bool
+    uncertain: bool = False
+    message: str = ""
+    permanent: bool = False
+
+    def __bool__(self):
+        return self.ok
+
+
 # ─────────────────────────────────────────────
 #  机器人核心
 # ─────────────────────────────────────────────
@@ -299,11 +375,57 @@ class BiliCommentBot:
     _BV_BASE = 58
     _BV_TABLE = "FcwAPNKTMug3GV5Lj7EJnHpWsx4tb8haYeviqBz6rkCy12mUSDQX9RdoZf"
 
-    def __init__(self, config: dict, logger: logging.Logger, socketio=None, on_config_changed=None):
+    def __init__(
+        self,
+        config: dict,
+        logger: logging.Logger,
+        socketio=None,
+        on_config_changed=None,
+        on_identity_changed=None,
+        data_dir: str = None,
+        account_id: str = None,
+    ):
         self.config = config
         self.logger = logger
         self.socketio = socketio  # 可选，用于推送到前端
         self.on_config_changed = on_config_changed  # 配置变更回调，用于持久化
+        self.on_identity_changed = on_identity_changed
+        self._identity_verified = False
+        self._identity_name = ""
+        self.account_id = str(account_id or "")
+        self.data_dir = DATA_DIR if data_dir is None else os.path.abspath(data_dir)
+        if self.data_dir:
+            os.makedirs(self.data_dir, exist_ok=True)
+        self.config_file = (
+            os.path.join(self.data_dir, "config.toml") if self.data_dir else CONFIG_FILE
+        )
+        self.history_file = (
+            os.path.join(self.data_dir, "history.json") if self.data_dir else HISTORY_FILE
+        )
+        self.cookie_file = (
+            os.path.join(self.data_dir, "bilibili_cookie.json")
+            if self.data_dir
+            else COOKIE_FILE
+        )
+        self.review_drafts_file = (
+            os.path.join(self.data_dir, "review_drafts.json")
+            if self.data_dir
+            else REVIEW_DRAFTS_FILE
+        )
+        self._ark_pacer_lock = threading.Lock()
+        self._ark_last_started_at = 0.0
+        self._review_operation_lock = threading.RLock()
+        self._review_generation_gate = threading.Lock()
+        self._review_send_gate = threading.Lock()
+        self._review_bilibili_gate = threading.Lock()
+        self._active_review_operations = {
+            "generating": 0,
+            "regenerating": 0,
+            "sending": 0,
+        }
+        self._auto_send_rounds = {}
+        self._pending_config: Optional[dict] = None
+        self._automatic_round_context_factory = None
 
         self.session = requests.Session()
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=Retry(total=0))
@@ -339,15 +461,18 @@ class BiliCommentBot:
         # 历史 & 缓存
         self.processed_comments: set = set()
         self.load_history()
+        self._review_lock = threading.Lock()
+        self._review_drafts: Dict[str, dict] = {}
+        self.load_review_drafts()
         self.cache: dict = {}
         self.cache_expire_time = self.config.get("cache", {}).get("expire_time", 300)
 
         # 频率控制
         self.last_request_time = 0
         rl = self.config.get("rate_limit", {})
-        self.min_request_interval = rl.get("min_request_interval", 2.0)
+        self.min_request_interval = rl.get("min_request_interval", 10.0)
         self.max_retries = rl.get("max_retries", 3)
-        self.retry_delay = rl.get("retry_delay", 5)
+        self.retry_delay = rl.get("retry_delay", 20)
         self.consecutive_failures = 0
         self.adaptive_interval = self.min_request_interval
 
@@ -356,8 +481,8 @@ class BiliCommentBot:
         self.cached_videos: List[dict] = []
         self.last_video_fetch_time = 0
         cache_file_path = vc.get("cache_file", "video_cache.json")
-        if DATA_DIR and not os.path.isabs(cache_file_path):
-            cache_file_path = os.path.join(DATA_DIR, cache_file_path)
+        if self.data_dir and not os.path.isabs(cache_file_path):
+            cache_file_path = os.path.join(self.data_dir, cache_file_path)
         self.video_cache_file = cache_file_path
         self.video_cache_expire_time = vc.get("expire_time", 43200)
         self.load_video_cache()
@@ -378,33 +503,75 @@ class BiliCommentBot:
         """安全推送事件到前端（SocketIO 可选）"""
         if self.socketio:
             try:
-                self.socketio.emit(event, data)
+                payload = dict(data)
+                if self.account_id:
+                    payload["account_id"] = self.account_id
+                self.socketio.emit(event, payload)
             except Exception:
                 pass
 
     # ── Cookie 初始化 ──
     def _init_cookie(self):
+        self._identity_verified = False
+        self._identity_name = ""
+        self.cookie_manager = None
+        self.csrf_token = ""
+        self.session.cookies.clear()
         cookie_str = self.config["bilibili"].get("cookie", "")
         refresh_token = self.config["bilibili"].get("refresh_token", "")
         if cookie_str:
             self.cookie_manager = BilibiliCookieManager(cookie_str, refresh_token, logger=self.logger)
             self.session.cookies.update(self.cookie_manager.session.cookies)
-        elif os.path.exists(COOKIE_FILE):
+        elif os.path.exists(self.cookie_file):
             self.cookie_manager = BilibiliCookieManager(logger=self.logger)
-            if self.cookie_manager.load_from_file(COOKIE_FILE):
+            if self.cookie_manager.load_from_file(self.cookie_file):
                 self.session.cookies.update(self.cookie_manager.session.cookies)
         if self.cookie_manager:
             self.csrf_token = self.cookie_manager._get_csrf_from_cookie()
 
-    def reload_config(self, config: dict):
-        """热更新配置"""
-        self.config = config
+    def _ensure_review_operation_state(self):
+        """兼容测试中绕过 __init__ 构造的实例。"""
+        if not hasattr(self, "_review_operation_lock"):
+            self._review_operation_lock = threading.RLock()
+        if not hasattr(self, "_running"):
+            self._running = False
+        if not hasattr(self, "_stop_event"):
+            self._stop_event = threading.Event()
+        if not hasattr(self, "_thread"):
+            self._thread = None
+        if not hasattr(self, "_review_generation_gate"):
+            self._review_generation_gate = threading.Lock()
+        if not hasattr(self, "_review_send_gate"):
+            self._review_send_gate = threading.Lock()
+        if not hasattr(self, "_review_bilibili_gate"):
+            self._review_bilibili_gate = threading.Lock()
+        if not hasattr(self, "_active_review_operations"):
+            self._active_review_operations = {
+                "generating": 0,
+                "regenerating": 0,
+                "sending": 0,
+            }
+        if not hasattr(self, "_auto_send_rounds"):
+            self._auto_send_rounds = {}
+        if not hasattr(self, "_pending_config"):
+            self._pending_config = None
+        if not hasattr(self, "_automatic_round_context_factory"):
+            self._automatic_round_context_factory = None
+
+    def set_automatic_round_context(self, context_factory):
+        """注入产品级多账号后台轮次协调器；人工操作不经过这里。"""
+        self._automatic_round_context_factory = context_factory
+
+    def _apply_config(self, config: dict):
+        self.config = copy.deepcopy(config)
+        if not self.config.get("reply", {}).get("auto_send_enabled", False):
+            self._auto_send_rounds.clear()
         self.cookie_refresh_interval = config["bilibili"].get("cookie_refresh_interval", 30) * 60
         self.auto_refresh_cookie = config["bilibili"].get("auto_refresh_cookie", True)
         rl = config.get("rate_limit", {})
-        self.min_request_interval = rl.get("min_request_interval", 2.0)
+        self.min_request_interval = rl.get("min_request_interval", 10.0)
         self.max_retries = rl.get("max_retries", 3)
-        self.retry_delay = rl.get("retry_delay", 5)
+        self.retry_delay = rl.get("retry_delay", 20)
         self.adaptive_interval = self.min_request_interval
         vc = config.get("video_cache", {})
         self.video_cache_expire_time = vc.get("expire_time", 43200)
@@ -414,50 +581,270 @@ class BiliCommentBot:
         # 重新初始化 Cookie
         self._init_cookie()
 
+    def reload_config(self, config: dict) -> bool:
+        """热更新配置；有审核任务时延迟到所有当前任务结束后生效。"""
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            if any(self._active_review_operations.values()):
+                self._pending_config = copy.deepcopy(config)
+                operation_labels = {
+                    "generating": "生成",
+                    "regenerating": "重新生成",
+                    "sending": "发送",
+                }
+                active = "、".join(
+                    operation_labels.get(name, name)
+                    for name, count in self._active_review_operations.items()
+                    if count
+                )
+                self.logger.info(
+                    "配置已保存；当前%s任务继续使用启动时配置，任务结束后自动生效",
+                    active,
+                )
+                return False
+            self._apply_config(config)
+            return True
+
+    @contextmanager
+    def _review_operation(
+        self,
+        name: str,
+        gate: threading.Lock = None,
+        exclusive_gate: threading.Lock = None,
+        start_guard: Callable[[dict], None] = None,
+    ):
+        self._ensure_review_operation_state()
+        if gate is not None and not gate.acquire(blocking=False):
+            label = "生成" if name == "generating" else "发送"
+            raise ReviewOperationBusyError(f"已有{label}任务正在执行，请等待当前任务完成")
+        if exclusive_gate is not None and not exclusive_gate.acquire(blocking=False):
+            if gate is not None:
+                gate.release()
+            raise ReviewOperationBusyError(
+                "当前账号已有扫描或发送任务正在执行，请等待当前任务完成"
+            )
+
+        try:
+            with self._review_operation_lock:
+                if start_guard is not None:
+                    start_guard(self.config)
+                self._active_review_operations[name] = (
+                    self._active_review_operations.get(name, 0) + 1
+                )
+                config_snapshot = copy.deepcopy(self.config)
+        except Exception:
+            if exclusive_gate is not None:
+                exclusive_gate.release()
+            if gate is not None:
+                gate.release()
+            raise
+
+        try:
+            yield config_snapshot
+        finally:
+            pending_config = None
+            try:
+                with self._review_operation_lock:
+                    self._active_review_operations[name] = max(
+                        0,
+                        self._active_review_operations.get(name, 1) - 1,
+                    )
+                    if (
+                        not any(self._active_review_operations.values())
+                        and self._pending_config is not None
+                    ):
+                        pending_config = self._pending_config
+                        self._pending_config = None
+                        self._apply_config(pending_config)
+                if pending_config is not None:
+                    self.logger.info("当前审核任务已结束，刚才保存的新配置现已生效")
+            finally:
+                if exclusive_gate is not None:
+                    exclusive_gate.release()
+                if gate is not None:
+                    gate.release()
+
+    def get_review_operation_status(self) -> dict:
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            return {
+                "active": dict(self._active_review_operations),
+                "config_pending": self._pending_config is not None,
+            }
+
     @property
     def is_running(self) -> bool:
         return self._running
 
     def start(self):
-        if self._running:
-            return False
-        self._running = True
-        self._stop_event.clear()
-        self.stats["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        self.logger.info("机器人已启动")
-        self._emit("bot_status", {"running": True})
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            if self._running:
+                return False
+            if self._thread is not None and self._thread.is_alive():
+                raise ReviewOperationBusyError(
+                    "上一次定时处理仍在收尾，请稍后再启动"
+                )
+            self._running = True
+            self._stop_event.clear()
+            self.stats["start_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._thread = threading.Thread(target=self._run_loop, daemon=True)
+            try:
+                self._thread.start()
+            except Exception:
+                self._running = False
+                self._stop_event.set()
+                self._thread = None
+                raise
+            self.logger.info("机器人已启动")
+            self._emit("bot_status", {"running": True})
         return True
 
     def stop(self):
-        if not self._running:
-            return False
-        self._running = False
-        self._stop_event.set()
-        self.logger.info("机器人已停止")
-        self._emit("bot_status", {"running": False})
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            if not self._running:
+                return False
+            self._running = False
+            self._stop_event.set()
+            operation_status = {
+                "active": dict(self._active_review_operations),
+            }
+            active = [
+                {
+                    "generating": "生成",
+                    "regenerating": "重新生成",
+                    "sending": "发送",
+                }.get(name, name)
+                for name, count in operation_status["active"].items()
+                if count
+            ]
+            if active:
+                self.logger.info(
+                    "定时处理已停止，不再开始下一轮；当前%s任务继续完成",
+                    "、".join(active),
+                )
+            else:
+                self.logger.info("机器人已停止")
+            self._emit("bot_status", {"running": False})
         # 刷出历史记录和 Cookie
         self._flush_history()
-        if self.cookie_manager:
+        cookie_manager = getattr(self, "cookie_manager", None)
+        if cookie_manager:
             try:
-                self.cookie_manager.save_to_file(COOKIE_FILE)
+                cookie_manager.save_to_file(self.cookie_file)
             except Exception:
                 pass
         return True
 
-    def _run_loop(self):
-        while self._running:
-            self.stats["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    def prepare_shutdown(self, wait_timeout: float = 20.0):
+        """服务退出前给当前请求有限收尾时间，无法确认的发送绝不自动重发。"""
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            self._running = False
+            self._stop_event.set()
+            worker = self._thread
+
+        deadline = time.monotonic() + max(0.0, float(wait_timeout))
+        if (
+            worker is not None
+            and worker is not threading.current_thread()
+            and worker.is_alive()
+        ):
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+
+        while time.monotonic() < deadline:
+            with self._review_operation_lock:
+                if not any(self._active_review_operations.values()):
+                    break
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+        with self._review_operation_lock:
+            idle = not any(self._active_review_operations.values())
+        if not idle:
+            self.logger.warning(
+                "退出等待已到上限，仍在执行的请求将按结果未知处理"
+            )
+
+        changed = False
+        with self._review_lock:
+            for draft in self._review_drafts.values():
+                if draft.get("status") == "sending":
+                    draft["approved"] = False
+                    draft["status"] = "send_unknown"
+                    draft["error"] = (
+                        "程序在发送过程中退出，B站是否已收到无法自动确认；"
+                        "请先到创作中心核对，系统不会自动重发"
+                    )
+                    changed = True
+                elif (
+                    draft.get("status") == "approved"
+                    and draft.get("approval_source") == "auto"
+                ):
+                    draft["approved"] = False
+                    draft["status"] = "pending"
+                    draft["error"] = "程序退出，尚未开始发送的自动候选已恢复待审核"
+                    changed = True
+                elif draft.get("status") == "regenerating":
+                    draft["approved"] = False
+                    draft["status"] = (
+                        "pending" if draft.get("should_reply") else "skipped"
+                    )
+                    draft["error"] = "程序在重新生成过程中退出，已保留退出前的候选回复"
+                    changed = True
+            if changed:
+                self._save_review_drafts()
+        self._flush_history()
+        cookie_manager = getattr(self, "cookie_manager", None)
+        if cookie_manager:
             try:
+                cookie_manager.save_to_file(self.cookie_file)
+            except Exception:
+                pass
+        return idle
+
+    def _run_loop(self):
+        worker = threading.current_thread()
+        try:
+            while self._running:
+                self.stats["last_check"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    self._process_scheduled_round()
+                except Exception as e:
+                    self.logger.error(f"处理评论异常: {e}", exc_info=True)
+                self._emit("stats", self.get_stats())
+                interval = max(
+                    1,
+                    int(self.config["bilibili"].get("check_interval", 3600)),
+                )
+                self.logger.info(f"等待 {interval} 秒后进行下次检查")
+                # 使用 Event.wait() 可被停止信号立即唤醒，避免循环 sleep
+                self._stop_event.wait(timeout=interval)
+        finally:
+            with self._review_operation_lock:
+                if self._thread is worker:
+                    self._thread = None
+
+    def _process_scheduled_round(self):
+        self._ensure_review_operation_state()
+        context_factory = self._automatic_round_context_factory
+        if (
+            context_factory is None
+            or not self.config.get("reply", {}).get("enabled", True)
+        ):
+            self.process_comments()
+            return
+
+        with context_factory(
+            self._stop_event,
+            self.logger,
+            lambda: (
+                self._running
+                and self.config.get("reply", {}).get("enabled", True)
+            ),
+        ) as allowed:
+            if allowed:
                 self.process_comments()
-            except Exception as e:
-                self.logger.error(f"处理评论异常: {e}", exc_info=True)
-            self._emit("stats", self.get_stats())
-            interval = max(1, int(self.config["bilibili"].get("check_interval", 60)))
-            self.logger.info(f"等待 {interval} 秒后进行下次检查")
-            # 使用 Event.wait() 可被停止信号立即唤醒，避免循环 sleep
-            self._stop_event.wait(timeout=interval)
 
     def update_headers(self):
         self.session.headers.update({
@@ -624,8 +1011,9 @@ class BiliCommentBot:
     # ── 历史记录 ──
     def load_history(self):
         try:
-            if os.path.exists(HISTORY_FILE):
-                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            history_file = getattr(self, "history_file", HISTORY_FILE)
+            if os.path.exists(history_file):
+                with open(history_file, "r", encoding="utf-8") as f:
                     history = json.load(f)
                 self.processed_comments = set(item.get("comment_id") for item in history)
                 self._history_buffer = history
@@ -662,8 +1050,14 @@ class BiliCommentBot:
         if not self._history_dirty:
             return
         try:
-            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            history_file = getattr(self, "history_file", HISTORY_FILE)
+            directory = os.path.dirname(history_file)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            temp_file = f"{history_file}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
                 json.dump(self._history_buffer, f, ensure_ascii=False, indent=2)
+            os.replace(temp_file, history_file)
             self._history_dirty = False
         except Exception as e:
             self.logger.error(f"刷出历史记录失败: {e}")
@@ -671,6 +1065,331 @@ class BiliCommentBot:
     def get_history(self) -> list:
         """返回内存中的完整历史记录（比读文件快）"""
         return self._history_buffer
+
+    # ── 人工审核草稿 ──
+    def load_review_drafts(self):
+        try:
+            recovered_sending = 0
+            recovered_regenerating = 0
+            recovered_auto_approved = 0
+            recovered_unavailable = 0
+            review_drafts_file = getattr(
+                self, "review_drafts_file", REVIEW_DRAFTS_FILE
+            )
+            if os.path.exists(review_drafts_file):
+                with open(review_drafts_file, "r", encoding="utf-8") as f:
+                    items = json.load(f)
+                if isinstance(items, list):
+                    self._review_drafts = {
+                        str(item["comment_id"]): item
+                        for item in items
+                        if isinstance(item, dict) and item.get("comment_id")
+                    }
+                    for draft in self._review_drafts.values():
+                        if draft.get("status") == "sending":
+                            draft["approved"] = False
+                            draft["status"] = "send_unknown"
+                            draft["error"] = (
+                                "程序在发送过程中退出，B站是否已收到无法自动确认；"
+                                "请先到创作中心核对，系统不会自动重发"
+                            )
+                            recovered_sending += 1
+                        elif draft.get("status") == "regenerating":
+                            draft["approved"] = False
+                            draft["status"] = (
+                                "pending" if draft.get("should_reply") else "skipped"
+                            )
+                            draft["error"] = "程序在重新生成过程中退出，已保留退出前的候选回复"
+                            recovered_regenerating += 1
+                        elif (
+                            draft.get("status") == "approved"
+                            and draft.get("approval_source") == "auto"
+                        ):
+                            draft["approved"] = False
+                            draft["status"] = "pending"
+                            draft["error"] = (
+                                "上次自动发送尚未开始，已恢复待审核，系统不会自动重发"
+                            )
+                            draft.pop("approval_source", None)
+                            draft.pop("approved_at", None)
+                            draft.pop("auto_generation_id", None)
+                            recovered_auto_approved += 1
+                        elif (
+                            draft.get("status") == "failed"
+                            and self._is_permanent_reply_failure(
+                                draft.get("error", "")
+                            )
+                        ):
+                            draft["approved"] = False
+                            draft["should_reply"] = False
+                            draft["status"] = "unavailable"
+                            draft.setdefault(
+                                "unavailable_at",
+                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            )
+                            recovered_unavailable += 1
+                    if (
+                        recovered_sending
+                        or recovered_regenerating
+                        or recovered_auto_approved
+                        or recovered_unavailable
+                    ):
+                        self._save_review_drafts()
+            self.logger.info(f"加载审核草稿 {len(self._review_drafts)} 条")
+            if recovered_sending:
+                self.logger.warning(
+                    "发现%s条上次退出时仍在发送的回复，已标记为发送结果待核对，绝不自动重发",
+                    recovered_sending,
+                )
+            if recovered_regenerating:
+                self.logger.warning(
+                    "发现%s条上次退出时仍在重新生成的草稿，已恢复退出前候选并取消批准",
+                    recovered_regenerating,
+                )
+            if recovered_auto_approved:
+                self.logger.warning(
+                    "发现%s条上次自动批准但尚未开始发送的草稿，"
+                    "已恢复待审核，不会自动重发",
+                    recovered_auto_approved,
+                )
+            if recovered_unavailable:
+                self.logger.warning(
+                    "发现%s条历史失败草稿已被B站明确标记为不可回复，"
+                    "已永久跳过，不会再次生成或发送",
+                    recovered_unavailable,
+                )
+        except Exception as e:
+            self.logger.error(f"加载审核草稿失败: {e}")
+            self._review_drafts = {}
+
+    def _save_review_drafts(self):
+        review_drafts_file = getattr(
+            self, "review_drafts_file", REVIEW_DRAFTS_FILE
+        )
+        directory = os.path.dirname(review_drafts_file)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temp_file = f"{review_drafts_file}.tmp"
+        items = sorted(
+            self._review_drafts.values(),
+            key=lambda item: item.get("comment_time", 0),
+            reverse=True,
+        )
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+        os.replace(temp_file, review_drafts_file)
+
+    def get_review_drafts(self) -> list:
+        with self._review_lock:
+            return sorted(
+                [dict(item) for item in self._review_drafts.values()],
+                key=lambda item: item.get("comment_time", 0),
+                reverse=True,
+            )
+
+    def set_review_approval(self, comment_id: str, approved: bool) -> dict:
+        with self._review_lock:
+            draft = self._review_drafts.get(str(comment_id))
+            if not draft:
+                raise KeyError("草稿不存在")
+            if draft.get("status") == "unavailable":
+                raise ValueError("B站已明确标记该评论不可回复")
+            if not draft.get("should_reply"):
+                raise ValueError("豆包已判断该评论不建议回复")
+            if draft.get("status") == "sent":
+                raise ValueError("该回复已经发送")
+            if draft.get("status") == "regenerating":
+                raise ValueError("豆包正在重新生成该回复")
+            if draft.get("status") == "sending":
+                raise ValueError("该回复正在发送，不能更改批准状态")
+            if draft.get("status") == "send_unknown":
+                raise ValueError("该回复发送结果待核对，不能直接重发")
+            if draft.get("status") == "dismissed":
+                raise ValueError("该评论已设为人工不回复，请先恢复审核")
+            draft["approved"] = bool(approved)
+            draft["status"] = "approved" if approved else "pending"
+            self._save_review_drafts()
+            return dict(draft)
+
+    def set_review_dismissed(self, comment_id: str, dismissed: bool) -> dict:
+        """持久化人工不回复决定；保留草稿用于去重，避免下次扫描重新出现。"""
+        comment_id = str(comment_id).strip()
+        if not comment_id:
+            raise ValueError("缺少 comment_id")
+
+        with self._review_lock:
+            draft = self._review_drafts.get(comment_id)
+            if not draft:
+                raise KeyError("草稿不存在")
+
+            status = str(draft.get("status") or "")
+            if status == "sent":
+                raise ValueError("该回复已经发送，不能设为人工不回复")
+            if status == "unavailable":
+                raise ValueError("B站已明确标记该评论不可回复")
+            if status == "sending":
+                raise ValueError("该回复正在发送，不能设为人工不回复")
+            if status == "regenerating":
+                raise ValueError("豆包正在重新生成该回复，不能设为人工不回复")
+            if status == "send_unknown":
+                raise ValueError("该回复发送结果待核对，不能设为人工不回复")
+
+            draft["approved"] = False
+            if dismissed:
+                draft["status"] = "dismissed"
+                draft["dismissed_at"] = datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+            else:
+                if status != "dismissed":
+                    raise ValueError("该评论当前不是人工不回复状态")
+                draft["status"] = (
+                    "pending"
+                    if draft.get("should_reply") and str(draft.get("reply") or "").strip()
+                    else "skipped"
+                )
+                draft.pop("dismissed_at", None)
+
+            self._save_review_drafts()
+            return dict(draft)
+
+    def set_review_approvals(self, comment_ids: List[str], approved: bool) -> dict:
+        """原子地批量修改批准状态；不访问 B站接口。"""
+        normalized_ids = list(dict.fromkeys(
+            str(comment_id).strip()
+            for comment_id in comment_ids
+            if str(comment_id).strip()
+        ))
+        if not normalized_ids:
+            raise ValueError("必须明确提交至少一个 comment_id")
+
+        self._ensure_review_operation_state()
+        with self._review_operation_lock:
+            if any(self._active_review_operations.values()):
+                raise ReviewOperationBusyError(
+                    "当前有生成、重新生成或发送任务，暂时不能批量修改勾选"
+                )
+            with self._review_lock:
+                drafts = []
+                for comment_id in normalized_ids:
+                    draft = self._review_drafts.get(comment_id)
+                    if not draft:
+                        raise KeyError(f"草稿不存在: {comment_id}")
+                    if not draft.get("should_reply") or not str(draft.get("reply") or "").strip():
+                        raise ValueError(f"该评论没有可发送的候选回复: {comment_id}")
+                    if draft.get("status") in {
+                        "sent", "skipped", "dismissed", "unavailable",
+                        "regenerating", "sending", "send_unknown"
+                    }:
+                        raise ValueError(
+                            f"该回复当前不能更改批准状态: {comment_id}"
+                        )
+                    drafts.append(draft)
+
+                for draft in drafts:
+                    draft["approved"] = bool(approved)
+                    draft["status"] = "approved" if approved else "pending"
+                self._save_review_drafts()
+                return {
+                    "updated": len(drafts),
+                    "approved": bool(approved),
+                }
+
+    def regenerate_review_draft(self, comment_id: str) -> dict:
+        """使用当前最新配置重新生成单条候选回复，不访问 B站接口。"""
+        comment_id = str(comment_id)
+        with self._review_operation("regenerating") as task_config:
+            with self._review_lock:
+                current = self._review_drafts.get(comment_id)
+                if not current:
+                    raise KeyError("草稿不存在")
+                if current.get("status") == "sent":
+                    raise ValueError("已发送的回复不能重新生成")
+                if current.get("status") == "unavailable":
+                    raise ValueError("B站已明确标记该评论不可回复")
+                if current.get("status") == "regenerating":
+                    raise ValueError("该回复已经在重新生成")
+                if current.get("status") == "sending":
+                    raise ValueError("该回复正在发送，不能重新生成")
+                if current.get("status") == "send_unknown":
+                    raise ValueError("该回复发送结果待核对，不能重新生成")
+                if current.get("status") == "dismissed":
+                    raise ValueError("该评论已设为人工不回复，请先恢复审核")
+                original = dict(current)
+                current["approved"] = False
+                current["status"] = "regenerating"
+                self._save_review_drafts()
+
+            comment = Comment(
+                comment_id=comment_id,
+                content=str(original.get("comment") or ""),
+                user=str(original.get("author") or ""),
+                uid=str(original.get("author_uid") or ""),
+                time=int(original.get("comment_time") or 0),
+                parent_id=original.get("parent_id"),
+                root_id=original.get("root_id"),
+                depth=int(original.get("depth") or 0),
+            )
+            parent = None
+            if original.get("parent_comment"):
+                parent = Comment(
+                    comment_id=str(
+                        original.get("parent_id")
+                        or original.get("root_id")
+                        or "context"
+                    ),
+                    content=str(original["parent_comment"]),
+                    user=str(original.get("parent_author") or "上级评论"),
+                    uid="",
+                    time=0,
+                )
+
+            item = {
+                "bvid": original.get("bvid", ""),
+                "oid": original.get("oid", ""),
+                "comment_type": original.get("comment_type", 1),
+                "video_title": original.get("video_title", ""),
+                "video_desc": "",
+                "comment": comment,
+                "context": [parent] if parent else [],
+                "parent_comment": parent,
+                "is_follow_up": bool(original.get("root_id") or original.get("depth")),
+                "regenerate": True,
+                "previous_reply": str(original.get("reply") or ""),
+                "_ark_config_snapshot": copy.deepcopy(task_config.get("ark", {})),
+            }
+
+            try:
+                decision = self.generate_distinct_reply_decision(item)
+                should_reply = bool(decision.get("should_reply") and decision.get("reply"))
+                with self._review_lock:
+                    current = self._review_drafts.get(comment_id)
+                    if not current:
+                        raise KeyError("草稿不存在")
+                    if current.get("status") != "regenerating":
+                        raise ValueError("草稿状态已变化，不能覆盖当前内容")
+                    current.update({
+                        "should_reply": should_reply,
+                        "reply": decision.get("reply", "") if should_reply else "",
+                        "reason": decision.get("reason", ""),
+                        "model": decision.get("model", ""),
+                        "approved": False,
+                        "status": "pending" if should_reply else "skipped",
+                        "regenerated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    current.pop("error", None)
+                    self._save_review_drafts()
+                    result = dict(current)
+            except Exception:
+                with self._review_lock:
+                    current = self._review_drafts.get(comment_id)
+                    if current and current.get("status") == "regenerating":
+                        self._review_drafts[comment_id] = original
+                        self._save_review_drafts()
+                raise
+
+        self._emit("review_updated", {"regenerated": comment_id})
+        return result
 
     # ── 视频缓存 ──
     def load_video_cache(self):
@@ -886,6 +1605,16 @@ class BiliCommentBot:
                 break
 
         if chained_reply_enabled:
+            my_uid = str(self.config.get("bilibili", {}).get("uid") or "")
+            if my_uid:
+                answered_ids = {
+                    str(comment.parent_id)
+                    for comment in all_comments
+                    if comment.uid == my_uid and comment.parent_id
+                }
+                for comment in all_comments:
+                    if comment.comment_id in answered_ids:
+                        comment.replied = True
             main_count = sum(1 for c in all_comments if c.depth == 0)
             child_count = len(all_comments) - main_count
             self.logger.info(f"共获取 {main_count} 条主评论和 {child_count} 条子评论")
@@ -954,61 +1683,553 @@ class BiliCommentBot:
 
         return all_replies
 
-    # ── DeepSeek 回复生成 ──
-    def generate_reply(self, comment: str, context: List[Comment] = None, video_title: str = None, video_desc: str = None) -> Optional[str]:
-        api_config = self.config["deepseek"]
-        headers = {"Authorization": f"Bearer {api_config['api_key']}", "Content-Type": "application/json"}
-        system_prompt = api_config.get("system_prompt", "你是一个友善的B站UP主，请对评论做出自然、友好的回复。控制在100字以内。")
-        messages = [{"role": "system", "content": system_prompt}]
-        video_context = ""
-        if video_title or video_desc:
-            video_context = "视频信息：\n"
-            if video_title:
-                video_context += f"标题：{video_title}\n"
-            if video_desc:
-                video_context += f"简介：{video_desc}\n"
-        if context or video_context:
-            ctx_text = video_context
-            if context:
-                ctx_text += "前面的评论上下文（已回复的历史评论，仅供参考，请勿回复这些历史评论）：\n"
-                for i, c in enumerate(context, 1):
-                    ctx_text += f"{i}. {c.user}: {c.content}\n"
-            messages.append({"role": "user", "content": ctx_text.strip()})
-        messages.append({"role": "user", "content": comment})
-        data = {
-            "model": api_config["model"],
-            "messages": messages,
-            "max_tokens": api_config["max_tokens"],
-            "temperature": api_config["temperature"],
-        }
-        try:
-            # 使用 bot 的 session（复用连接池），失败时重试
-            max_attempts = max(1, self.config.get("rate_limit", {}).get("max_retries", 3))
-            for attempt in range(max_attempts):
-                try:
-                    response = self.session.post(
-                        f"{api_config['base_url']}/chat/completions",
-                        headers=headers, json=data, timeout=30,
-                    )
-                    if response.status_code == 200:
-                        return response.json()["choices"][0]["message"]["content"].strip()
-                    self.logger.error(f"DeepSeek API失败: {response.status_code} {response.text[:200]}")
-                    if attempt < max_attempts - 1:
-                        wait = self.retry_delay * (2 ** attempt) + random.uniform(0, 2)
-                        self.logger.warning(f"DeepSeek API重试 ({attempt+1}/{max_attempts}) 等待 {wait:.1f}s")
-                        time.sleep(wait)
-                        continue
-                    return None
-                except requests.exceptions.RequestException as e:
-                    self.logger.error(f"DeepSeek API请求异常: {e}")
-                    if attempt < max_attempts - 1:
-                        wait = self.retry_delay * (2 ** attempt) + random.uniform(0, 2)
-                        time.sleep(wait)
-                        continue
-                    return None
-        except Exception as e:
-            self.logger.error(f"DeepSeek API异常: {e}")
+    @staticmethod
+    def _creator_reply_to_comment(reply: dict) -> Comment:
+        root_id = str(reply.get("root") or "") or None
+        parent_id = str(reply.get("parent") or "") or None
+        member = reply.get("member") or {}
+        content = reply.get("content") or {}
+        return Comment(
+            comment_id=str(reply.get("rpid") or ""),
+            content=str(content.get("message") or ""),
+            user=str(member.get("uname") or ""),
+            uid=str(member.get("mid") or reply.get("mid") or ""),
+            time=int(reply.get("ctime") or 0),
+            replied=bool((reply.get("up_action") or {}).get("reply")),
+            parent_id=parent_id,
+            root_id=root_id,
+            depth=1 if root_id else 0,
+        )
+
+    def get_creator_comment_feed(
+        self,
+        limit: int,
+        since_timestamp: int = None,
+        my_uid: str = "",
+        skip_comment_ids=None,
+        candidate_filter=None,
+        stop_after_empty_pages: bool = True,
+    ) -> List[dict]:
+        """按时间线读取最新评论，可选连续三页无新增时提前停止。"""
+        url = "https://api.bilibili.com/x/v2/reply/up/fulllist"
+        page_size = 10
+        limit = max(1, int(limit))
+        my_uid = str(my_uid or "")
+        skip_comment_ids = {str(value) for value in (skip_comment_ids or set())}
+        eligible_items = {}
+        seen_ids = set()
+        answered_ids = set()
+        reached_since = False
+        scanned_count = 0
+        self_count = 0
+        replied_count = 0
+        skipped_known_count = 0
+        filtered_count = 0
+        empty_candidate_pages = 0
+        pn = 1
+
+        while True:
+            params = {
+                "order": 1,
+                "filter": -1,
+                "is_hidden": 0,
+                "type": 1,
+                "pn": pn,
+                "ps": page_size,
+                "charge_plus_filter": False,
+            }
+            response = self.make_request_with_retry(
+                "GET",
+                url,
+                params=params,
+                use_cache=False,
+                headers={"Referer": "https://member.bilibili.com/platform/comment/article"},
+            )
+            if not response:
+                raise RuntimeError(
+                    f"创作中心评论扫描中断：第{pn}页请求无响应"
+                )
+
+            payload = response.json()
+            if payload.get("code") != 0:
+                message = payload.get("message", "未知错误")
+                raise RuntimeError(
+                    f"创作中心评论扫描中断：第{pn}页获取失败: {message}"
+                )
+
+            data = payload.get("data") or {}
+            replies = data.get("list") or []
+            if not replies:
+                self.logger.info(
+                    "创作中心最新评论扫描停止：第%s页为空，列表已结束；"
+                    "累计扫描%s条，待生成%s条",
+                    pn,
+                    scanned_count,
+                    len(eligible_items),
+                )
+                break
+
+            page_start_ids = set(eligible_items)
+            page_scanned_count = 0
+            reached_raw_limit = False
+            for reply in replies:
+                if scanned_count >= limit:
+                    reached_raw_limit = True
+                    break
+                comment = self._creator_reply_to_comment(reply)
+                scanned_count += 1
+                page_scanned_count += 1
+                if since_timestamp is not None and comment.time < since_timestamp:
+                    reached_since = True
+                    break
+                if not comment.comment_id or comment.comment_id in seen_ids:
+                    continue
+                seen_ids.add(comment.comment_id)
+
+                if my_uid and comment.uid == my_uid:
+                    self_count += 1
+                    replied_target = str(reply.get("parent") or "")
+                    if replied_target:
+                        answered_ids.add(replied_target)
+                        if eligible_items.pop(replied_target, None) is not None:
+                            replied_count += 1
+                    continue
+                if comment.replied or comment.comment_id in answered_ids:
+                    replied_count += 1
+                    continue
+                if comment.comment_id in skip_comment_ids:
+                    skipped_known_count += 1
+                    continue
+                if candidate_filter is not None and not candidate_filter(comment):
+                    filtered_count += 1
+                    continue
+
+                parent_data = reply.get("parent_info") or {}
+                if not parent_data and comment.parent_id:
+                    root_data = reply.get("root_info") or {}
+                    if str(root_data.get("rpid") or "") == comment.parent_id:
+                        parent_data = root_data
+                parent_comment = (
+                    self._creator_reply_to_comment(parent_data)
+                    if parent_data and parent_data.get("rpid")
+                    else None
+                )
+
+                eligible_items[comment.comment_id] = {
+                    "bvid": str(reply.get("bvid") or ""),
+                    "oid": str(reply.get("oid") or ""),
+                    "comment_type": int(reply.get("type") or 1),
+                    "video_title": str(reply.get("title") or ""),
+                    "video_desc": "",
+                    "comment": comment,
+                    "parent_comment": parent_comment,
+                }
+
+            page_new_count = len(set(eligible_items) - page_start_ids)
+            if page_new_count:
+                empty_candidate_pages = 0
+            else:
+                empty_candidate_pages += 1
+
+            page = data.get("page") or {}
+            total = int(page.get("total") or 0)
+            empty_page_progress = (
+                f"{empty_candidate_pages}/{CREATOR_EMPTY_PAGE_STOP}页"
+                if stop_after_empty_pages
+                else f"{empty_candidate_pages}页（提前停止已关闭）"
+            )
+            self.logger.info(
+                "创作中心最新评论第%s页扫描%s条；本页新增待生成%s条，"
+                "连续无新增%s；累计扫描%s条，待生成%s条，"
+                "排除自己的回复%s条、已回复%s条、已有记录%s条、过滤%s条",
+                pn,
+                page_scanned_count,
+                page_new_count,
+                empty_page_progress,
+                scanned_count,
+                len(eligible_items),
+                self_count,
+                replied_count,
+                skipped_known_count,
+                filtered_count,
+            )
+
+            stop_reason = ""
+            if reached_since:
+                stop_reason = "已到达所选时间范围"
+            elif reached_raw_limit or scanned_count >= limit:
+                stop_reason = f"已达到本次读取上限 {limit} 条"
+            elif (
+                stop_after_empty_pages
+                and empty_candidate_pages >= CREATOR_EMPTY_PAGE_STOP
+            ):
+                stop_reason = (
+                    f"连续{CREATOR_EMPTY_PAGE_STOP}页没有新增待生成评论"
+                )
+            elif len(replies) < page_size:
+                stop_reason = "当前页不足一页，列表已结束"
+            elif total and pn * page_size >= total:
+                stop_reason = "已到达创作中心评论列表末尾"
+
+            if stop_reason:
+                self.logger.info(
+                    "创作中心最新评论扫描停止：%s；共扫描%s页、%s条，"
+                    "最终待生成%s条",
+                    stop_reason,
+                    pn,
+                    scanned_count,
+                    len(eligible_items),
+                )
+                break
+            pn += 1
+
+        return list(eligible_items.values())
+
+    @staticmethod
+    def _parse_review_since(value: str) -> Optional[int]:
+        value = str(value or "").strip()
+        if not value:
             return None
+        try:
+            return int(datetime.fromisoformat(value.replace("T", " ")).timestamp())
+        except (ValueError, OSError, OverflowError) as exc:
+            raise ValueError("起始时间格式无效，请使用 YYYY-MM-DD HH:MM") from exc
+
+    @classmethod
+    def _resolve_review_since(
+        cls,
+        value: str = "",
+        time_range: str = "",
+    ) -> Optional[int]:
+        time_range = str(time_range or "").strip()
+        if time_range in REVIEW_TIME_RANGE_SECONDS:
+            return int(time.time()) - REVIEW_TIME_RANGE_SECONDS[time_range]
+        if time_range not in {"", "custom"}:
+            raise ValueError("时间范围无效")
+        return cls._parse_review_since(value)
+
+    # ── 豆包回复生成 ──
+    def _ark_output_text(self, payload: dict) -> str:
+        parts = []
+        for output in payload.get("output", []) or []:
+            for part in output.get("content", []) or []:
+                if part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+        return "".join(parts).strip()
+
+    def _parse_json_text(self, text: str):
+        cleaned = text.strip()
+        fenced = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", cleaned, re.IGNORECASE)
+        if fenced:
+            cleaned = fenced.group(1).strip()
+        return json.loads(cleaned)
+
+    def _wait_for_ark_slot(self, api_config: dict = None):
+        """在当前服务实例内错开方舟请求起始时间，避免同一时刻突发。"""
+        api_config = api_config or self.config.get("ark", {})
+        interval = max(
+            0.0,
+            float(api_config.get("request_interval_seconds", 0.15)),
+        )
+        if interval <= 0:
+            return
+
+        with self._ark_pacer_lock:
+            wait_seconds = interval - (time.monotonic() - self._ark_last_started_at)
+            if wait_seconds > 0:
+                time.sleep(wait_seconds)
+            self._ark_last_started_at = time.monotonic()
+
+    @staticmethod
+    def _ark_retry_after(response: requests.Response, fallback: float) -> float:
+        value = str(response.headers.get("Retry-After") or "").strip()
+        try:
+            return max(float(value), fallback)
+        except ValueError:
+            return fallback
+
+    def _post_ark(
+        self,
+        request_payload: dict,
+        api_config: dict,
+        api_key: str,
+    ) -> requests.Response:
+        proxy_url = os.environ.get("ARK_PROXY_URL", "").strip()
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+        max_retries = max(1, int(api_config.get("max_retries", 5)))
+        retry_base = max(0.1, float(api_config.get("retry_base_seconds", 2.0)))
+        last_error = None
+
+        for attempt in range(max_retries):
+            self._wait_for_ark_slot(api_config)
+            try:
+                response = requests.post(
+                    api_config.get("base_url", DEFAULT_CONFIG["ark"]["base_url"]),
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=request_payload,
+                    timeout=120,
+                    proxies=proxies,
+                )
+            except requests.exceptions.RequestException as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                if attempt >= max_retries - 1:
+                    break
+                wait_seconds = retry_base * (2 ** attempt) + random.uniform(0, 0.5)
+                self.logger.warning(
+                    "豆包请求异常，第%s/%s次，%.1f秒后重试: %s",
+                    attempt + 1,
+                    max_retries,
+                    wait_seconds,
+                    last_error,
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            if response.status_code == 429 or response.status_code >= 500:
+                error_body = re.sub(r"\s+", " ", response.text or "")[:500]
+                last_error = f"HTTP {response.status_code}: {error_body}"
+                if attempt >= max_retries - 1:
+                    break
+                fallback = retry_base * (2 ** attempt) + random.uniform(0, 0.5)
+                wait_seconds = self._ark_retry_after(response, fallback)
+                self.logger.warning(
+                    "豆包限流/服务异常，第%s/%s次，%.1f秒后重试: %s",
+                    attempt + 1,
+                    max_retries,
+                    wait_seconds,
+                    last_error,
+                )
+                time.sleep(wait_seconds)
+                continue
+
+            response.raise_for_status()
+            return response
+
+        raise ArkTransientError(last_error or "豆包请求重试后仍失败")
+
+    def generate_reply_decisions(self, items: List[dict]) -> List[dict]:
+        if not items:
+            return []
+
+        api_config = copy.deepcopy(
+            items[0].get("_ark_config_snapshot")
+            or self.config.get("ark", {})
+        )
+        api_key = (
+            os.environ.get("ARK_API_KEY")
+            or os.environ.get("VOLCENGINE_ARK_API_KEY")
+            or api_config.get("api_key", "")
+        )
+        if not api_key:
+            raise RuntimeError("未配置 ARK_API_KEY")
+
+        model = api_config.get("model", DEFAULT_CONFIG["ark"]["model"])
+        system_prompt = api_config.get("system_prompt", DEFAULT_CONFIG["ark"]["system_prompt"])
+        input_items = []
+        for item in items:
+            comment = item["comment"]
+            context = item.get("context") or []
+            input_items.append({
+                "id": str(comment.comment_id),
+                "video_title": item.get("video_title", ""),
+                "author": comment.user,
+                "comment": comment.content,
+                "is_follow_up": bool(item.get("is_follow_up") or comment.root_id),
+                "regenerate": bool(item.get("regenerate")),
+                "previous_reply": str(item.get("previous_reply") or ""),
+                "avoid_replies": [
+                    str(reply)
+                    for reply in (item.get("avoid_replies") or [])
+                    if str(reply).strip()
+                ],
+                "parent_context": [
+                    {"author": parent.user, "comment": parent.content}
+                    for parent in context
+                ],
+            })
+
+        prompt = f"""请处理下面这批评论。
+
+判断规则：
+1. 只有容易理解、容易自然回应、不容易犯错的评论才 should_reply=true。
+2. 上下文不足、事实争议大、容易引战、敏感、纯辱骂、只能写万能套话的评论，should_reply=false。
+3. 不为了数量硬回。短评论如果能自然接梗，也可以回复。
+4. is_follow_up=true 表示观众是在继续一段已有对话。只有追问带来新问题、新信息或确实值得继续的互动点时才回复；纯“谢谢/收到/哈哈”、表情、重复上一句、无新内容的附和必须跳过。
+5. 不要为了追平对话而回复每一条追评。拿不准是否值得继续时 should_reply=false。
+6. reply 必须是可直接发出的豆包原文，通常不超过60个汉字；不要加“回复：”、引号、分析或备选项。
+7. 不要编造视频和评论里没有的事实。
+8. regenerate=true 表示用户不满意旧回复。必须重新组织表达，不能与 previous_reply 或 avoid_replies 中的内容相同，也不能只替换标点、语气词或少量近义词。
+9. 风格硬约束：默认不要使用“哈哈”“哈哈哈”“笑死”“绷不住”等幼稚或重复口头禅。只有观众原话明确在开玩笑且回复确实需要接梗时，才可以偶尔使用一次；拿不准就不用。
+10. 观众质问或询问回复者是不是AI、机器人或自动回复时，必须 should_reply=false，直接跳过，不要解释或否认。
+
+只输出严格 JSON 数组：
+[{{"id":"评论id","should_reply":true,"reply":"直接回复正文","reason":"简短判断"}}]
+不建议回复时 reply 必须为空字符串。
+
+评论数据：
+{json.dumps(input_items, ensure_ascii=False)}
+"""
+        request_payload = {
+            "model": model,
+            "instructions": system_prompt,
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }],
+            "reasoning": {
+                "effort": str(api_config.get("reasoning_effort", "medium")).strip().lower(),
+            },
+            "max_output_tokens": int(api_config.get("max_tokens", 128000)),
+        }
+        response = self._post_ark(request_payload, api_config, api_key)
+        response_payload = response.json()
+        output_text = self._ark_output_text(response_payload)
+        if not output_text:
+            status = str(response_payload.get("status") or "unknown")
+            incomplete = response_payload.get("incomplete_details")
+            raise ArkEmptyOutputError(
+                f"豆包没有返回文本（status={status}, incomplete_details={incomplete!r}）"
+            )
+        parsed = self._parse_json_text(output_text)
+        if not isinstance(parsed, list):
+            raise RuntimeError("豆包返回格式不是 JSON 数组")
+
+        known_ids = {str(item["comment"].comment_id) for item in items}
+        results = []
+        for decision in parsed:
+            decision_id = str(decision.get("id", ""))
+            if decision_id not in known_ids:
+                continue
+            should_reply = decision.get("should_reply") is True
+            reply = str(decision.get("reply", "")).strip() if should_reply else ""
+            results.append({
+                "id": decision_id,
+                "should_reply": should_reply and bool(reply),
+                "reply": reply,
+                "reason": str(decision.get("reason", "")).strip(),
+                "model": model,
+            })
+        return results
+
+    @staticmethod
+    def _normalized_reply_text(text: str) -> str:
+        return re.sub(r"[\W_]+", "", str(text or ""), flags=re.UNICODE).lower()
+
+    def generate_distinct_reply_decision(self, item: dict) -> dict:
+        """重新生成时最多调用豆包两次，确保不是原样返回。"""
+        previous_reply = str(item.get("previous_reply") or "")
+        avoid_replies = [previous_reply] if previous_reply else []
+
+        for _ in range(2):
+            request_item = dict(item)
+            request_item["regenerate"] = True
+            request_item["previous_reply"] = previous_reply
+            request_item["avoid_replies"] = list(avoid_replies)
+            decisions = self.generate_reply_decisions_resilient([request_item])
+            decision = decisions[0] if decisions else None
+            if not decision or not decision.get("should_reply"):
+                return decision or {
+                    "id": str(item["comment"].comment_id),
+                    "should_reply": False,
+                    "reply": "",
+                    "reason": "豆包未返回该条，暂不回复",
+                    "model": (
+                        item.get("_ark_config_snapshot")
+                        or self.config.get("ark", {})
+                    ).get(
+                        "model",
+                        DEFAULT_CONFIG["ark"]["model"],
+                    ),
+                }
+
+            new_reply = str(decision.get("reply") or "")
+            normalized_new = self._normalized_reply_text(new_reply)
+            if normalized_new and all(
+                normalized_new != self._normalized_reply_text(old_reply)
+                for old_reply in avoid_replies
+            ):
+                return decision
+            if new_reply:
+                avoid_replies.append(new_reply)
+
+        raise RuntimeError("豆包连续两次返回相同回复，旧回复已保留，请稍后再试")
+
+    def generate_reply_decisions_resilient(self, items: List[dict]) -> List[dict]:
+        """豆包偶发返回坏 JSON/空文本时串行拆小批次，避免拖垮整批。"""
+        try:
+            return self.generate_reply_decisions(items)
+        except (json.JSONDecodeError, ArkEmptyOutputError) as exc:
+            problem = "JSON 不完整" if isinstance(exc, json.JSONDecodeError) else "空文本"
+            self.logger.warning(
+                "豆包返回%s，当前批次 %s 条，准备串行拆分: %s",
+                problem,
+                len(items),
+                exc,
+            )
+            if len(items) <= 1:
+                comment_id = str(items[0]["comment"].comment_id)
+                return [{
+                    "id": comment_id,
+                    "should_reply": False,
+                    "reply": "",
+                    "reason": (
+                        "豆包未返回文本，暂不回复"
+                        if isinstance(exc, ArkEmptyOutputError)
+                        else "豆包返回格式异常，暂不回复"
+                    ),
+                    "model": (
+                        items[0].get("_ark_config_snapshot")
+                        or self.config.get("ark", {})
+                    ).get(
+                        "model",
+                        DEFAULT_CONFIG["ark"]["model"],
+                    ),
+                }]
+
+            middle = len(items) // 2
+            return (
+                self.generate_reply_decisions_resilient(items[:middle])
+                + self.generate_reply_decisions_resilient(items[middle:])
+            )
+        except ArkTransientError as exc:
+            self.logger.error(
+                "豆包批次重试后仍失败，当前%s条仅标记为暂不回复: %s",
+                len(items),
+                exc,
+            )
+            model = (
+                items[0].get("_ark_config_snapshot")
+                or self.config.get("ark", {})
+            ).get(
+                "model",
+                DEFAULT_CONFIG["ark"]["model"],
+            )
+            return [{
+                "id": str(item["comment"].comment_id),
+                "should_reply": False,
+                "reply": "",
+                "reason": "豆包请求受限或暂时不可用，稍后可重新生成",
+                "model": model,
+            } for item in items]
+
+    def generate_reply(self, comment: str, context: List[Comment] = None, video_title: str = None, video_desc: str = None) -> Optional[str]:
+        placeholder = Comment(
+            comment_id="single",
+            content=comment,
+            user="观众",
+            uid="",
+            time=int(time.time()),
+        )
+        decisions = self.generate_reply_decisions([{
+            "comment": placeholder,
+            "context": context or [],
+            "video_title": video_title or "",
+            "video_desc": video_desc or "",
+        }])
+        return decisions[0]["reply"] if decisions and decisions[0]["should_reply"] else None
 
     # ── 评论点赞 ──
     def like_comment(self, bvid: str, comment_id: str) -> bool:
@@ -1120,43 +2341,84 @@ class BiliCommentBot:
             self.logger.error(f"检查粉丝关系异常: {e}", exc_info=True)
             return False
 
-    def reply_comment(self, bvid: str, comment_id: str, content: str, root_id: str = None, parent_id: str = None) -> bool:
+    @staticmethod
+    def _is_permanent_reply_failure(message: str) -> bool:
+        normalized = re.sub(r"\s+", "", str(message or ""))
+        return any(
+            marker in normalized
+            for marker in PERMANENT_REPLY_FAILURE_MARKERS
+        )
+
+    def reply_comment(
+        self,
+        bvid: str,
+        comment_id: str,
+        content: str,
+        root_id: str = None,
+        oid: str = None,
+        comment_type: int = 1,
+    ) -> ReplyAttemptResult:
         if self.cookie_manager:
             self.csrf_token = self.cookie_manager._get_csrf_from_cookie()
         if not self.csrf_token:
             self.logger.error("未找到CSRF token")
-            return False
+            return ReplyAttemptResult(False, False, "未找到CSRF token")
         if self.cookie_manager:
             is_valid, result = self.cookie_manager.verify_cookie()
             if not is_valid:
                 self.logger.error(f"Cookie无效: {result.get('message')}")
-                return False
+                return ReplyAttemptResult(False, False, f"Cookie无效: {result.get('message')}")
 
         url = "https://api.bilibili.com/x/v2/reply/add"
-        aid = self.bvid_to_aid(bvid)
-        prefix = self.config["reply"].get("prefix", "")
-
+        aid = str(oid or self.bvid_to_aid(bvid))
+        if not aid:
+            self.logger.error(f"无法确定评论所属稿件: comment_id={comment_id}")
+            return ReplyAttemptResult(False, False, "无法确定评论所属稿件")
         root = root_id if root_id else comment_id
-        parent = parent_id if parent_id else comment_id
+        # parent 表示本次要回复的目标评论，而不是目标评论原来的上级。
+        parent = comment_id
 
-        data = {"type": 1, "oid": aid, "root": root, "parent": parent, "message": f"{prefix}{content}", "csrf": self.csrf_token}
+        data = {
+            "type": int(comment_type or 1),
+            "oid": aid,
+            "root": root,
+            "parent": parent,
+            "message": content,
+            "csrf": self.csrf_token,
+        }
 
         reply_type = "楼中楼回复" if root_id else "主评论回复"
-        self.logger.debug(f"{reply_type}: bvid={bvid}, root={root}, parent={parent}, comment_id={comment_id}")
+        self.logger.debug(
+            f"{reply_type}: bvid={bvid}, oid={aid}, type={comment_type}, "
+            f"root={root}, parent={parent}, comment_id={comment_id}"
+        )
 
         try:
             response = self.make_request_with_retry("POST", url, data=data)
             if not response:
-                return False
+                return ReplyAttemptResult(
+                    False,
+                    True,
+                    "B站请求没有返回；请求可能已被服务端接收",
+                )
             result = response.json()
             if result.get("code") == 0:
                 self.logger.info(f"回复成功: {comment_id} (类型: {reply_type})")
-                return True
-            self.logger.error(f"回复失败: {result.get('message')}")
-            return False
+                return ReplyAttemptResult(True)
+            message = str(result.get("message") or "B站回复接口返回失败")
+            permanent = self._is_permanent_reply_failure(message)
+            if permanent:
+                self.logger.warning(f"回复不可用，已标记为永久跳过: {message}")
+            else:
+                self.logger.error(f"回复失败: {message}")
+            return ReplyAttemptResult(False, False, message, permanent)
         except Exception as e:
             self.logger.error(f"回复异常: {e}")
-            return False
+            return ReplyAttemptResult(
+                False,
+                True,
+                f"回复请求异常: {type(e).__name__}: {e}",
+            )
 
     def refresh_cookie_if_needed(self):
         if not self.cookie_manager or not self.cookie_manager.refresh_token:
@@ -1175,137 +2437,704 @@ class BiliCommentBot:
                     self.on_config_changed(new_rt)
         self.last_cookie_refresh_time = current_time
 
-    # ── 主处理循环 ──
-    def process_comments(self):
-        if self.auto_refresh_cookie:
-            self.refresh_cookie_if_needed()
-        if not self.config["reply"].get("enabled", True):
-            return
+    # ── 人工审核处理循环 ──
+    def _collect_review_items(
+        self,
+        limit: int,
+        review_since: str = None,
+        review_time_range: str = None,
+        config_snapshot: dict = None,
+    ) -> List[dict]:
+        task_config = config_snapshot or self.config
+        only_bvid = task_config["reply"].get("only_bvid", "").strip()
+        context_count = task_config["reply"].get("context_comments_count", 0)
+        my_uid = task_config["bilibili"].get("uid", "")
+        items = []
 
-        only_bvid = self.config["reply"].get("only_bvid", "").strip()
-        if only_bvid:
-            self.logger.info(f"仅回复指定视频: {only_bvid}")
-            video_title = f"指定视频({only_bvid})"
-            videos = [{"bvid": only_bvid, "title": video_title, "desc": ""}]
-        else:
-            videos = self.get_video_list()
-            if not videos:
-                self.logger.warning("未获取到视频列表")
-                return
+        with self._review_lock:
+            existing_ids = set(self._review_drafts)
 
-        max_process = self.config["reply"].get("max_process", 10)
-        context_count = self.config["reply"].get("context_comments_count", 0)
-        processed_count = 0
-        my_uid = self.config["bilibili"].get("uid", "")
+        if not only_bvid:
+            stop_after_empty_pages = bool(
+                task_config["reply"].get("stop_after_empty_pages", True)
+            )
+            effective_since = (
+                task_config["reply"].get("review_since", "")
+                if review_since is None
+                else review_since
+            )
+            effective_time_range = (
+                task_config["reply"].get("review_time_range", "")
+                if review_time_range is None
+                else review_time_range
+            )
+            since_timestamp = self._resolve_review_since(
+                effective_since,
+                effective_time_range,
+            )
+            if since_timestamp is None:
+                range_text = "不限时间"
+            else:
+                range_text = "时间下限" + datetime.fromtimestamp(
+                    since_timestamp
+                ).strftime("%Y-%m-%d %H:%M:%S")
+            stop_text = (
+                f"连续{CREATOR_EMPTY_PAGE_STOP}页没有新增待生成评论则停止"
+                if stop_after_empty_pages
+                else "连续无新增提前停止已关闭"
+            )
+            self.logger.info(
+                "开始扫描创作中心最新评论：最多读取%s条，%s；%s",
+                limit,
+                range_text,
+                stop_text,
+            )
+            feed_items = self.get_creator_comment_feed(
+                limit,
+                since_timestamp,
+                my_uid=my_uid,
+                skip_comment_ids=self.processed_comments | existing_ids,
+                candidate_filter=lambda comment: self._check_filters(
+                    comment,
+                    task_config,
+                )[0],
+                stop_after_empty_pages=stop_after_empty_pages,
+            )
+            for feed_item in feed_items:
+                if len(items) >= limit:
+                    break
+                comment = feed_item["comment"]
+                if comment.comment_id in self.processed_comments or comment.comment_id in existing_ids:
+                    continue
+                if comment.replied:
+                    continue
+                if my_uid and comment.uid == my_uid:
+                    continue
 
+                parent_comment = feed_item.get("parent_comment")
+                context = [parent_comment] if parent_comment else []
+                feed_item["context"] = context
+                feed_item["is_follow_up"] = comment.depth > 0
+                items.append(feed_item)
+            return items
+
+        videos = [{"bvid": only_bvid, "title": f"指定视频({only_bvid})", "desc": ""}]
         for video in videos:
-            if processed_count >= max_process:
+            if len(items) >= limit:
                 break
             bvid = video["bvid"]
-            title = video.get("title", "")
-            self.logger.info(f"处理视频: {title} ({bvid})")
             comments = self.get_video_comments(bvid)
-
             for idx, comment in enumerate(comments):
-                if processed_count >= max_process:
+                if len(items) >= limit:
                     break
-                if comment.comment_id in self.processed_comments:
+                if comment.comment_id in self.processed_comments or comment.comment_id in existing_ids:
                     continue
-
-                # 立即标记，防止重复
-                self.processed_comments.add(comment.comment_id)
-
-                # 跳过自己的评论
+                if comment.replied:
+                    continue
                 if my_uid and comment.uid == my_uid:
-                    self.logger.debug(f"跳过自己的评论: {comment.comment_id}")
                     continue
-
-                # 应用过滤器（关键词、长度、用户黑白名单）
-                passed, reason = self._check_filters(comment)
+                passed, _ = self._check_filters(comment)
                 if not passed:
-                    self.logger.debug(f"跳过评论 {comment.comment_id}: {reason}")
                     continue
 
-                self.logger.info(f"处理评论: [{comment.user}] {comment.content[:40]}... (深度: {comment.depth})")
-
-                # 构建上下文
                 context = []
+                parent_comment = None
                 if comment.depth > 0 and comment.parent_id:
-                    parent_comment = next((c for c in comments if c.comment_id == comment.parent_id), None)
+                    parent_comment = next(
+                        (candidate for candidate in comments if candidate.comment_id == comment.parent_id),
+                        None,
+                    )
                     if parent_comment:
                         context.append(parent_comment)
-                        self.logger.debug(f"添加父评论到上下文: [{parent_comment.user}] {parent_comment.content[:30]}...")
-
                 if context_count > 0 and idx > 0:
                     start_idx = max(0, idx - context_count)
-                    for i in range(start_idx, idx):
-                        if comments[i].comment_id != comment.parent_id:
-                            context.append(comments[i])
+                    for previous in comments[start_idx:idx]:
+                        if previous.comment_id != comment.parent_id:
+                            context.append(previous)
 
-                reply = self.generate_reply(comment.content, context, title, video.get("desc", ""))
-                if not reply:
-                    self.logger.warning(f"生成回复失败，跳过评论 {comment.comment_id}")
-                    continue
+                items.append({
+                    "bvid": bvid,
+                    "video_title": video.get("title", ""),
+                    "video_desc": video.get("desc", ""),
+                    "comment": comment,
+                    "context": context,
+                    "parent_comment": parent_comment,
+                    "is_follow_up": comment.depth > 0,
+                })
+        return items
 
-                if self.config["reply"].get("like_enabled", False):
-                    self.like_comment(bvid, comment.comment_id)
+    def generate_review_drafts(
+        self,
+        limit: int = None,
+        review_since: str = None,
+        review_time_range: str = None,
+        include_generated_ids: bool = False,
+    ) -> dict:
+        self._ensure_review_operation_state()
+        self._ensure_login_identity()
+        with self._review_operation(
+            "generating",
+            gate=self._review_generation_gate,
+            exclusive_gate=self._review_bilibili_gate,
+        ) as task_config:
+            if self.auto_refresh_cookie:
+                self.refresh_cookie_if_needed()
+            limit = normalize_review_read_limit(
+                limit or task_config["reply"].get("max_process", REVIEW_READ_DEFAULT)
+            )
+            items = self._collect_review_items(
+                limit,
+                review_since=review_since,
+                review_time_range=review_time_range,
+                config_snapshot=task_config,
+            )
+            result = self._generate_review_drafts(
+                items,
+                config_snapshot=task_config,
+                include_generated_ids=include_generated_ids,
+            )
+            return result
 
-                is_child_comment = comment.depth > 0 and comment.root_id is not None
+    def _generate_review_drafts(
+        self,
+        items: List[dict],
+        config_snapshot: dict = None,
+        include_generated_ids: bool = False,
+    ) -> dict:
+        generation_id = uuid.uuid4().hex if include_generated_ids else ""
+        if not items:
+            result = {"generated": 0, "replyable": 0, "skipped": 0}
+            if include_generated_ids:
+                with self._review_operation_lock:
+                    self._auto_send_rounds.clear()
+                result.update({
+                    "generation_id": generation_id,
+                    "generated_ids": [],
+                    "replyable_ids": [],
+                })
+            return result
 
-                if is_child_comment:
-                    if not comment.root_id:
-                        self.logger.error(f"楼中楼回复失败：根评论ID为空 (comment_id={comment.comment_id})")
-                        continue
-                    self.logger.info(f"楼中楼回复: 根评论={comment.root_id}, 当前评论={comment.comment_id}")
-                    if self.reply_comment(bvid, comment.comment_id, reply, root_id=comment.root_id):
-                        self.logger.info(f"楼中楼回复成功: {comment.comment_id}")
-                        self.processed_comments.add(comment.comment_id)
-                        self.save_history(comment, reply)
-                    continue
+        task_config = copy.deepcopy(config_snapshot or self.config)
+        ark_config = copy.deepcopy(task_config.get("ark", {}))
+        generation_items = []
+        for item in items:
+            generation_item = dict(item)
+            generation_item["_ark_config_snapshot"] = ark_config
+            generation_items.append(generation_item)
+
+        # 评论可能很长。按小批次保证 JSON 稳定，不同批次可并发调用豆包。
+        batch_size = max(
+            1,
+            min(int(task_config["reply"].get("review_batch_size", 4)), 4),
+        )
+        batches = [
+            generation_items[start:start + batch_size]
+            for start in range(0, len(generation_items), batch_size)
+        ]
+        decisions = {}
+        max_concurrency = max(
+            1,
+            int(ark_config.get("max_concurrency", 16)),
+        )
+        request_interval = max(
+            0.0,
+            float(ark_config.get("request_interval_seconds", 0.15)),
+        )
+        self.logger.info(
+            "开始豆包生成：共%s条，%s批，每批最多%s条，最大并发%s，请求起始间隔%.2f秒；"
+            "自定义提示词%s字，将作为 Responses API instructions 发送",
+            len(items),
+            len(batches),
+            batch_size,
+            min(len(batches), max_concurrency),
+            request_interval,
+            len(str(ark_config.get("system_prompt") or "")),
+        )
+        completed_items = 0
+        completed_batches = 0
+        replyable_so_far = 0
+        with ThreadPoolExecutor(max_workers=min(len(batches), max_concurrency)) as executor:
+            future_batches = {
+                executor.submit(self.generate_reply_decisions_resilient, batch): batch
+                for batch in batches
+            }
+            for future in as_completed(future_batches):
+                batch = future_batches[future]
+                batch_decisions = future.result()
+                for decision in batch_decisions:
+                    decisions[decision["id"]] = decision
+                completed_items += len(batch)
+                completed_batches += 1
+                replyable_so_far += sum(
+                    1
+                    for decision in batch_decisions
+                    if decision.get("should_reply") and decision.get("reply")
+                )
+                self.logger.info(
+                    "豆包生成进度：已处理%s/%s条（%s/%s批；可回复%s，建议跳过%s）",
+                    completed_items,
+                    len(items),
+                    completed_batches,
+                    len(batches),
+                    replyable_so_far,
+                    completed_items - replyable_so_far,
+                )
+
+        generated = 0
+        replyable = 0
+        skipped = 0
+        generated_ids = []
+        replyable_ids = []
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._review_lock:
+            for item in items:
+                comment = item["comment"]
+                decision = decisions.get(str(comment.comment_id), {
+                    "should_reply": False,
+                    "reply": "",
+                    "reason": "豆包未返回该条，暂不回复",
+                    "model": ark_config.get("model", DEFAULT_CONFIG["ark"]["model"]),
+                })
+                parent = item.get("parent_comment")
+                should_reply = bool(decision.get("should_reply") and decision.get("reply"))
+                draft = {
+                    "comment_id": str(comment.comment_id),
+                    "bvid": item["bvid"],
+                    "oid": item.get("oid", ""),
+                    "comment_type": item.get("comment_type", 1),
+                    "video_title": item["video_title"],
+                    "author": comment.user,
+                    "author_uid": comment.uid,
+                    "comment": comment.content,
+                    "comment_time": comment.time,
+                    "parent_id": comment.parent_id,
+                    "root_id": comment.root_id,
+                    "depth": comment.depth,
+                    "parent_author": parent.user if parent else "",
+                    "parent_comment": parent.content if parent else "",
+                    "should_reply": should_reply,
+                    "reply": decision.get("reply", "") if should_reply else "",
+                    "reason": decision.get("reason", ""),
+                    "model": decision.get("model", ""),
+                    "approved": False,
+                    "status": "pending" if should_reply else "skipped",
+                    "created_at": now_text,
+                }
+                if include_generated_ids:
+                    draft["auto_generation_id"] = generation_id
+                self._review_drafts[str(comment.comment_id)] = draft
+                generated_ids.append(str(comment.comment_id))
+                generated += 1
+                if should_reply:
+                    replyable_ids.append(str(comment.comment_id))
+                    replyable += 1
                 else:
-                    # 主评论回复
-                    if not self.reply_comment(bvid, comment.comment_id, reply):
+                    skipped += 1
+            self._save_review_drafts()
+
+        if include_generated_ids:
+            with self._review_operation_lock:
+                self._auto_send_rounds.clear()
+                if (
+                    replyable_ids
+                    and self._running
+                    and self.config.get("reply", {}).get(
+                        "auto_send_enabled",
+                        False,
+                    )
+                ):
+                    self._auto_send_rounds[generation_id] = set(replyable_ids)
+
+        self.logger.info(
+            "豆包生成完成：新增%s条草稿，可回复%s条，建议跳过%s条",
+            generated,
+            replyable,
+            skipped,
+        )
+        self._emit("review_updated", {
+            "generated": generated,
+            "replyable": replyable,
+            "skipped": skipped,
+        })
+        result = {"generated": generated, "replyable": replyable, "skipped": skipped}
+        if include_generated_ids:
+            result.update({
+                "generation_id": generation_id,
+                "generated_ids": generated_ids,
+                "replyable_ids": replyable_ids,
+            })
+        return result
+
+    def send_approved_drafts(
+        self,
+        comment_ids: List[str] = None,
+        since_timestamp: int = None,
+        auto_approve: bool = False,
+        auto_generation_id: str = None,
+    ) -> dict:
+        self._ensure_review_operation_state()
+        requested = None if comment_ids is None else {
+            str(value) for value in comment_ids
+        }
+        if auto_approve and requested is None:
+            raise ValueError("自动发送必须明确指定本轮新生成的 comment_id")
+        if auto_approve and not str(auto_generation_id or "").strip():
+            raise ValueError("自动发送必须携带本轮生成令牌")
+
+        def guard_auto_send(current_config: dict):
+            if not auto_approve:
+                return
+            reply_config = current_config.get("reply", {})
+            if (
+                not self._running
+                or not reply_config.get("enabled", True)
+                or not reply_config.get("auto_send_enabled", False)
+            ):
+                raise AutoSendBlockedError(
+                    "定时处理已停止或自动回复已关闭，本轮候选保留待审核"
+                )
+            generation_id = str(auto_generation_id)
+            allowed_ids = self._auto_send_rounds.get(generation_id)
+            if allowed_ids is None or requested != allowed_ids:
+                raise ValueError(
+                    "自动发送的评论 ID 与本轮豆包生成结果不一致"
+                )
+            with self._review_lock:
+                tagged_ids = {
+                    comment_id
+                    for comment_id in requested
+                    if (
+                        self._review_drafts.get(comment_id, {}).get(
+                            "auto_generation_id"
+                        )
+                        == generation_id
+                    )
+                }
+            if tagged_ids != requested:
+                raise ValueError(
+                    "自动发送的草稿不属于本轮豆包生成结果"
+                )
+            self._auto_send_rounds.pop(generation_id, None)
+
+        with self._review_operation(
+            "sending",
+            gate=self._review_send_gate,
+            exclusive_gate=self._review_bilibili_gate,
+            start_guard=guard_auto_send,
+        ) as task_config:
+            with self._review_lock:
+                auto_approved = 0
+                auto_approval_snapshots = {}
+                if auto_approve:
+                    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    for comment_id in requested:
+                        draft = self._review_drafts.get(comment_id)
+                        if (
+                            not draft
+                            or draft.get("status") != "pending"
+                            or not draft.get("should_reply")
+                            or not str(draft.get("reply") or "").strip()
+                            or draft.get("auto_generation_id")
+                            != str(auto_generation_id)
+                        ):
+                            continue
+                        auto_approval_snapshots[comment_id] = dict(draft)
+                        draft["approved"] = True
+                        draft["status"] = "approved"
+                        draft["approval_source"] = "auto"
+                        draft["approved_at"] = now_text
+                        auto_approved += 1
+                    if auto_approved:
+                        try:
+                            self._save_review_drafts()
+                        except Exception:
+                            for comment_id, snapshot in auto_approval_snapshots.items():
+                                self._review_drafts[comment_id] = snapshot
+                            try:
+                                self._save_review_drafts()
+                            except Exception:
+                                self.logger.exception(
+                                    "自动批准落盘失败，内存已回滚待审核；"
+                                    "磁盘状态将在下次启动时再次校正"
+                                )
+                            raise
+                        self.logger.info(
+                            "自动模式已批准本轮%s条低风险候选，准备串行发送",
+                            auto_approved,
+                        )
+                range_excluded_ids = [
+                    str(draft["comment_id"])
+                    for draft in self._review_drafts.values()
+                    if draft.get("approved")
+                    and draft.get("status") == "approved"
+                    and requested is not None
+                    and str(draft["comment_id"]) in requested
+                    and since_timestamp is not None
+                    and int(draft.get("comment_time") or 0) < since_timestamp
+                ]
+                if range_excluded_ids:
+                    raise ValueError(
+                        f"有{len(range_excluded_ids)}条已勾选草稿超出当前时间范围，"
+                        "请刷新列表后重新确认"
+                    )
+                draft_ids = [
+                    str(draft["comment_id"])
+                    for draft in self._review_drafts.values()
+                    if draft.get("approved")
+                    and draft.get("status") == "approved"
+                    and (
+                        since_timestamp is None
+                        or int(draft.get("comment_time") or 0) >= since_timestamp
+                    )
+                    and (
+                        requested is None
+                        or str(draft["comment_id"]) in requested
+                    )
+                ]
+
+            sent = 0
+            failed = 0
+            unknown = 0
+            total = len(draft_ids)
+            self.logger.info("开始串行发送：共%s条已批准回复", total)
+            for index, comment_id in enumerate(draft_ids, start=1):
+                if auto_approve:
+                    with self._review_operation_lock:
+                        auto_send_still_running = self._running
+                    if not auto_send_still_running:
+                        remaining_ids = draft_ids[index - 1:]
+                        with self._review_lock:
+                            reverted = 0
+                            for remaining_id in remaining_ids:
+                                remaining = self._review_drafts.get(remaining_id)
+                                if (
+                                    remaining
+                                    and remaining.get("status") == "approved"
+                                    and remaining.get("approval_source") == "auto"
+                                ):
+                                    remaining["approved"] = False
+                                    remaining["status"] = "pending"
+                                    remaining["error"] = (
+                                        "定时处理已停止，尚未开始发送，已恢复待审核"
+                                    )
+                                    reverted += 1
+                            if reverted:
+                                self._save_review_drafts()
+                        self.logger.info(
+                            "定时处理已停止，剩余%s条自动候选恢复待审核",
+                            reverted,
+                        )
+                        break
+                with self._review_lock:
+                    current = self._review_drafts.get(comment_id)
+                    if (
+                        not current
+                        or not current.get("approved")
+                        or current.get("status") != "approved"
+                    ):
                         continue
-                    self.processed_comments.add(comment.comment_id)
-                    self.save_history(comment, reply)
-                    processed_count += 1
-                    self.stats["total_replied"] += 1
+                    before_sending = dict(current)
+                    current["approved"] = False
+                    current["status"] = "sending"
+                    current["sending_started_at"] = datetime.now().strftime(
+                        "%Y-%m-%d %H:%M:%S"
+                    )
+                    current.pop("error", None)
+                    try:
+                        self._save_review_drafts()
+                    except Exception:
+                        if auto_approve:
+                            before_sending["approved"] = False
+                            before_sending["status"] = "pending"
+                            before_sending["error"] = (
+                                "发送前保存状态失败，已恢复待审核，系统没有调用B站回复接口"
+                            )
+                            before_sending.pop("approval_source", None)
+                            before_sending.pop("approved_at", None)
+                            before_sending.pop("auto_generation_id", None)
+                        self._review_drafts[comment_id] = before_sending
+                        try:
+                            self._save_review_drafts()
+                        except Exception:
+                            self.logger.exception(
+                                "发送前状态落盘失败，内存已回滚；"
+                                "磁盘状态将在下次启动时再次校正"
+                            )
+                        raise
+                    draft = dict(current)
 
-                    # 点赞评论用户的最新视频
-                    if self.config["reply"].get("like_user_video_enabled", False):
-                        self.logger.info(f"[点赞视频] 配置已启用，准备点赞用户 {comment.user} (UID: {comment.uid}) 的最新视频")
-                        only_followers = self.config["reply"].get("like_user_video_only_followers", False)
+                self.logger.info(
+                    "发送进度：正在发送第%s/%s条，comment_id=%s",
+                    index,
+                    total,
+                    comment_id,
+                )
+                self._emit("review_updated", {"sending": comment_id})
+                attempt = self.reply_comment(
+                    draft["bvid"],
+                    comment_id,
+                    draft["reply"],
+                    root_id=(
+                        draft.get("root_id")
+                        if draft.get("depth", 0) > 0
+                        else None
+                    ),
+                    oid=draft.get("oid"),
+                    comment_type=draft.get("comment_type", 1),
+                )
+                if isinstance(attempt, ReplyAttemptResult):
+                    ok = attempt.ok
+                    uncertain = attempt.uncertain
+                    error_message = attempt.message
+                    permanent = attempt.permanent
+                else:
+                    ok = bool(attempt)
+                    uncertain = False
+                    error_message = "" if ok else "B站回复接口返回失败"
+                    permanent = False
 
-                        skip_like = False
-                        if only_followers:
-                            my_uid = self.config["bilibili"].get("uid")
-                            if my_uid:
-                                is_follower = self.check_is_follower(comment.uid, my_uid)
-                                if not is_follower:
-                                    self.logger.info(f"[点赞视频] 用户 {comment.user} 未关注你，跳过点赞视频")
-                                    skip_like = True
-                            else:
-                                self.logger.warning("[点赞视频] 未配置 uid，无法检查粉丝关系，跳过点赞视频")
-                                skip_like = True
+                history_comment = None
+                with self._review_lock:
+                    current = self._review_drafts.get(comment_id)
+                    if not current:
+                        continue
+                    current.pop("sending_started_at", None)
+                    if ok:
+                        current["status"] = "sent"
+                        current["sent_at"] = datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        current.pop("error", None)
+                        sent += 1
+                        self.processed_comments.add(comment_id)
+                        history_comment = Comment(
+                            comment_id=comment_id,
+                            content=draft["comment"],
+                            user=draft["author"],
+                            uid=draft["author_uid"],
+                            time=int(draft["comment_time"]),
+                            parent_id=draft.get("parent_id"),
+                            root_id=draft.get("root_id"),
+                            depth=int(draft.get("depth", 0)),
+                        )
+                        self.stats["total_replied"] += 1
+                    elif uncertain:
+                        current["status"] = "send_unknown"
+                        current["error"] = (
+                            f"{error_message}；请先到B站创作中心核对，系统不会自动重发"
+                        )
+                        unknown += 1
+                    elif permanent:
+                        current["status"] = "unavailable"
+                        current["should_reply"] = False
+                        current["unavailable_at"] = datetime.now().strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        current["error"] = error_message
+                        failed += 1
+                        self.logger.warning(
+                            "comment_id=%s 已标记为不可回复，后续扫描和发送都会跳过",
+                            comment_id,
+                        )
+                    else:
+                        current["status"] = "failed"
+                        current["error"] = (
+                            error_message or "B站回复接口明确返回失败"
+                        )
+                        failed += 1
+                    self._save_review_drafts()
 
-                        if not skip_like:
-                            latest_video = self.get_user_latest_video(comment.uid)
-                            if latest_video:
-                                if self.like_video(latest_video["bvid"]):
-                                    self.logger.info(f"[点赞视频] ✓ 成功点赞用户 {comment.user} 的最新视频")
-                                else:
-                                    self.logger.warning(f"[点赞视频] ✗ 点赞用户 {comment.user} 的最新视频失败")
-                            else:
-                                self.logger.warning(f"[点赞视频] 用户 {comment.user} 没有视频或获取失败")
+                if history_comment is not None:
+                    self.save_history(history_comment, draft["reply"])
+                    self._flush_history()
 
-                    delay = self.config["reply"].get("reply_delay", 2)
-                    if delay > 0:
-                        time.sleep(delay)
+                self.logger.info(
+                    "发送进度：已处理%s/%s条（成功%s，失败%s，待核对%s）",
+                    index,
+                    total,
+                    sent,
+                    failed,
+                    unknown,
+                )
+                self._emit(
+                    "review_updated",
+                    {"sent": sent, "failed": failed, "unknown": unknown},
+                )
 
-    def _check_filters(self, comment: Comment) -> tuple:
+                delay = task_config["reply"].get("reply_delay", 10)
+                if ok and delay > 0 and index < total:
+                    time.sleep(delay)
+
+            self.logger.info(
+                "串行发送完成：成功%s条，失败%s条，发送结果待核对%s条",
+                sent,
+                failed,
+                unknown,
+            )
+            return {"sent": sent, "failed": failed, "unknown": unknown}
+
+    def process_comments(self):
+        """后台轮询生成草稿；自动模式只发送本轮新生成的可回复候选。"""
+        self._ensure_review_operation_state()
+        if not self.config["reply"].get("enabled", True):
+            return
+        try:
+            result = self.generate_review_drafts(include_generated_ids=True)
+        except ReviewOperationBusyError:
+            self.logger.info("当前账号已有扫描或发送任务，本轮后台检查跳过")
+            return
+        self.logger.info(
+            "审核草稿更新：生成 %s 条，可回复 %s 条，跳过 %s 条",
+            result["generated"],
+            result["replyable"],
+            result["skipped"],
+        )
+        with self._review_operation_lock:
+            auto_send_enabled = bool(
+                self._running
+                and self.config.get("reply", {}).get("enabled", True)
+                and self.config.get("reply", {}).get(
+                    "auto_send_enabled",
+                    False,
+                )
+            )
+        if not auto_send_enabled:
+            return
+        replyable_ids = [
+            str(comment_id) for comment_id in result.get("replyable_ids", [])
+        ]
+        if not replyable_ids:
+            self.logger.info(
+                "自动回复已开启，本轮没有豆包判断为可回复的新评论"
+            )
+            return
+        try:
+            send_result = self.send_approved_drafts(
+                comment_ids=replyable_ids,
+                auto_approve=True,
+                auto_generation_id=result.get("generation_id"),
+            )
+        except AutoSendBlockedError as exc:
+            self.logger.info("%s：%s条新候选未发送", exc, len(replyable_ids))
+            return
+        except ReviewOperationBusyError:
+            self.logger.info(
+                "当前账号已有发送任务，本轮%s条新候选保留待审核",
+                len(replyable_ids),
+            )
+            return
+        self.logger.info(
+            "自动回复本轮完成：成功%s条，失败%s条，待核对%s条",
+            send_result["sent"],
+            send_result["failed"],
+            send_result["unknown"],
+        )
+
+    def _check_filters(self, comment: Comment, config: dict = None) -> tuple:
         """检查评论是否通过所有过滤器。返回 (通过, 跳过原因)"""
+        task_config = config or self.config
         # ── 长度过滤 ──
-        lf = self.config["reply"].get("length_filter", {})
+        lf = task_config["reply"].get("length_filter", {})
         if lf.get("enabled", False):
             min_len = lf.get("min_length", 0)
             max_len = lf.get("max_length", 500)
@@ -1316,7 +3145,7 @@ class BiliCommentBot:
                 return False, f"评论长度 {content_len} > {max_len}"
 
         # ── 关键词过滤 ──
-        kf = self.config["reply"].get("keyword_filter", {})
+        kf = task_config["reply"].get("keyword_filter", {})
         if kf.get("enabled", False):
             wl_str = kf.get("whitelist", "").strip()
             bl_str = kf.get("blacklist", "").strip()
@@ -1346,7 +3175,7 @@ class BiliCommentBot:
                         return False, "未包含任何白名单关键词"
 
         # ── 用户过滤 ──
-        uf = self.config["reply"].get("user_filter", {})
+        uf = task_config["reply"].get("user_filter", {})
         if uf.get("enabled", False):
             uid = comment.uid
             bl_str = uf.get("blacklist", "").strip()
@@ -1365,6 +3194,9 @@ class BiliCommentBot:
         return True, ""
 
     def get_stats(self) -> dict:
+        auto_send_enabled = bool(
+            self.config.get("reply", {}).get("auto_send_enabled", False)
+        )
         return {
             "running": self._running,
             "total_replied": self.stats["total_replied"],
@@ -1372,10 +3204,47 @@ class BiliCommentBot:
             "last_check": self.stats["last_check"],
             "processed_count": len(self.processed_comments),
             "cached_videos": len(self.cached_videos),
+            "review_operations": self.get_review_operation_status(),
+            "auto_send_enabled": auto_send_enabled,
+            "monitor_mode": "auto_reply" if auto_send_enabled else "manual_review",
         }
+
+    def _ensure_login_identity(self) -> dict:
+        configured_uid = str(self.config.get("bilibili", {}).get("uid") or "")
+        if getattr(self, "_identity_verified", False) and configured_uid:
+            return {
+                "valid": True,
+                "message": "登录身份已识别",
+                "user_info": {
+                    "mid": configured_uid,
+                    "name": getattr(self, "_identity_name", ""),
+                },
+            }
+        if not hasattr(self, "cookie_manager"):
+            return {
+                "valid": bool(configured_uid),
+                "message": "测试实例未初始化Cookie",
+                "user_info": {"mid": configured_uid, "name": ""},
+            }
+        result = self.verify_login()
+        if not result.get("valid"):
+            raise RuntimeError(f"无法识别当前登录账号: {result.get('message', 'Cookie验证失败')}")
+        return result
 
     def verify_login(self) -> dict:
         if not self.cookie_manager:
             return {"valid": False, "message": "未配置Cookie"}
         valid, result = self.cookie_manager.verify_cookie()
+        if valid:
+            user_info = result.get("user_info") or {}
+            uid = str(user_info.get("mid") or "")
+            name = str(user_info.get("name") or "").strip()
+            if not uid:
+                return {"valid": False, "message": "B站未返回当前账号 UID"}
+            self.config.setdefault("bilibili", {})["uid"] = uid
+            self._identity_verified = True
+            self._identity_name = name
+            callback = getattr(self, "on_identity_changed", None)
+            if callback:
+                callback(uid, name)
         return {"valid": valid, **result}

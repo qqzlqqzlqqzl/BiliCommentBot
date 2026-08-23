@@ -38,7 +38,7 @@ vim ./data/config.toml
 uid = "你的B站用户ID"
 cookie = "从WebUI扫码登录获取"
 refresh_token = ""
-check_interval = 60
+check_interval = 3600
 auto_refresh_cookie = true
 cookie_refresh_interval = 30
 max_comment_pages = 10
@@ -57,12 +57,12 @@ enabled = true
 prefix = "🤖 "
 only_new = true
 max_process = 10
-reply_delay = 2
+reply_delay = 10
 
 [rate_limit]
-min_request_interval = 2.0
+min_request_interval = 10.0
 max_retries = 3
-retry_delay = 5
+retry_delay = 20
 
 [cache]
 enabled = true
