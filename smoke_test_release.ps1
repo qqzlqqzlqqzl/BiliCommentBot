@@ -153,7 +153,7 @@ try {
         $page.Content -notmatch "fetch\('/api/logs/clear'" -or
         $page.Content -notmatch '关闭后会保留你当前查看的位置' -or
         $page.Content -notmatch '切换当前操作账号' -or
-        $page.Content -notmatch '按配置的检查间隔在后台扫描最新评论' -or
+        $page.Content -notmatch '启动当前账号自己的后台定时处理' -or
         $page.Content -notmatch '配置豆包 API、模型、推理力度' -or
         $page.Content -notmatch '向 B站申请当前账号的登录二维码' -or
         $page.Content -notmatch '查看第 \$\{i\} 页回复历史' -or
